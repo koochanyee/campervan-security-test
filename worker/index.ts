@@ -1,125 +1,110 @@
-// Export the Workflow and Durable Object classes
-export { MyWorkflow } from "./workflow";
-export { WorkflowStatusDO } from "./durable-object";
 
-/**
- * Main Worker fetch handler
- *
- * Handles API routes and WebSocket upgrade requests for workflow management:
- * - POST /api/workflow/start - Create new workflow instance
- * - GET /api/workflow/status/:id - Get workflow status
- * - POST /api/workflow/event/:id - Send events to workflow
- * - GET /ws - WebSocket connection for real-time updates
- */
+interface Env {
+  GOOGLE_CLIENT_ID: string;
+}
+
+interface GoogleTokenInfo {
+  aud?: string;
+  sub?: string;
+  email?: string;
+  email_verified?: string;
+  exp?: string;
+  iss?: string;
+}
+
+function jsonResponse(
+  body: Record<string, unknown>,
+  status = 200,
+): Response {
+  return Response.json(body, {
+    status,
+    headers: {
+      "Cache-Control": "no-store",
+      "X-Content-Type-Options": "nosniff",
+    },
+  });
+}
+
 export default {
-	async fetch(request: Request, env: Env): Promise<Response> {
-		const url = new URL(request.url);
+  async fetch(request: Request, env: Env): Promise<Response> {
+    const url = new URL(request.url);
 
-		// API: Start a new workflow instance
-		if (url.pathname === "/api/workflow/start" && request.method === "POST") {
-			try {
-				const instance = await env.MY_WORKFLOW.create({
-					params: {
-						timestamp: Date.now(),
-					},
-				});
+    if (request.method === "GET" && url.pathname === "/api/health") {
+      return jsonResponse({ success: true, service: "campervan-auth-test" });
+    }
 
-				return Response.json({
-					instanceId: instance.id,
-					message: "Workflow started successfully",
-				});
-			} catch {
-				return Response.json(
-					{ error: "Failed to start workflow" },
-					{ status: 500 },
-				);
-			}
-		}
+    if (url.pathname !== "/api/auth/google" || request.method !== "POST") {
+      return jsonResponse({ error: "Not Found" }, 404);
+    }
 
-		// API: Get workflow status
-		if (url.pathname.startsWith("/api/workflow/status/")) {
-			const instanceId = url.pathname.split("/").pop();
-			if (!instanceId) {
-				return Response.json(
-					{ error: "Instance ID required" },
-					{ status: 400 },
-				);
-			}
+    if (!env.GOOGLE_CLIENT_ID) {
+      return jsonResponse({ error: "Server configuration error" }, 500);
+    }
 
-			try {
-				const instance = await env.MY_WORKFLOW.get(instanceId);
-				const status = await instance.status();
-				return Response.json(status);
-			} catch {
-				return Response.json(
-					{ error: "Failed to get workflow status" },
-					{ status: 500 },
-				);
-			}
-		}
+    let body: { credential?: unknown };
 
-		// API: Send event to workflow instance
-		if (
-			url.pathname.startsWith("/api/workflow/event/") &&
-			request.method === "POST"
-		) {
-			const instanceId = url.pathname.split("/").pop();
-			if (!instanceId) {
-				return Response.json(
-					{ error: "Instance ID required" },
-					{ status: 400 },
-				);
-			}
+    try {
+      body = await request.json() as { credential?: unknown };
+    } catch {
+      return jsonResponse({ error: "Invalid JSON body" }, 400);
+    }
 
-			try {
-				const body = (await request.json()) as {
-					approved: boolean;
-					comment?: string;
-				};
-				const instance = await env.MY_WORKFLOW.get(instanceId);
+    if (
+      typeof body.credential !== "string" ||
+      body.credential.length < 20 ||
+      body.credential.length > 10000
+    ) {
+      return jsonResponse({ error: "Google ID token required" }, 401);
+    }
 
-				await instance.sendEvent({
-					type: "user-approval",
-					payload: body,
-				});
+    let tokenResponse: Response;
 
-				return Response.json({
-					success: true,
-					message: "Event sent successfully",
-				});
-			} catch {
-				return Response.json(
-					{ error: "Failed to send event" },
-					{ status: 500 },
-				);
-			}
-		}
+    try {
+      tokenResponse = await fetch(
+        "https://oauth2.googleapis.com/tokeninfo?id_token=" +
+          encodeURIComponent(body.credential),
+      );
+    } catch {
+      return jsonResponse({ error: "Token verification unavailable" }, 502);
+    }
 
-		// WebSocket: Connect to workflow status updates
-		if (url.pathname === "/ws") {
-			const instanceId = url.searchParams.get("instanceId");
-			if (!instanceId) {
-				return new Response("instanceId query parameter required", {
-					status: 400,
-				});
-			}
+    if (!tokenResponse.ok) {
+      return jsonResponse({ error: "Invalid or expired Google ID token" }, 401);
+    }
 
-			const upgradeHeader = request.headers.get("Upgrade");
-			if (upgradeHeader !== "websocket") {
-				return new Response("Expected Upgrade: websocket", { status: 426 });
-			}
+    let token: GoogleTokenInfo;
 
-			try {
-				const doId = env.WORKFLOW_STATUS.idFromName(instanceId);
-				const stub = env.WORKFLOW_STATUS.get(doId);
-				return stub.fetch(request);
-			} catch {
-				return new Response("Failed to establish WebSocket connection", {
-					status: 500,
-				});
-			}
-		}
+    try {
+      token = await tokenResponse.json() as GoogleTokenInfo;
+    } catch {
+      return jsonResponse({ error: "Invalid token response" }, 502);
+    }
 
-		return Response.json({ error: "Not Found" }, { status: 404 });
-	},
-} satisfies ExportedHandler<Env>;
+    const validIssuer =
+      token.iss === "accounts.google.com" ||
+      token.iss === "https://accounts.google.com";
+
+    const expiresAt = Number(token.exp);
+
+    if (
+      token.aud !== env.GOOGLE_CLIENT_ID ||
+      !token.sub ||
+      !token.email ||
+      token.email_verified !== "true" ||
+      !validIssuer ||
+      !Number.isFinite(expiresAt) ||
+      expiresAt <= Math.floor(Date.now() / 1000)
+    ) {
+      return jsonResponse({ error: "Google identity validation failed" }, 401);
+    }
+
+    return jsonResponse({
+      success: true,
+      user: {
+        googleId: token.sub,
+        email: token.email,
+      },
+      message: "Google identity verified; trip access has not been granted.",
+    });
+  },
+};
