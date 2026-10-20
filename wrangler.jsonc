@@ -49,5 +49,6 @@
 			"new_sqlite_classes": ["WorkflowStatusDO"]
 		}
 	],
+    "previews": {},
 	"upload_source_maps": true
 }
