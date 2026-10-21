@@ -40,6 +40,12 @@ interface GoogleTokenInfo {
   iss?: string;
 }
 
+interface SessionPayload {
+  email: string;
+  googleId: string;
+  exp: number;
+}
+
 function jsonResponse(
   body: Record<string, unknown>,
   status = 200,
@@ -53,18 +59,12 @@ function jsonResponse(
   });
 }
 
-
-interface SessionPayload {
-  email: string;
-  googleId: string;
-  exp: number;
-}
-
 function base64UrlEncode(bytes: Uint8Array): string {
   let binary = "";
   for (const byte of bytes) {
     binary += String.fromCharCode(byte);
   }
+
   return btoa(binary)
     .replace(/\+/g, "-")
     .replace(/\//g, "_")
@@ -72,12 +72,14 @@ function base64UrlEncode(bytes: Uint8Array): string {
 }
 
 function base64UrlDecode(value: string): Uint8Array {
-  const base64 = value
-    .replace(/-/g, "+")
-    .replace(/_/g, "/");
-  const padded = base64 + "=".repeat((4 - base64.length % 4) % 4);
+  const base64 = value.replace(/-/g, "+").replace(/_/g, "/");
+  const padded = base64 + "=".repeat((4 - (base64.length % 4)) % 4);
   const binary = atob(padded);
-  return Uint8Array.from(binary, (char) => char.charCodeAt(0));
+
+  return Uint8Array.from(
+    binary,
+    (char) => char.charCodeAt(0),
+  );
 }
 
 async function hmac(
@@ -102,6 +104,8 @@ async function hmac(
 }
 
 function isApprovedEmail(email: string, env: Env): boolean {
+  if (!env.APPROVED_EMAILS) return false;
+
   const approved = env.APPROVED_EMAILS
     .split(",")
     .map((item) => item.trim().toLowerCase())
@@ -117,7 +121,10 @@ async function createSessionToken(
   const encoded = base64UrlEncode(
     new TextEncoder().encode(JSON.stringify(payload)),
   );
-  const signature = base64UrlEncode(await hmac(encoded, secret));
+
+  const signature = base64UrlEncode(
+    await hmac(encoded, secret),
+  );
 
   return `${encoded}.${signature}`;
 }
@@ -136,6 +143,7 @@ async function readSession(
     }
 
     const cookieHeader = request.headers.get("Cookie") || "";
+
     const cookie = cookieHeader
       .split(";")
       .map((item) => item.trim())
@@ -145,26 +153,29 @@ async function readSession(
 
     const token = cookie.slice("m3_session=".length);
     const parts = token.split(".");
+
     if (parts.length !== 2) return null;
 
     const [encoded, suppliedSignature] = parts;
+
     if (!encoded || !suppliedSignature) return null;
 
     const expectedSignature = base64UrlEncode(
       await hmac(encoded, env.SESSION_SECRET),
     );
 
-    // Compare without returning early for individual characters.
     if (suppliedSignature.length !== expectedSignature.length) {
       return null;
     }
 
     let difference = 0;
+
     for (let i = 0; i < expectedSignature.length; i++) {
       difference |=
         suppliedSignature.charCodeAt(i) ^
         expectedSignature.charCodeAt(i);
     }
+
     if (difference !== 0) return null;
 
     const payload = JSON.parse(
@@ -192,22 +203,28 @@ export default {
     const url = new URL(request.url);
 
     // Health check
-    if (request.method === "GET" && url.pathname === "/api/health") {
+    if (
+      request.method === "GET" &&
+      url.pathname === "/api/health"
+    ) {
       return jsonResponse({
         success: true,
         service: "campervan-auth-test",
       });
     }
 
-    // Google ID token verification
-    if (url.pathname === "/api/auth/google" && request.method === "POST") {
+    // Google ID token verification and session creation
+    if (
+      url.pathname === "/api/auth/google" &&
+      request.method === "POST"
+    ) {
       if (!env.GOOGLE_CLIENT_ID) {
         return jsonResponse(
-          { error: "M3 preview cannot read GOOGLE_CLIENT_ID" },
+          { error: "Google Client ID is not configured" },
           500,
         );
       }
-      
+
       if (
         !env.APPROVED_EMAILS ||
         !env.SESSION_SECRET ||
@@ -224,7 +241,10 @@ export default {
       try {
         body = await request.json() as { credential?: unknown };
       } catch {
-        return jsonResponse({ error: "Invalid JSON body" }, 400);
+        return jsonResponse(
+          { error: "Invalid JSON body" },
+          400,
+        );
       }
 
       if (
@@ -232,7 +252,10 @@ export default {
         body.credential.length < 20 ||
         body.credential.length > 10000
       ) {
-        return jsonResponse({ error: "Google ID token required" }, 401);
+        return jsonResponse(
+          { error: "Google ID token required" },
+          401,
+        );
       }
 
       let tokenResponse: Response;
@@ -261,7 +284,10 @@ export default {
       try {
         token = await tokenResponse.json() as GoogleTokenInfo;
       } catch {
-        return jsonResponse({ error: "Invalid token response" }, 502);
+        return jsonResponse(
+          { error: "Invalid token response" },
+          502,
+        );
       }
 
       const validIssuer =
@@ -285,7 +311,6 @@ export default {
         );
       }
 
-      
       const email = token.email.trim().toLowerCase();
 
       if (!isApprovedEmail(email, env)) {
@@ -308,7 +333,14 @@ export default {
           env.SESSION_SECRET,
         );
 
-        const email = token.email.trim().toLowerCase();
+        const response = jsonResponse({
+          success: true,
+          user: {
+            googleId: token.sub,
+            email,
+          },
+          message: "Google identity verified. Trip access granted.",
+        });
 
         response.headers.append(
           "Set-Cookie",
@@ -324,7 +356,7 @@ export default {
       }
     }
 
-    // Require an approved, authenticated session for workflow APIs and WebSockets.
+    // Require an approved session for workflow APIs and WebSockets.
     if (
       url.pathname.startsWith("/api/workflow/") ||
       url.pathname === "/ws"
@@ -333,7 +365,10 @@ export default {
 
       if (!session) {
         return jsonResponse(
-          { success: false, error: "Authentication required" },
+          {
+            success: false,
+            error: "Authentication required",
+          },
           401,
         );
       }
@@ -364,7 +399,10 @@ export default {
     }
 
     // Read workflow status
-    if (url.pathname.startsWith("/api/workflow/status/")) {
+    if (
+      url.pathname.startsWith("/api/workflow/status/") &&
+      request.method === "GET"
+    ) {
       const instanceId = url.pathname.split("/").pop();
 
       if (!instanceId) {
@@ -377,6 +415,7 @@ export default {
       try {
         const instance = await env.MY_WORKFLOW.get(instanceId);
         const status = await instance.status();
+
         return jsonResponse({ status });
       } catch {
         return jsonResponse(
@@ -400,12 +439,35 @@ export default {
         );
       }
 
+      let body: {
+        approved: boolean;
+        comment?: string;
+      };
+
       try {
-        const body = await request.json() as {
+        body = await request.json() as {
           approved: boolean;
           comment?: string;
         };
+      } catch {
+        return jsonResponse(
+          { error: "Invalid JSON body" },
+          400,
+        );
+      }
 
+      if (
+        typeof body.approved !== "boolean" ||
+        (body.comment !== undefined &&
+          typeof body.comment !== "string")
+      ) {
+        return jsonResponse(
+          { error: "Invalid workflow event payload" },
+          400,
+        );
+      }
+
+      try {
         const instance = await env.MY_WORKFLOW.get(instanceId);
 
         await instance.sendEvent({
@@ -437,14 +499,16 @@ export default {
       }
 
       if (request.headers.get("Upgrade") !== "websocket") {
-        return new Response("Expected Upgrade: websocket", {
-          status: 426,
-        });
+        return new Response(
+          "Expected Upgrade: websocket",
+          { status: 426 },
+        );
       }
 
       try {
         const doId = env.WORKFLOW_STATUS.idFromName(instanceId);
         const stub = env.WORKFLOW_STATUS.get(doId);
+
         return stub.fetch(request);
       } catch {
         return new Response(
@@ -454,6 +518,9 @@ export default {
       }
     }
 
-    return jsonResponse({ error: "Not Found" }, 404);
+    return jsonResponse(
+      { error: "Not Found" },
+      404,
+    );
   },
 } satisfies ExportedHandler<Env>;
