@@ -1,3 +1,4 @@
+
 import { useState, useEffect } from "react";
 import { WorkflowDiagram } from "./components/WorkflowDiagram";
 import { CodeDisplay } from "./components/CodeDisplay";
@@ -5,9 +6,31 @@ import { BackgroundDots } from "./components/BackgroundDots";
 import { useWorkflowWebSocket } from "./hooks/useWorkflowWebSocket";
 import { WORKFLOW_STEPS } from "./types";
 
+declare global {
+	interface Window {
+		google?: {
+			accounts: {
+				id: {
+					initialize: (options: {
+						client_id: string;
+						callback: (response: { credential: string }) => void;
+					}) => void;
+					renderButton: (
+						element: HTMLElement,
+						options: { theme: string; size: string; text: string },
+					) => void;
+				};
+			};
+		};
+	}
+}
+
 function App() {
 	const [instanceId, setInstanceId] = useState<string | null>(null);
 	const [isStarting, setIsStarting] = useState(false);
+	const [authMessage, setAuthMessage] = useState("");
+	const [isVerifying, setIsVerifying] = useState(false);
+	const [verifiedEmail, setVerifiedEmail] = useState("");
 	const workflowState = useWorkflowWebSocket(instanceId);
 
 	useEffect(() => {
@@ -27,6 +50,89 @@ function App() {
 			setIsStarting(false);
 		}
 	}, [workflowState.workflowStatus, workflowState.currentStep]);
+
+	useEffect(() => {
+		const clientId = import.meta.env.VITE_GOOGLE_CLIENT_ID as
+			| string
+			| undefined;
+
+		if (!clientId) {
+			setAuthMessage("Google sign-in configuration is missing.");
+			return;
+		}
+
+		let attempts = 0;
+		let timer: ReturnType<typeof setInterval> | undefined;
+
+		const setupGoogleSignIn = () => {
+			if (!window.google?.accounts.id) {
+				attempts += 1;
+				if (attempts >= 20 && timer) clearInterval(timer);
+				return;
+			}
+
+			if (timer) clearInterval(timer);
+
+			const button = document.getElementById("google-sign-in-button");
+			if (!button) return;
+
+			button.replaceChildren();
+
+			window.google.accounts.id.initialize({
+				client_id: clientId,
+				callback: async (response) => {
+					setAuthMessage("Verifying Google account…");
+					setIsVerifying(true);
+					setVerifiedEmail("");
+
+					try {
+						const result = await fetch("/api/auth/google", {
+							method: "POST",
+							headers: { "Content-Type": "application/json" },
+							body: JSON.stringify({
+								credential: response.credential,
+							}),
+						});
+
+						const data = await result.json();
+
+						if (!result.ok || !data.success) {
+							throw new Error(data.error || "Google verification failed.");
+						}
+
+						setVerifiedEmail(data.user.email);
+						setAuthMessage(
+							"Google identity verified. Trip access has not been granted.",
+						);
+					} catch (error) {
+						setAuthMessage(
+							error instanceof Error
+								? error.message
+								: "Google verification failed. Please try again.",
+						);
+					} finally {
+						setIsVerifying(false);
+					}
+				},
+			});
+
+			window.google.accounts.id.renderButton(button, {
+				theme: "outline",
+				size: "large",
+				text: "signin_with",
+			});
+		};
+
+		setupGoogleSignIn();
+
+		if (!window.google?.accounts.id) {
+			timer = setInterval(setupGoogleSignIn, 500);
+		}
+
+		return () => {
+			if (timer) clearInterval(timer);
+		};
+	}, []);
 
 	const handleStartWorkflow = async () => {
 		setIsStarting(true);
@@ -50,12 +156,10 @@ function App() {
 
 	return (
 		<div className="min-h-screen bg-neutral-50/30 dark:bg-neutral-950 flex flex-col relative">
-			{/* Background dots across entire page */}
 			<div className="absolute inset-0 text-neutral-200/50 dark:text-neutral-700/40 overflow-hidden">
 				<BackgroundDots />
 			</div>
 
-			{/* Minimal Integrated Header */}
 			<header className="px-6 pt-6 pb-4 relative z-10">
 				<div className="flex items-center justify-between">
 					<div className="flex items-center gap-3">
@@ -76,7 +180,7 @@ function App() {
 						</svg>
 						<div className="w-px h-4 bg-neutral-300/50 dark:bg-neutral-600/50" />
 						<h1 className="text-sm font-medium text-neutral-600 dark:text-neutral-400">
-							Workflows Starter Template
+							Campervan Security Test
 						</h1>
 					</div>
 
@@ -91,9 +195,27 @@ function App() {
 				</div>
 			</header>
 
-			{/* Main content - unified canvas */}
+			<section className="relative z-10 mx-6 mb-5 rounded-xl border border-neutral-200 bg-white/90 p-5 dark:border-neutral-800 dark:bg-neutral-900/90">
+				<h2 className="mb-3 text-base font-semibold text-neutral-800 dark:text-neutral-100">
+					M3 — Google Sign-in Test
+				</h2>
+				<div id="google-sign-in-button" />
+				{isVerifying && (
+					<p className="mt-3 text-sm text-neutral-600">Verifying account…</p>
+				)}
+				{authMessage && (
+					<p className="mt-3 text-sm text-neutral-700 dark:text-neutral-300">
+						{authMessage}
+					</p>
+				)}
+				{verifiedEmail && (
+					<p className="mt-2 text-sm font-medium text-green-700">
+						Verified Google email: {verifiedEmail}
+					</p>
+				)}
+			</section>
+
 			<main className="flex-1 flex flex-col lg:flex-row overflow-hidden relative z-10">
-				{/* Left side - Code (responsive width) */}
 				<div className="w-full lg:w-[60%] overflow-hidden px-6 pb-6">
 					<CodeDisplay
 						currentStep={workflowState.currentStep}
@@ -103,7 +225,6 @@ function App() {
 					/>
 				</div>
 
-				{/* Right side - Diagram (responsive width) */}
 				<div className="flex-1 overflow-hidden px-6 lg:pl-8 lg:pr-6 pb-6">
 					<WorkflowDiagram
 						steps={WORKFLOW_STEPS}
