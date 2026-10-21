@@ -67,7 +67,7 @@ export default {
     if (url.pathname === "/api/auth/google" && request.method === "POST") {
       if (!env.GOOGLE_CLIENT_ID) {
         return jsonResponse(
-          { error: "Server configuration error" },
+          { error: "M3 preview cannot read GOOGLE_CLIENT_ID" },
           500,
         );
       }
