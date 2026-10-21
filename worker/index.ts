@@ -225,13 +225,23 @@ export default {
         );
       }
 
-      if (
-        !env.APPROVED_EMAILS ||
-        !env.SESSION_SECRET ||
-        env.SESSION_SECRET.length < 32
-      ) {
+      if (!env.APPROVED_EMAILS) {
         return jsonResponse(
-          { error: "Authentication configuration incomplete" },
+          { error: "Preview diagnostic: APPROVED_EMAILS missing" },
+          500,
+        );
+      }
+
+      if (!env.SESSION_SECRET) {
+        return jsonResponse(
+          { error: "Preview diagnostic: SESSION_SECRET missing" },
+          500,
+        );
+      }
+
+      if (env.SESSION_SECRET.length < 32) {
+        return jsonResponse(
+          { error: "Preview diagnostic: SESSION_SECRET too short" },
           500,
         );
       }
