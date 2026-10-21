@@ -25,6 +25,8 @@ interface WorkflowBinding {
 
 interface Env {
   GOOGLE_CLIENT_ID: string;
+  APPROVED_EMAILS: string;
+  SESSION_SECRET: string;
   MY_WORKFLOW: WorkflowBinding;
   WORKFLOW_STATUS: DurableObjectNamespace;
 }
@@ -51,6 +53,140 @@ function jsonResponse(
   });
 }
 
+
+interface SessionPayload {
+  email: string;
+  googleId: string;
+  exp: number;
+}
+
+function base64UrlEncode(bytes: Uint8Array): string {
+  let binary = "";
+  for (const byte of bytes) {
+    binary += String.fromCharCode(byte);
+  }
+  return btoa(binary)
+    .replace(/\+/g, "-")
+    .replace(/\//g, "_")
+    .replace(/=+$/, "");
+}
+
+function base64UrlDecode(value: string): Uint8Array {
+  const base64 = value
+    .replace(/-/g, "+")
+    .replace(/_/g, "/");
+  const padded = base64 + "=".repeat((4 - base64.length % 4) % 4);
+  const binary = atob(padded);
+  return Uint8Array.from(binary, (char) => char.charCodeAt(0));
+}
+
+async function hmac(
+  value: string,
+  secret: string,
+): Promise<Uint8Array> {
+  const key = await crypto.subtle.importKey(
+    "raw",
+    new TextEncoder().encode(secret),
+    { name: "HMAC", hash: "SHA-256" },
+    false,
+    ["sign"],
+  );
+
+  return new Uint8Array(
+    await crypto.subtle.sign(
+      "HMAC",
+      key,
+      new TextEncoder().encode(value),
+    ),
+  );
+}
+
+function isApprovedEmail(email: string, env: Env): boolean {
+  const approved = env.APPROVED_EMAILS
+    .split(",")
+    .map((item) => item.trim().toLowerCase())
+    .filter(Boolean);
+
+  return approved.includes(email.trim().toLowerCase());
+}
+
+async function createSessionToken(
+  payload: SessionPayload,
+  secret: string,
+): Promise<string> {
+  const encoded = base64UrlEncode(
+    new TextEncoder().encode(JSON.stringify(payload)),
+  );
+  const signature = base64UrlEncode(await hmac(encoded, secret));
+
+  return `${encoded}.${signature}`;
+}
+
+async function readSession(
+  request: Request,
+  env: Env,
+): Promise<SessionPayload | null> {
+  try {
+    if (
+      !env.SESSION_SECRET ||
+      env.SESSION_SECRET.length < 32 ||
+      !env.APPROVED_EMAILS
+    ) {
+      return null;
+    }
+
+    const cookieHeader = request.headers.get("Cookie") || "";
+    const cookie = cookieHeader
+      .split(";")
+      .map((item) => item.trim())
+      .find((item) => item.startsWith("m3_session="));
+
+    if (!cookie) return null;
+
+    const token = cookie.slice("m3_session=".length);
+    const parts = token.split(".");
+    if (parts.length !== 2) return null;
+
+    const [encoded, suppliedSignature] = parts;
+    if (!encoded || !suppliedSignature) return null;
+
+    const expectedSignature = base64UrlEncode(
+      await hmac(encoded, env.SESSION_SECRET),
+    );
+
+    // Compare without returning early for individual characters.
+    if (suppliedSignature.length !== expectedSignature.length) {
+      return null;
+    }
+
+    let difference = 0;
+    for (let i = 0; i < expectedSignature.length; i++) {
+      difference |=
+        suppliedSignature.charCodeAt(i) ^
+        expectedSignature.charCodeAt(i);
+    }
+    if (difference !== 0) return null;
+
+    const payload = JSON.parse(
+      new TextDecoder().decode(base64UrlDecode(encoded)),
+    ) as SessionPayload;
+
+    if (
+      typeof payload.email !== "string" ||
+      typeof payload.googleId !== "string" ||
+      typeof payload.exp !== "number" ||
+      payload.exp <= Math.floor(Date.now() / 1000) ||
+      !isApprovedEmail(payload.email, env)
+    ) {
+      return null;
+    }
+
+    return payload;
+  } catch {
+    return null;
+  }
+}
+
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
     const url = new URL(request.url);
@@ -68,6 +204,17 @@ export default {
       if (!env.GOOGLE_CLIENT_ID) {
         return jsonResponse(
           { error: "M3 preview cannot read GOOGLE_CLIENT_ID" },
+          500,
+        );
+      }
+      
+      if (
+        !env.APPROVED_EMAILS ||
+        !env.SESSION_SECRET ||
+        env.SESSION_SECRET.length < 32
+      ) {
+        return jsonResponse(
+          { error: "Authentication configuration incomplete" },
           500,
         );
       }
@@ -147,6 +294,21 @@ export default {
         message:
           "Google identity verified; trip access has not been granted.",
       });
+    }
+
+    // Require an approved, authenticated session for workflow APIs and WebSockets.
+    if (
+      url.pathname.startsWith("/api/workflow/") ||
+      url.pathname === "/ws"
+    ) {
+      const session = await readSession(request, env);
+
+      if (!session) {
+        return jsonResponse(
+          { success: false, error: "Authentication required" },
+          401,
+        );
+      }
     }
 
     // Start a workflow
