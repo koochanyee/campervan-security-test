@@ -285,15 +285,50 @@ export default {
         );
       }
 
-      return jsonResponse({
-        success: true,
-        user: {
-          googleId: token.sub,
-          email: token.email,
-        },
-        message:
-          "Google identity verified; trip access has not been granted.",
-      });
+      
+      const email = token.email.trim().toLowerCase();
+
+      if (!isApprovedEmail(email, env)) {
+        return jsonResponse(
+          {
+            success: false,
+            error: "This Google account is not approved for trip access.",
+          },
+          403,
+        );
+      }
+
+      try {
+        const sessionToken = await createSessionToken(
+          {
+            email,
+            googleId: token.sub,
+            exp: Math.floor(Date.now() / 1000) + 8 * 60 * 60,
+          },
+          env.SESSION_SECRET,
+        );
+
+        const response = jsonResponse({
+          success: true,
+          user: {
+            googleId: token.sub,
+            email,
+          },
+          message: "Google identity verified. Trip access granted.",
+        });
+
+        response.headers.append(
+          "Set-Cookie",
+          `m3_session=${sessionToken}; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=28800`,
+        );
+
+        return response;
+      } catch {
+        return jsonResponse(
+          { error: "Failed to create authenticated session" },
+          500,
+        );
+      }
     }
 
     // Require an approved, authenticated session for workflow APIs and WebSockets.
