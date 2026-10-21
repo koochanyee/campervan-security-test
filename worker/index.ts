@@ -322,6 +322,13 @@ export default {
       }
 
       const email = token.email.trim().toLowerCase();
+      console.log("Trip access diagnostic:", {
+        approvedEmailsConfigured: Boolean(env.APPROVED_EMAILS),
+        approvedEmailCount: env.APPROVED_EMAILS
+         ? env.APPROVED_EMAILS.split(",").filter((item) => item.trim()).length
+         : 0,
+        verifiedEmailMatches: isApprovedEmail(email, env),
+      });
 
       if (!isApprovedEmail(email, env)) {
         return jsonResponse(
