@@ -308,14 +308,7 @@ export default {
           env.SESSION_SECRET,
         );
 
-        const response = jsonResponse({
-          success: true,
-          user: {
-            googleId: token.sub,
-            email,
-          },
-          message: "Google identity verified. Trip access granted.",
-        });
+        const email = token.email.trim().toLowerCase();
 
         response.headers.append(
           "Set-Cookie",
