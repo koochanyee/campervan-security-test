@@ -29,6 +29,13 @@ interface Env {
   SESSION_SECRET: string;
   MY_WORKFLOW: WorkflowBinding;
   WORKFLOW_STATUS: DurableObjectNamespace;
+
+  // Google Sheets OAuth — configure these on Preview
+  GOOGLE_CLIENT_SECRET: string;
+  TOKEN_ENCRYPTION_KEY: string;
+  GOOGLE_SHEET_ID: string;
+  GOOGLE_SHEET_TAB: string;
+  OAUTH_TOKEN_STORE: KVNamespace;
 }
 
 interface GoogleTokenInfo {
