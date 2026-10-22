@@ -102,7 +102,7 @@ function App() {
 
 						setVerifiedEmail(data.user.email);
 						setAuthMessage(
-							"Google identity verified. Trip access has not been granted.",
+							"Google identity verified. Trip access granted.",
 						);
 					} catch (error) {
 						setAuthMessage(
