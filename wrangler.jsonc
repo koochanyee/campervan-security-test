@@ -50,5 +50,10 @@
 		}
 	],
     "previews": {},
+    "vars": {
+        "GOOGLE_SHEET_ID": "1L_GUByHbUMIORDakIRutHUwK9pNMYPAsm1H1fe6RMB0",
+        "GOOGLE_SHEET_TAB": "FINAL ITINERARY"
+    },
+    "previews": {},
 	"upload_source_maps": true
 }
