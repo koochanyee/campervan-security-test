@@ -205,6 +205,184 @@ async function readSession(
   }
 }
 
+interface GoogleOAuthState {
+  email: string;
+  nonce: string;
+  exp: number;
+}
+
+interface GoogleOAuthTokenResponse {
+  access_token?: string;
+  refresh_token?: string;
+  expires_in?: number;
+  token_type?: string;
+  error?: string;
+}
+
+function getCookie(
+  request: Request,
+  name: string,
+): string | null {
+  const cookieHeader = request.headers.get("Cookie") || "";
+
+  const cookie = cookieHeader
+    .split(";")
+    .map((item) => item.trim())
+    .find((item) => item.startsWith(`${name}=`));
+
+  return cookie ? cookie.slice(name.length + 1) : null;
+}
+
+async function createOAuthState(
+  email: string,
+  secret: string,
+): Promise<{ state: string; nonce: string }> {
+  const nonceBytes = crypto.getRandomValues(new Uint8Array(32));
+  const nonce = base64UrlEncode(nonceBytes);
+
+  const payload: GoogleOAuthState = {
+    email,
+    nonce,
+    exp: Math.floor(Date.now() / 1000) + 10 * 60,
+  };
+
+  const encoded = base64UrlEncode(
+    new TextEncoder().encode(JSON.stringify(payload)),
+  );
+
+  const signature = base64UrlEncode(
+    await hmac(encoded, secret),
+  );
+
+  return {
+    state: `${encoded}.${signature}`,
+    nonce,
+  };
+}
+
+async function verifyOAuthState(
+  state: string,
+  secret: string,
+): Promise<GoogleOAuthState | null> {
+  try {
+    const parts = state.split(".");
+    if (parts.length !== 2) return null;
+
+    const [encoded, suppliedSignature] = parts;
+    if (!encoded || !suppliedSignature) return null;
+
+    const expectedSignature = base64UrlEncode(
+      await hmac(encoded, secret),
+    );
+
+    if (suppliedSignature.length !== expectedSignature.length) {
+      return null;
+    }
+
+    let difference = 0;
+
+    for (let i = 0; i < expectedSignature.length; i++) {
+      difference |=
+        suppliedSignature.charCodeAt(i) ^
+        expectedSignature.charCodeAt(i);
+    }
+
+    if (difference !== 0) return null;
+
+    const payload = JSON.parse(
+      new TextDecoder().decode(base64UrlDecode(encoded)),
+    ) as GoogleOAuthState;
+
+    if (
+      typeof payload.email !== "string" ||
+      typeof payload.nonce !== "string" ||
+      typeof payload.exp !== "number" ||
+      payload.exp <= Math.floor(Date.now() / 1000)
+    ) {
+      return null;
+    }
+
+    return payload;
+  } catch {
+    return null;
+  }
+}
+
+async function encryptToken(
+  plaintext: string,
+  encodedKey: string,
+): Promise<string> {
+  const rawKey = base64UrlDecode(encodedKey);
+
+  if (rawKey.length !== 32) {
+    throw new Error(
+      "TOKEN_ENCRYPTION_KEY must decode to exactly 32 bytes",
+    );
+  }
+
+  const key = await crypto.subtle.importKey(
+    "raw",
+    rawKey,
+    { name: "AES-GCM" },
+    false,
+    ["encrypt"],
+  );
+
+  const iv = crypto.getRandomValues(new Uint8Array(12));
+
+  const ciphertext = await crypto.subtle.encrypt(
+    { name: "AES-GCM", iv },
+    key,
+    new TextEncoder().encode(plaintext),
+  );
+
+  return `${base64UrlEncode(iv)}.${base64UrlEncode(
+    new Uint8Array(ciphertext),
+  )}`;
+}
+
+async function decryptToken(
+  encrypted: string,
+  encodedKey: string,
+): Promise<string> {
+  const parts = encrypted.split(".");
+  if (parts.length !== 2) {
+    throw new Error("Invalid encrypted token format");
+  }
+
+  const [encodedIv, encodedCiphertext] = parts;
+  if (!encodedIv || !encodedCiphertext) {
+    throw new Error("Encrypted token is incomplete");
+  }
+
+  const rawKey = base64UrlDecode(encodedKey);
+
+  if (rawKey.length !== 32) {
+    throw new Error(
+      "TOKEN_ENCRYPTION_KEY must decode to exactly 32 bytes",
+    );
+  }
+
+  const key = await crypto.subtle.importKey(
+    "raw",
+    rawKey,
+    { name: "AES-GCM" },
+    false,
+    ["decrypt"],
+  );
+
+  const plaintext = await crypto.subtle.decrypt(
+    {
+      name: "AES-GCM",
+      iv: base64UrlDecode(encodedIv),
+    },
+    key,
+    base64UrlDecode(encodedCiphertext),
+  );
+
+  return new TextDecoder().decode(plaintext);
+}
+
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
     const url = new URL(request.url);
