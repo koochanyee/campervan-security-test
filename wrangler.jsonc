@@ -9,7 +9,8 @@
 	"compatibility_date": "2025-10-08",
 	"assets": {
 		"directory": "./dist",
-		"not_found_handling": "single-page-application"
+		"not_found_handling": "single-page-application",
+		"run_worker_first": ["/api/*"]
 	},
 	"observability": {
 		"enabled": true
@@ -50,9 +51,22 @@
 		}
 	],
     "vars": {
+      "GOOGLE_SHEET_ID": "1L_GUByHbUMIORDakIRutHUwK9pNMYPAsm1H1fe6RMB0",
+      "GOOGLE_SHEET_TAB": "FINAL ITINERARY",
+    },
+    "previews": {
+      "vars": {
+        "GOOGLE_CLIENT_ID": "269076730966-j59ftkgn019lqmtlsgskg99bfi3ssggb.apps.googleusercontent.com",
+        "APPROVED_EMAILS": "koochanyee@gmail.com,wookahwai@gmail.com",
         "GOOGLE_SHEET_ID": "1L_GUByHbUMIORDakIRutHUwK9pNMYPAsm1H1fe6RMB0",
         "GOOGLE_SHEET_TAB": "FINAL ITINERARY"
+      },
+      "kv_namespaces": [
+        {
+          "binding": "OAUTH_TOKEN_STORE",
+          "id": "95841caaf7584e2ab56c3dc2915522ff"
+        }
+      ]
     },
-    "previews": {},
-	"upload_source_maps": true
+    "upload_source_maps": true
 }
