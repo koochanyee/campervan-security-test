@@ -25,13 +25,7 @@ declare global {
 	}
 }
 
-function App() {
-	const [instanceId, setInstanceId] = useState<string | null>(null);
-	const [isStarting, setIsStarting] = useState(false);
-	const [authMessage, setAuthMessage] = useState("");
-	const [isVerifying, setIsVerifying] = useState(false);
-	const [verifiedEmail, setVerifiedEmail] = useState("");
-	
+
 function App() {
     const [instanceId, setInstanceId] = useState<string | null>(null);
     const [isStarting, setIsStarting] = useState(false);
