@@ -31,7 +31,51 @@ function App() {
 	const [authMessage, setAuthMessage] = useState("");
 	const [isVerifying, setIsVerifying] = useState(false);
 	const [verifiedEmail, setVerifiedEmail] = useState("");
-	const workflowState = useWorkflowWebSocket(instanceId);
+	
+function App() {
+    const [instanceId, setInstanceId] = useState<string | null>(null);
+    const [isStarting, setIsStarting] = useState(false);
+    const [authMessage, setAuthMessage] = useState("");
+    const [isVerifying, setIsVerifying] = useState(false);
+    const [verifiedEmail, setVerifiedEmail] = useState("");
+
+    // Restore the existing login session after a page refresh.
+    useEffect(() => {
+        let cancelled = false;
+
+        async function restoreSession() {
+            try {
+                const result = await fetch("/api/auth/session", {
+                    method: "GET",
+                    credentials: "same-origin",
+                });
+
+                if (!result.ok) {
+                    return;
+                }
+
+                const data = await result.json();
+
+                if (!cancelled && data.success && data.user?.email) {
+                    setVerifiedEmail(data.user.email);
+                    setAuthMessage(
+                        "Existing session restored. Trip access granted."
+                    );
+                }
+            } catch (error) {
+                console.error("Session restoration failed:", error);
+            }
+        }
+
+        restoreSession();
+
+        return () => {
+            cancelled = true;
+        };
+    }, []);
+
+    const workflowState = useWorkflowWebSocket(instanceId);
+
 
 	useEffect(() => {
 		if (workflowState.workflowStatus === "completed") {
