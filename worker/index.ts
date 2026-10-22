@@ -583,6 +583,433 @@ export default {
         },
       });
     }
+    
+    // Start Google Sheets OAuth authorization
+    if (
+      url.pathname === "/api/sheets/connect" &&
+      request.method === "GET"
+    ) {
+      const session = await readSession(request, env);
+
+      if (!session) {
+        return jsonResponse(
+          { success: false, error: "Authentication required" },
+          401,
+        );
+      }
+
+      if (
+        !env.GOOGLE_CLIENT_ID ||
+        !env.GOOGLE_CLIENT_SECRET ||
+        !env.SESSION_SECRET ||
+        !env.OAUTH_TOKEN_STORE ||
+        !env.TOKEN_ENCRYPTION_KEY
+      ) {
+        return jsonResponse(
+          { error: "Google Sheets OAuth is not fully configured" },
+          500,
+        );
+      }
+
+      try {
+        const { state, nonce } = await createOAuthState(
+          session.email,
+          env.SESSION_SECRET,
+        );
+
+        await env.OAUTH_TOKEN_STORE.put(
+          `oauth-state:${nonce}`,
+          session.email,
+          { expirationTtl: 600 },
+        );
+
+        const callbackUrl = `${url.origin}/api/sheets/callback`;
+        const googleUrl = new URL(
+          "https://accounts.google.com/o/oauth2/v2/auth",
+        );
+
+        googleUrl.searchParams.set("client_id", env.GOOGLE_CLIENT_ID);
+        googleUrl.searchParams.set("redirect_uri", callbackUrl);
+        googleUrl.searchParams.set("response_type", "code");
+        googleUrl.searchParams.set(
+          "scope",
+          "https://www.googleapis.com/auth/spreadsheets.readonly",
+        );
+        googleUrl.searchParams.set("access_type", "offline");
+        googleUrl.searchParams.set("prompt", "consent");
+        googleUrl.searchParams.set("state", state);
+
+        return new Response(null, {
+          status: 302,
+          headers: {
+            Location: googleUrl.toString(),
+            "Cache-Control": "no-store",
+            "Set-Cookie":
+              `m3_oauth_state=${nonce}; Path=/api/sheets/callback; ` +
+              "HttpOnly; Secure; SameSite=Lax; Max-Age=600",
+          },
+        });
+      } catch {
+        return jsonResponse(
+          { error: "Could not start Google Sheets authorization" },
+          500,
+        );
+      }
+    }
+
+    // Complete Google Sheets OAuth authorization
+    if (
+      url.pathname === "/api/sheets/callback" &&
+      request.method === "GET"
+    ) {
+      const session = await readSession(request, env);
+      const state = url.searchParams.get("state");
+      const code = url.searchParams.get("code");
+      const oauthError = url.searchParams.get("error");
+      const nonceCookie = getCookie(request, "m3_oauth_state");
+
+      const clearStateCookie =
+        "m3_oauth_state=; Path=/api/sheets/callback; " +
+        "HttpOnly; Secure; SameSite=Lax; Max-Age=0";
+
+      if (oauthError) {
+        return new Response(
+          "Google Sheets authorization was cancelled or denied. You may return to the app and try again.",
+          {
+            status: 400,
+            headers: {
+              "Cache-Control": "no-store",
+              "Set-Cookie": clearStateCookie,
+            },
+          },
+        );
+      }
+
+      if (!session || !state || !code || !nonceCookie) {
+        return new Response(
+          "Authorization failed. Please sign in again and retry.",
+          {
+            status: 401,
+            headers: {
+              "Cache-Control": "no-store",
+              "Set-Cookie": clearStateCookie,
+            },
+          },
+        );
+      }
+
+      if (
+        !env.GOOGLE_CLIENT_ID ||
+        !env.GOOGLE_CLIENT_SECRET ||
+        !env.SESSION_SECRET ||
+        !env.TOKEN_ENCRYPTION_KEY ||
+        !env.OAUTH_TOKEN_STORE
+      ) {
+        return new Response("OAuth configuration is incomplete.", {
+          status: 500,
+          headers: {
+            "Cache-Control": "no-store",
+            "Set-Cookie": clearStateCookie,
+          },
+        });
+      }
+
+      try {
+        const verifiedState = await verifyOAuthState(
+          state,
+          env.SESSION_SECRET,
+        );
+
+        if (
+          !verifiedState ||
+          verifiedState.email !== session.email ||
+          verifiedState.nonce !== nonceCookie
+        ) {
+          return new Response(
+            "Invalid or expired authorization state. Please retry.",
+            {
+              status: 400,
+              headers: {
+                "Cache-Control": "no-store",
+                "Set-Cookie": clearStateCookie,
+              },
+            },
+          );
+        }
+
+        const stateKey = `oauth-state:${verifiedState.nonce}`;
+        const storedEmail = await env.OAUTH_TOKEN_STORE.get(stateKey);
+
+        if (
+          !storedEmail ||
+          storedEmail.toLowerCase() !== session.email.toLowerCase()
+        ) {
+          return new Response(
+            "Authorization state has expired or already been used. Please retry.",
+            {
+              status: 400,
+              headers: {
+                "Cache-Control": "no-store",
+                "Set-Cookie": clearStateCookie,
+              },
+            },
+          );
+        }
+
+        // Consume the state record before exchanging the authorization code.
+        await env.OAUTH_TOKEN_STORE.delete(stateKey);
+
+        const callbackUrl = `${url.origin}/api/sheets/callback`;
+        const form = new URLSearchParams({
+          code,
+          client_id: env.GOOGLE_CLIENT_ID,
+          client_secret: env.GOOGLE_CLIENT_SECRET,
+          redirect_uri: callbackUrl,
+          grant_type: "authorization_code",
+        });
+
+        const tokenResponse = await fetch(
+          "https://oauth2.googleapis.com/token",
+          {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/x-www-form-urlencoded",
+            },
+            body: form.toString(),
+          },
+        );
+
+        if (!tokenResponse.ok) {
+          return new Response(
+            "Google could not complete authorization. Please retry.",
+            {
+              status: 502,
+              headers: {
+                "Cache-Control": "no-store",
+                "Set-Cookie": clearStateCookie,
+              },
+            },
+          );
+        }
+
+        const tokens =
+          (await tokenResponse.json()) as GoogleOAuthTokenResponse;
+
+        if (!tokens.refresh_token) {
+          return new Response(
+            "Google did not return a refresh token. Revoke this app's access in your Google Account and try connecting again.",
+            {
+              status: 400,
+              headers: {
+                "Cache-Control": "no-store",
+                "Set-Cookie": clearStateCookie,
+              },
+            },
+          );
+        }
+
+        const encryptedToken = await encryptToken(
+          tokens.refresh_token,
+          env.TOKEN_ENCRYPTION_KEY,
+        );
+
+        await env.OAUTH_TOKEN_STORE.put(
+          `google-refresh:${session.email.toLowerCase()}`,
+          encryptedToken,
+        );
+
+        return new Response(null, {
+          status: 302,
+          headers: {
+            Location: `${url.origin}/?sheets=connected`,
+            "Cache-Control": "no-store",
+            "Set-Cookie": clearStateCookie,
+          },
+        });
+      } catch {
+        return new Response(
+          "An unexpected error occurred during Google authorization.",
+          {
+            status: 500,
+            headers: {
+              "Cache-Control": "no-store",
+              "Set-Cookie": clearStateCookie,
+            },
+          },
+        );
+      }
+    }
+
+    
+    // Read the signed-in user's Google Sheets itinerary.
+    if (request.method === "GET" && url.pathname === "/api/itinerary") {
+      const session = await readSession(request, env);
+
+      if (!session) {
+        return jsonResponse(
+          { success: false, error: "Authentication required." },
+          401,
+        );
+      }
+
+      if (
+        !env.GOOGLE_CLIENT_ID ||
+        !env.GOOGLE_CLIENT_SECRET ||
+        !env.TOKEN_ENCRYPTION_KEY ||
+        !env.GOOGLE_SHEET_ID ||
+        !env.GOOGLE_SHEET_TAB ||
+        !env.OAUTH_TOKEN_STORE
+      ) {
+        return jsonResponse(
+          { success: false, error: "Itinerary service is not configured." },
+          500,
+        );
+      }
+
+      try {
+        const tokenKey =
+          `google-refresh:${session.email.toLowerCase()}`;
+
+        const encryptedRefreshToken =
+          await env.OAUTH_TOKEN_STORE.get(tokenKey);
+
+        if (!encryptedRefreshToken) {
+          return jsonResponse(
+            {
+              success: false,
+              error: "Google Sheets is not connected.",
+              connectUrl: "/api/sheets/connect",
+            },
+            403,
+          );
+        }
+
+        const refreshToken = await decryptToken(
+          encryptedRefreshToken,
+          env.TOKEN_ENCRYPTION_KEY,
+        );
+
+        const tokenResponse = await fetch(
+          "https://oauth2.googleapis.com/token",
+          {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/x-www-form-urlencoded",
+            },
+            body: new URLSearchParams({
+              client_id: env.GOOGLE_CLIENT_ID,
+              client_secret: env.GOOGLE_CLIENT_SECRET,
+              refresh_token: refreshToken,
+              grant_type: "refresh_token",
+            }).toString(),
+          },
+        );
+
+        if (!tokenResponse.ok) {
+          return jsonResponse(
+            {
+              success: false,
+              error: "Could not refresh Google access. Please reconnect Google Sheets.",
+              connectUrl: "/api/sheets/connect",
+            },
+            502,
+          );
+        }
+
+        const tokenData = (await tokenResponse.json()) as {
+          access_token?: string;
+        };
+
+        if (!tokenData.access_token) {
+          return jsonResponse(
+            { success: false, error: "Google returned no access token." },
+            502,
+          );
+        }
+
+        const range =
+          `'${env.GOOGLE_SHEET_TAB.replace(/'/g, "''")}'!A:ZZZ`;
+
+        const sheetUrl =
+          `https://sheets.googleapis.com/v4/spreadsheets/` +
+          `${encodeURIComponent(env.GOOGLE_SHEET_ID)}/values/` +
+          `${encodeURIComponent(range)}`;
+
+        const sheetResponse = await fetch(sheetUrl, {
+          headers: {
+            Authorization: `Bearer ${tokenData.access_token}`,
+          },
+        });
+
+        if (!sheetResponse.ok) {
+          return jsonResponse(
+            {
+              success: false,
+              error: "Could not read the Google Sheet. Check the sheet permissions and configuration.",
+            },
+            502,
+          );
+        }
+
+        const sheetData = (await sheetResponse.json()) as {
+          values?: unknown[][];
+        };
+
+        const rows = sheetData.values ?? [];
+
+        if (rows.length === 0) {
+          return jsonResponse(
+            { success: true, data: [], count: 0 },
+            200,
+          );
+        }
+
+        const rawHeaders = rows[0].map((value) =>
+          String(value ?? "").trim(),
+        );
+
+        const headers: string[] = [];
+
+        rawHeaders.forEach((header, index) => {
+          const base = header || `column_${index + 1}`;
+          let key = base;
+          let suffix = 2;
+
+          while (headers.includes(key)) {
+            key = `${base}_${suffix++}`;
+          }
+
+          headers.push(key);
+        });
+
+        const data = rows.slice(1)
+          .filter((row) =>
+            row.some((value) => String(value ?? "").trim() !== ""),
+          )
+          .map((row) => {
+            const item: Record<string, string> = {};
+
+            headers.forEach((header, index) => {
+              item[header] = String(row[index] ?? "");
+            });
+
+            return item;
+          });
+
+        return jsonResponse(
+          { success: true, data, count: data.length },
+          200,
+        );
+      } catch {
+        return jsonResponse(
+          {
+            success: false,
+            error: "An unexpected error occurred while reading the itinerary.",
+          },
+          500,
+        );
+      }
+    }
 
     // Require an approved session for workflow APIs and WebSockets.
     if (
