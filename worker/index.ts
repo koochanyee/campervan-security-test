@@ -373,6 +373,32 @@ export default {
       }
     }
 
+    // Check whether the current browser has a valid session
+    if (
+      url.pathname === "/api/auth/session" &&
+      request.method === "GET"
+    ) {
+      const session = await readSession(request, env);
+
+      if (!session) {
+        return jsonResponse(
+          {
+            success: false,
+            error: "Authentication required",
+          },
+          401,
+        );
+      }
+
+      return jsonResponse({
+        success: true,
+        user: {
+          email: session.email,
+          googleId: session.googleId,
+        },
+      });
+    }
+
     // Require an approved session for workflow APIs and WebSockets.
     if (
       url.pathname.startsWith("/api/workflow/") ||
