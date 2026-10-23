@@ -1007,13 +1007,14 @@ export default {
        );
 
        return jsonResponse(
-         {
-           success: false,
-           error: "An unexpected error occurred while reading the itinerary.",
-         },
-         500,
-       );
-     }
+          {
+            success: false,
+            error: "An unexpected error occurred while reading the itinerary.",
+          },
+          500,
+        );
+      }
+    }
 
     // Require an approved session for workflow APIs and WebSockets.
     if (
