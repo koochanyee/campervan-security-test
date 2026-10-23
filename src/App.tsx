@@ -1,7 +1,14 @@
 import { useEffect, useMemo, useState } from "react";
 
 type ItineraryRow = Record<string, string>;
-type ViewName = "home" | "itinerary" | "expenses" | "memories" | "map";
+type ViewName =
+  | "home"
+  | "checklist"
+  | "companion"
+  | "itinerary"
+  | "expenses"
+  | "memories"
+  | "map";
 
 type ApiResponse = {
   success?: boolean;
@@ -73,6 +80,7 @@ function App() {
   const [refreshKey, setRefreshKey] = useState(0);
   const [activeDayIndex, setActiveDayIndex] = useState(0);
   const [activeView, setActiveView] = useState<ViewName>("home");
+  const [preTripChecklist, setPreTripChecklist] = useState<Record<string, boolean>>({});
 
   useEffect(() => {
     let cancelled = false;
@@ -322,7 +330,7 @@ function App() {
                         <p className="mt-3 max-w-xl text-sm leading-6 text-emerald-50">Your shared home for the daily plan, trip reminders, expenses and memories.</p>
                       </div>
                     </div>
-                    <button type="button" onClick={() => navigateToItinerary()} disabled={tripDays.length === 0} className="mt-6 rounded-xl bg-white px-5 py-3 text-sm font-bold text-emerald-950 shadow-sm hover:bg-emerald-50 disabled:opacity-50">View itinerary <span aria-hidden="true">→</span></button>
+                    <button   type="button"   onClick={() => setActiveView("checklist")}   className="mt-6 rounded-xl bg-white px-5 py-3 text-sm font-bold text-emerald-950 shadow-sm hover:bg-emerald-50" >   START JOURNEY ✈️🚐   <span aria-hidden="true"> →</span> </button>
                   </div>
                 </section>
 
@@ -470,6 +478,118 @@ function App() {
                 )}
               </section>
             )}
+
+            {!isLoadingItinerary && !itineraryError && activeView === "checklist" && (
+              <section className="rounded-2xl border border-slate-200 bg-white p-5 shadow-sm sm:p-7">
+                <button
+                  type="button"
+                  onClick={() => setActiveView("home")}
+                  className="text-sm font-semibold text-emerald-800 hover:underline"
+                >
+                  ← Back to dashboard
+                </button>
+
+                <p className="mt-6 text-xs font-bold uppercase tracking-[0.16em] text-emerald-800">
+                  Before departure
+                </p>
+                <h2 className="mt-2 text-2xl font-bold">Travel checklist</h2>
+                <p className="mt-2 text-sm text-slate-600">
+                  Check the essentials before starting your South Island journey.
+                </p>
+
+                <div className="mt-5 space-y-3">
+                  {[
+                    { id: "passport", label: "Passport and travel documents" },
+                    { id: "wallet", label: "Wallet, bank cards and cash" },
+                    { id: "visa", label: "Visa / NZeTA requirements checked" },
+                    { id: "booking", label: "Flight, campervan and accommodation bookings" },
+                    { id: "driving", label: "Driving licence and required permits" },
+                    { id: "insurance", label: "Travel and vehicle insurance" },
+                    { id: "phone", label: "Phone, chargers and power bank" },
+                    { id: "medicine", label: "Personal medication and essentials" },
+                  ].map((item) => (
+                    <label
+                      key={item.id}
+                      className="flex cursor-pointer items-start gap-3 rounded-xl border border-slate-200 p-4 hover:bg-slate-50"
+                    >
+                      <input
+                        type="checkbox"
+                        checked={Boolean(preTripChecklist[item.id])}
+                        onChange={(event) =>
+                          setPreTripChecklist((previous) => ({
+                            ...previous,
+                            [item.id]: event.target.checked,
+                          }))
+                        }
+                        className="mt-1 h-4 w-4 accent-emerald-700"
+                      />
+                      <span className="text-sm font-medium text-slate-800">
+                        {item.label}
+                      </span>
+                    </label>
+                  ))}
+                </div>
+
+                <p className="mt-4 text-sm text-slate-500">
+                  Completed: {Object.values(preTripChecklist).filter(Boolean).length} of 8 items
+                </p>
+
+                <button
+                  type="button"
+                  onClick={() => setActiveView("companion")}
+                  className="mt-6 w-full rounded-xl bg-emerald-800 px-5 py-3 font-bold text-white hover:bg-emerald-900"
+                >
+                  See Companion →
+                </button>
+              </section>
+            )}
+
+            {!isLoadingItinerary && !itineraryError && activeView === "companion" && (
+              <section className="rounded-2xl border border-slate-200 bg-white p-5 shadow-sm sm:p-7">
+                <button
+                  type="button"
+                  onClick={() => setActiveView("checklist")}
+                  className="text-sm font-semibold text-emerald-800 hover:underline"
+                >
+                  ← Back to checklist
+                </button>
+
+                <div className="mt-6 flex h-16 w-16 items-center justify-center rounded-2xl bg-emerald-50 text-3xl">
+                  ❤️
+                </div>
+
+                <p className="mt-5 text-xs font-bold uppercase tracking-[0.16em] text-emerald-800">
+                  Your travel companion
+                </p>
+                <h2 className="mt-2 text-2xl font-bold">Two travellers, one journey</h2>
+                <p className="mt-3 text-sm leading-6 text-slate-600">
+                  Your shared South Island trip, itinerary and travel memories belong
+                  in one place. Sign in using your own approved Google account.
+                </p>
+
+                <div className="mt-5 rounded-xl border border-slate-200 p-4">
+                  <p className="text-xs font-semibold uppercase tracking-wide text-slate-500">
+                    Currently signed in
+                  </p>
+                  <p className="mt-1 break-all font-medium text-slate-900">
+                    {verifiedEmail}
+                  </p>
+                </div>
+
+                <p className="mt-4 text-sm text-slate-500">
+                  Shared companion profiles and live shared editing are not connected yet.
+                </p>
+
+                <button
+                  type="button"
+                  onClick={() => navigateToItinerary()}
+                  disabled={tripDays.length === 0}
+                  className="mt-6 w-full rounded-xl bg-emerald-800 px-5 py-3 font-bold text-white hover:bg-emerald-900 disabled:opacity-50"
+                >
+                  Show Itinerary →
+                </button>
+              </section>
+            )}            
 
             {!isLoadingItinerary && !itineraryError && ["expenses", "memories", "map"].includes(activeView) && (
               <section className="rounded-2xl border border-slate-200 bg-white p-6 shadow-sm sm:p-8">
