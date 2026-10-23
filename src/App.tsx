@@ -1,6 +1,7 @@
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 
 type ItineraryRow = Record<string, string>;
+type ViewName = "home" | "itinerary" | "expenses" | "memories" | "map";
 
 type ApiResponse = {
   success?: boolean;
@@ -10,6 +11,19 @@ type ApiResponse = {
   error?: string;
   connectUrl?: string;
   message?: string;
+};
+
+type TripDay = {
+  key: string;
+  weekday: string;
+  date: string;
+  dateObject: Date | null;
+};
+
+type DayEntry = {
+  key: string;
+  label: string;
+  value: string;
 };
 
 declare global {
@@ -31,21 +45,37 @@ declare global {
   }
 }
 
+const TRIP_YEAR = 2026;
+const MONTHS = ["jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"];
+
+function parseTripDate(label: string): Date | null {
+  const match = label.trim().match(/^(\d{1,2})\s+([A-Za-z]{3,})/);
+  if (!match) return null;
+  const day = Number(match[1]);
+  const month = MONTHS.indexOf(match[2].slice(0, 3).toLowerCase());
+  if (month < 0 || day < 1 || day > 31) return null;
+  const result = new Date(TRIP_YEAR, month, day);
+  return result.getMonth() === month && result.getDate() === day ? result : null;
+}
+
+function dateIsSameDay(a: Date, b: Date): boolean {
+  return a.getFullYear() === b.getFullYear() && a.getMonth() === b.getMonth() && a.getDate() === b.getDate();
+}
+
 function App() {
   const [authMessage, setAuthMessage] = useState("");
   const [isVerifying, setIsVerifying] = useState(false);
   const [verifiedEmail, setVerifiedEmail] = useState("");
-
   const [itineraryRows, setItineraryRows] = useState<ItineraryRow[]>([]);
   const [isLoadingItinerary, setIsLoadingItinerary] = useState(false);
   const [itineraryError, setItineraryError] = useState("");
   const [needsSheetsConnection, setNeedsSheetsConnection] = useState(false);
   const [refreshKey, setRefreshKey] = useState(0);
+  const [activeDayIndex, setActiveDayIndex] = useState(0);
+  const [activeView, setActiveView] = useState<ViewName>("home");
 
-  // Restore the existing app login after a page refresh or OAuth redirect.
   useEffect(() => {
     let cancelled = false;
-
     async function restoreSession() {
       try {
         const response = await fetch("/api/auth/session", {
@@ -54,7 +84,6 @@ function App() {
           cache: "no-store",
         });
         if (!response.ok) return;
-
         const result = (await response.json()) as ApiResponse;
         if (!cancelled && result.success && result.user?.email) {
           setVerifiedEmail(result.user.email);
@@ -64,17 +93,12 @@ function App() {
         console.error("Session restoration failed:", error);
       }
     }
-
     void restoreSession();
-    return () => {
-      cancelled = true;
-    };
+    return () => { cancelled = true; };
   }, []);
 
-  // Google Identity Services sign-in. The client ID is public and is embedded at build time.
   useEffect(() => {
     const clientId = import.meta.env.VITE_GOOGLE_CLIENT_ID as string | undefined;
-
     if (!clientId) {
       setAuthMessage("Google sign-in configuration is missing.");
       return;
@@ -82,25 +106,21 @@ function App() {
 
     let attempts = 0;
     let timer: ReturnType<typeof setInterval> | undefined;
-
     const setupGoogleSignIn = () => {
       if (!window.google?.accounts.id) {
         attempts += 1;
         if (attempts >= 20 && timer) clearInterval(timer);
         return;
       }
-
       if (timer) clearInterval(timer);
       const button = document.getElementById("google-sign-in-button");
       if (!button) return;
-
       button.replaceChildren();
       window.google.accounts.id.initialize({
         client_id: clientId,
         callback: async (response) => {
           setAuthMessage("Verifying Google account…");
           setIsVerifying(true);
-
           try {
             const result = await fetch("/api/auth/google", {
               method: "POST",
@@ -109,51 +129,33 @@ function App() {
               body: JSON.stringify({ credential: response.credential }),
             });
             const data = (await result.json()) as ApiResponse;
-
             if (!result.ok || !data.success || !data.user?.email) {
               throw new Error(data.error || "Google verification failed.");
             }
-
             setVerifiedEmail(data.user.email);
-            setAuthMessage("Google identity verified. Loading your itinerary…");
+            setAuthMessage("Google identity verified. Loading your trip dashboard…");
           } catch (error) {
-            setAuthMessage(
-              error instanceof Error
-                ? error.message
-                : "Google verification failed. Please try again.",
-            );
+            setAuthMessage(error instanceof Error ? error.message : "Google verification failed. Please try again.");
           } finally {
             setIsVerifying(false);
           }
         },
       });
-
-      window.google.accounts.id.renderButton(button, {
-        theme: "outline",
-        size: "large",
-        text: "signin_with",
-      });
+      window.google.accounts.id.renderButton(button, { theme: "outline", size: "large", text: "signin_with" });
     };
 
     setupGoogleSignIn();
     if (!window.google?.accounts.id) timer = setInterval(setupGoogleSignIn, 500);
-
-    return () => {
-      if (timer) clearInterval(timer);
-    };
+    return () => { if (timer) clearInterval(timer); };
   }, []);
 
-  // Load rows from the connected Google Sheet whenever a user session is available.
   useEffect(() => {
     if (!verifiedEmail) return;
-
     let cancelled = false;
-
     async function loadItinerary() {
       setIsLoadingItinerary(true);
       setItineraryError("");
       setNeedsSheetsConnection(false);
-
       try {
         const response = await fetch("/api/itinerary", {
           method: "GET",
@@ -161,178 +163,361 @@ function App() {
           cache: "no-store",
         });
         const result = (await response.json()) as ApiResponse;
-
         if (!response.ok || !result.success) {
           if (!cancelled) {
             setItineraryRows([]);
-            setNeedsSheetsConnection(
-              response.status === 403 || Boolean(result.connectUrl),
-            );
+            setNeedsSheetsConnection(response.status === 403 || Boolean(result.connectUrl));
             setItineraryError(result.error || `Could not load itinerary (HTTP ${response.status}).`);
           }
           return;
         }
-
         if (!cancelled) {
-          setItineraryRows(Array.isArray(result.data) ? result.data : []);
+          const rows = Array.isArray(result.data) ? result.data : [];
+          setItineraryRows(rows);
+          setActiveDayIndex(0);
           setItineraryError("");
           setNeedsSheetsConnection(false);
           setAuthMessage("Signed in. Itinerary loaded from Google Sheets.");
         }
       } catch (error) {
-        if (!cancelled) {
-          setItineraryError(
-            error instanceof Error ? error.message : "Could not load itinerary.",
-          );
-        }
+        if (!cancelled) setItineraryError(error instanceof Error ? error.message : "Could not load itinerary.");
       } finally {
         if (!cancelled) setIsLoadingItinerary(false);
       }
     }
-
     void loadItinerary();
-    return () => {
-      cancelled = true;
-    };
+    return () => { cancelled = true; };
   }, [verifiedEmail, refreshKey]);
 
-  const headers = itineraryRows.length > 0 ? Object.keys(itineraryRows[0]) : [];
+  const headerKeys = useMemo(() => (itineraryRows.length > 0 ? Object.keys(itineraryRows[0]) : []), [itineraryRows]);
+  const labelKey = headerKeys[0] || "DAY";
+
+  const tripDays = useMemo<TripDay[]>(() => {
+    if (itineraryRows.length === 0 || headerKeys.length < 2) return [];
+    const dateRow = itineraryRows[0];
+    return headerKeys.slice(1).flatMap((key) => {
+      const date = String(dateRow[key] ?? "").trim();
+      if (!date) return [];
+      return [{
+        key,
+        weekday: key.replace(/_\d+$/, "").replace(/_/g, " ").toUpperCase(),
+        date,
+        dateObject: parseTripDate(date),
+      }];
+    });
+  }, [headerKeys, itineraryRows]);
+
+  const safeDayIndex = tripDays.length > 0 ? Math.min(activeDayIndex, tripDays.length - 1) : 0;
+  const selectedDay = tripDays[safeDayIndex];
+  const today = new Date();
+  const liveDayIndex = tripDays.findIndex((day) => day.dateObject && dateIsSameDay(day.dateObject, today));
+  const dashboardDayIndex = liveDayIndex >= 0 ? liveDayIndex : safeDayIndex;
+  const dashboardDay = tripDays[dashboardDayIndex];
+  const tripStart = tripDays[0]?.dateObject;
+  const tripEnd = tripDays[tripDays.length - 1]?.dateObject;
+  const isTripOngoing = Boolean(tripStart && tripEnd && today >= tripStart && today <= tripEnd);
+  const isTripUpcoming = Boolean(tripStart && today < tripStart);
+  const dateRange = tripDays.length > 0
+    ? `${tripDays[0].date}–${tripDays[tripDays.length - 1].date} ${TRIP_YEAR}`
+    : "Trip dates will appear here";
+
+  const getEntriesForDay = (day: TripDay | undefined): DayEntry[] => {
+    if (!day || itineraryRows.length < 2) return [];
+    return itineraryRows.slice(1).flatMap((row, index) => {
+      const value = String(row[day.key] ?? "").trim();
+      if (!value) return [];
+      const label = String(row[labelKey] ?? "").trim() || `Itinerary item ${index + 1}`;
+      return [{ key: `${day.key}-${index}`, label, value }];
+    });
+  };
+
+  const dayEntries = useMemo<DayEntry[]>(() => {
+    if (!selectedDay || itineraryRows.length < 2) return [];
+    return itineraryRows.slice(1).flatMap((row, index) => {
+      const value = String(row[selectedDay.key] ?? "").trim();
+      if (!value) return [];
+      const label = String(row[labelKey] ?? "").trim() || `Itinerary item ${index + 1}`;
+      return [{ key: `${selectedDay.key}-${index}`, label, value }];
+    });
+  }, [selectedDay, itineraryRows, labelKey]);
+
+  const dashboardEntries = getEntriesForDay(dashboardDay);
+  const entryCounts = useMemo(() => {
+    const counts = new Map<string, number>();
+    for (const day of tripDays) {
+      counts.set(day.key, itineraryRows.slice(1).reduce((total, row) => total + (String(row[day.key] ?? "").trim() ? 1 : 0), 0));
+    }
+    return counts;
+  }, [itineraryRows, tripDays]);
+
+  const categorized = useMemo(() => {
+    const groups: Record<string, DayEntry[]> = {
+      route: [],
+      places: [],
+      stay: [],
+      other: [],
+    };
+    for (const entry of dayEntries) {
+      const label = entry.label.toLowerCase();
+      if (/route|drive|driving|destination|distance|travel time|departure|arrival|transport/.test(label)) groups.route.push(entry);
+      else if (/attraction|place|visit|activity|experience|sight|stop|location|walk|hike|tour/.test(label)) groups.places.push(entry);
+      else if (/camp|campsite|accommodation|hotel|booking|check.?in|reservation|stay|overnight/.test(label)) groups.stay.push(entry);
+      else groups.other.push(entry);
+    }
+    return groups;
+  }, [dayEntries]);
+
+  const navigateToItinerary = (dayIndex = dashboardDayIndex) => {
+    setActiveDayIndex(Math.max(0, Math.min(dayIndex, Math.max(0, tripDays.length - 1))));
+    setActiveView("itinerary");
+  };
 
   return (
-    <div className="min-h-screen bg-slate-50 text-slate-900">
+    <div className="min-h-screen bg-[#f4f6f4] pb-24 text-slate-900">
       <header className="border-b border-slate-200 bg-white">
-        <div className="mx-auto flex max-w-7xl flex-col gap-3 px-4 py-5 sm:flex-row sm:items-center sm:justify-between sm:px-6">
-          <div>
-            <p className="text-xs font-semibold uppercase tracking-[0.18em] text-emerald-700">
-              Shared travel companion
-            </p>
-            <h1 className="mt-1 text-2xl font-bold tracking-tight sm:text-3xl">
-              South Island Campervan Trip
-            </h1>
-            <p className="mt-1 text-sm text-slate-500">
-              Your itinerary, loaded from Google Sheets
-            </p>
+        <div className="mx-auto flex max-w-6xl flex-col gap-3 px-4 py-4 sm:flex-row sm:items-center sm:justify-between sm:px-6">
+          <button type="button" onClick={() => setActiveView("home")} className="text-left">
+            <p className="text-xs font-bold uppercase tracking-[0.18em] text-emerald-800">Shared travel companion</p>
+            <h1 className="mt-1 text-2xl font-bold tracking-tight sm:text-3xl">New Zealand Road Trip</h1>
+            <p className="mt-1 text-sm text-slate-500">South Island · {dateRange}</p>
+          </button>
+          <div className="flex flex-wrap items-center gap-2">
+            {verifiedEmail && <span className="text-sm text-slate-600">{verifiedEmail}</span>}
+            {verifiedEmail && <button type="button" onClick={() => window.location.assign("/api/sheets/connect")} className="rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm font-semibold hover:bg-slate-50">{needsSheetsConnection ? "Connect Sheets" : "Reconnect Sheets"}</button>}
           </div>
-          {verifiedEmail && (
-            <div className="flex flex-col items-start gap-2 sm:items-end">
-              <p className="text-sm text-slate-600">Signed in as {verifiedEmail}</p>
-              <button
-                type="button"
-                onClick={() => window.location.assign("/api/sheets/connect")}
-                className="rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm font-semibold hover:bg-slate-100"
-              >
-                {needsSheetsConnection ? "Connect Google Sheets" : "Reconnect Google Sheets"}
-              </button>
-            </div>
-          )}
         </div>
       </header>
 
-      <main className="mx-auto max-w-7xl space-y-6 px-4 py-6 sm:px-6 sm:py-8">
-        <section className="rounded-2xl border border-slate-200 bg-white p-5 shadow-sm">
-          <h2 className="text-base font-semibold">Google account</h2>
-          <div className="mt-3 flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
-            <div>
-              {verifiedEmail ? (
-                <p className="text-sm text-emerald-700">Google identity verified: {verifiedEmail}</p>
-              ) : (
-                <p className="text-sm text-slate-600">
-                  Sign in with an approved Google account to view the shared itinerary.
-                </p>
-              )}
-              {authMessage && (
-                <p className="mt-1 text-sm text-slate-500" aria-live="polite">
-                  {authMessage}
-                </p>
-              )}
-              {isVerifying && <p className="mt-1 text-sm text-slate-500">Verifying account…</p>}
-            </div>
-            <div id="google-sign-in-button" className="min-h-10" />
-          </div>
-        </section>
-
-        {verifiedEmail && (
-          <section className="overflow-hidden rounded-2xl border border-slate-200 bg-white shadow-sm">
-            <div className="flex flex-col gap-3 border-b border-slate-200 px-5 py-4 sm:flex-row sm:items-center sm:justify-between">
-              <div>
-                <h2 className="text-lg font-semibold">Itinerary</h2>
-                <p className="mt-1 text-sm text-slate-500">
-                  {isLoadingItinerary
-                    ? "Loading rows from your sheet…"
-                    : `${itineraryRows.length} itinerary row${itineraryRows.length === 1 ? "" : "s"}`}
-                </p>
-              </div>
-              <button
-                type="button"
-                onClick={() => setRefreshKey((value) => value + 1)}
-                disabled={isLoadingItinerary}
-                className="rounded-lg bg-emerald-700 px-4 py-2 text-sm font-semibold text-white hover:bg-emerald-800 disabled:cursor-not-allowed disabled:opacity-50"
-              >
-                {isLoadingItinerary ? "Refreshing…" : "Refresh itinerary"}
-              </button>
-            </div>
-
-            {isLoadingItinerary && (
-              <div className="px-5 py-8 text-sm text-slate-500" role="status">
-                Loading your shared itinerary…
-              </div>
-            )}
-
-            {!isLoadingItinerary && itineraryError && (
-              <div className="m-5 rounded-xl border border-amber-200 bg-amber-50 p-4" role="alert">
-                <p className="font-semibold text-amber-900">Itinerary could not be loaded</p>
-                <p className="mt-1 text-sm text-amber-800">{itineraryError}</p>
-                {needsSheetsConnection && (
-                  <button
-                    type="button"
-                    onClick={() => window.location.assign("/api/sheets/connect")}
-                    className="mt-3 rounded-lg bg-amber-900 px-3 py-2 text-sm font-semibold text-white hover:bg-amber-950"
-                  >
-                    Connect Google Sheets
-                  </button>
-                )}
-              </div>
-            )}
-
-            {!isLoadingItinerary && !itineraryError && itineraryRows.length === 0 && (
-              <div className="px-5 py-8 text-sm text-slate-500">
-                The connection worked, but the selected sheet tab has no itinerary rows yet.
-              </div>
-            )}
-
-            {!isLoadingItinerary && !itineraryError && itineraryRows.length > 0 && (
-              <div className="max-w-full overflow-x-auto">
-                <table className="min-w-full divide-y divide-slate-200 text-left text-sm">
-                  <thead className="bg-slate-50">
-                    <tr>
-                      {headers.map((header) => (
-                        <th
-                          key={header}
-                          scope="col"
-                          className="whitespace-nowrap px-4 py-3 font-semibold text-slate-700"
-                        >
-                          {header.replace(/_/g, " ")}
-                        </th>
-                      ))}
-                    </tr>
-                  </thead>
-                  <tbody className="divide-y divide-slate-100">
-                    {itineraryRows.map((row, index) => (
-                      <tr key={index} className="align-top hover:bg-emerald-50/40">
-                        {headers.map((header) => (
-                          <td key={header} className="min-w-32 max-w-sm whitespace-pre-wrap px-4 py-3 text-slate-700">
-                            {row[header] || "—"}
-                          </td>
-                        ))}
-                      </tr>
-                    ))}
-                  </tbody>
-                </table>
-              </div>
-            )}
+      <main className="mx-auto max-w-6xl space-y-6 px-4 py-5 sm:px-6 sm:py-7">
+        {!verifiedEmail && (
+          <section className="rounded-2xl border border-slate-200 bg-white p-5 shadow-sm">
+            <h2 className="text-lg font-semibold">Google account</h2>
+            <p className="mt-2 text-sm text-slate-600">Sign in with an approved Google account to view your shared travel companion.</p>
+            {authMessage && <p className="mt-2 text-sm text-slate-500" aria-live="polite">{authMessage}</p>}
+            {isVerifying && <p className="mt-2 text-sm text-slate-500">Verifying account…</p>}
+            <div id="google-sign-in-button" className="mt-4 min-h-10" />
           </section>
         )}
+
+        {verifiedEmail && (
+          <>
+            {itineraryError && (
+              <div className="rounded-xl border border-amber-200 bg-amber-50 p-4" role="alert">
+                <p className="font-semibold text-amber-900">Itinerary could not be loaded</p>
+                <p className="mt-1 text-sm text-amber-800">{itineraryError}</p>
+                <div className="mt-3 flex flex-wrap gap-2">
+                  <button type="button" onClick={() => setRefreshKey((n) => n + 1)} className="rounded-lg bg-amber-900 px-3 py-2 text-sm font-semibold text-white">Try again</button>
+                  {needsSheetsConnection && <button type="button" onClick={() => window.location.assign("/api/sheets/connect")} className="rounded-lg border border-amber-900 px-3 py-2 text-sm font-semibold text-amber-950">Connect Google Sheets</button>}
+                </div>
+              </div>
+            )}
+
+            {isLoadingItinerary && <div className="rounded-xl border border-slate-200 bg-white p-5 text-sm text-slate-600" role="status">Loading your trip details…</div>}
+
+            {!isLoadingItinerary && !itineraryError && activeView === "home" && (
+              <div className="space-y-6">
+                <section className="relative overflow-hidden rounded-3xl bg-gradient-to-br from-emerald-950 via-emerald-800 to-teal-700 p-6 text-white shadow-sm sm:p-8">
+                  <div className="absolute -right-10 -top-12 h-56 w-56 rounded-full border border-white/10" />
+                  <div className="absolute -right-1 top-8 h-36 w-36 rounded-full border border-white/10" />
+                  <div className="relative max-w-2xl">
+                    <span className="inline-flex items-center rounded-full border border-white/25 bg-white/10 px-3 py-1 text-xs font-semibold uppercase tracking-wider">{isTripOngoing ? "During the trip" : isTripUpcoming ? "Your trip is coming up" : "Your trip dashboard"}</span>
+                    <div className="mt-5 flex items-start gap-4">
+                      <div className="flex h-14 w-14 shrink-0 items-center justify-center rounded-2xl bg-white/15 text-3xl" aria-hidden="true">🚐</div>
+                      <div>
+                        <h2 className="text-2xl font-bold sm:text-3xl">New Zealand Road Trip</h2>
+                        <p className="mt-2 text-sm text-emerald-50 sm:text-base">South Island · {dateRange}</p>
+                        <p className="mt-3 max-w-xl text-sm leading-6 text-emerald-50">Your shared home for the daily plan, trip reminders, expenses and memories.</p>
+                      </div>
+                    </div>
+                    <button type="button" onClick={() => navigateToItinerary()} disabled={tripDays.length === 0} className="mt-6 rounded-xl bg-white px-5 py-3 text-sm font-bold text-emerald-950 shadow-sm hover:bg-emerald-50 disabled:opacity-50">View itinerary <span aria-hidden="true">→</span></button>
+                  </div>
+                </section>
+
+                <section className="grid gap-5 lg:grid-cols-[1.5fr_1fr]">
+                  <div className="rounded-2xl border border-slate-200 bg-white p-5 shadow-sm sm:p-6">
+                    <div className="flex flex-wrap items-start justify-between gap-3">
+                      <div>
+                        <p className="text-xs font-bold uppercase tracking-[0.16em] text-emerald-800">{isTripOngoing ? "Today's plan" : "Trip preview"}</p>
+                        <h2 className="mt-1 text-xl font-bold">{dashboardDay ? `${dashboardDay.weekday} · ${dashboardDay.date}` : "Your daily itinerary"}</h2>
+                        <p className="mt-1 text-sm text-slate-500">{dashboardDay ? `Day ${dashboardDayIndex + 1}` : "Dates will appear after loading"}</p>
+                      </div>
+                      <button type="button" onClick={() => navigateToItinerary()} disabled={!dashboardDay} className="rounded-lg border border-slate-300 px-3 py-2 text-sm font-semibold hover:border-emerald-700 hover:text-emerald-800 disabled:opacity-50">View day</button>
+                    </div>
+                    {dashboardEntries.length === 0 ? (
+                      <div className="mt-5 rounded-xl bg-slate-50 p-4 text-sm text-slate-600">{dashboardDay ? "No plan details are entered for this date yet." : "Your trip dates will appear when the itinerary loads."}</div>
+                    ) : (
+                      <div className="mt-4 space-y-3">
+                        {dashboardEntries.slice(0, 4).map((entry) => (
+                          <div key={entry.key} className="flex gap-3 rounded-xl border border-slate-100 p-3">
+                            <div className="flex h-9 w-9 shrink-0 items-center justify-center rounded-lg bg-emerald-50 text-emerald-800" aria-hidden="true">•</div>
+                            <div className="min-w-0">
+                              <h3 className="text-sm font-semibold">{entry.label}</h3>
+                              <p className="mt-1 whitespace-pre-wrap break-words text-sm leading-6 text-slate-600">{entry.value}</p>
+                            </div>
+                          </div>
+                        ))}
+                        {dashboardEntries.length > 4 && <p className="text-xs text-slate-500">+ {dashboardEntries.length - 4} more itinerary entries</p>}
+                      </div>
+                    )}
+                  </div>
+
+                  <div className="grid gap-5 sm:grid-cols-2 lg:grid-cols-1">
+                    <section className="rounded-2xl border border-slate-200 bg-white p-5 shadow-sm">
+                      <div className="flex items-start gap-3">
+                        <div className="flex h-11 w-11 items-center justify-center rounded-xl bg-amber-50 text-2xl" aria-hidden="true">💳</div>
+                        <div>
+                          <h2 className="font-bold">Trip expenses</h2>
+                          <p className="mt-1 text-sm text-slate-600">Expense tracking is not connected yet.</p>
+                          <p className="mt-2 text-xs text-slate-500">No spending total is shown until expense data is added.</p>
+                        </div>
+                      </div>
+                      <button type="button" onClick={() => setActiveView("expenses")} className="mt-4 text-sm font-semibold text-emerald-800 hover:underline">Open expenses →</button>
+                    </section>
+                    <section className="rounded-2xl border border-slate-200 bg-white p-5 shadow-sm">
+                      <div className="flex items-start gap-3">
+                        <div className="flex h-11 w-11 items-center justify-center rounded-xl bg-sky-50 text-2xl" aria-hidden="true">🔔</div>
+                        <div>
+                          <h2 className="font-bold">Reminders</h2>
+                          <p className="mt-1 text-sm text-slate-600">Booking and check-in reminders are not connected yet.</p>
+                          <p className="mt-2 text-xs text-slate-500">No pending count is shown until reminders are configured.</p>
+                        </div>
+                      </div>
+                      <button type="button" onClick={() => setActiveView("itinerary")} className="mt-4 text-sm font-semibold text-emerald-800 hover:underline">Review trip plan →</button>
+                    </section>
+                  </div>
+                </section>
+
+                <section>
+                  <div className="mb-3 flex items-end justify-between gap-3">
+                    <div>
+                      <h2 className="text-lg font-bold">Your trip</h2>
+                      <p className="mt-1 text-sm text-slate-500">Jump to a part of your travel companion.</p>
+                    </div>
+                    <button type="button" onClick={() => setRefreshKey((n) => n + 1)} disabled={isLoadingItinerary} className="text-sm font-semibold text-emerald-800 hover:underline disabled:opacity-50">Refresh data</button>
+                  </div>
+                  <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
+                    {[
+                      { view: "itinerary" as ViewName, icon: "🗓️", title: "Itinerary", description: "Daily plans and destinations", available: true },
+                      { view: "expenses" as ViewName, icon: "💳", title: "Expenses", description: "Shared trip spending", available: false },
+                      { view: "memories" as ViewName, icon: "📸", title: "Memories", description: "Photos and shared notes", available: false },
+                      { view: "map" as ViewName, icon: "🗺️", title: "Map", description: "Routes and saved places", available: false },
+                    ].map((item) => (
+                      <button key={item.view} type="button" onClick={() => setActiveView(item.view)} className="rounded-2xl border border-slate-200 bg-white p-4 text-left shadow-sm transition hover:-translate-y-0.5 hover:border-emerald-300 hover:shadow">
+                        <span className="text-2xl" aria-hidden="true">{item.icon}</span>
+                        <span className="mt-3 block font-bold">{item.title}</span>
+                        <span className="mt-1 block text-sm text-slate-500">{item.description}</span>
+                        {!item.available && <span className="mt-3 inline-block rounded-full bg-slate-100 px-2 py-1 text-xs font-medium text-slate-500">Not connected yet</span>}
+                      </button>
+                    ))}
+                  </div>
+                </section>
+              </div>
+            )}
+
+            {!isLoadingItinerary && !itineraryError && activeView === "itinerary" && (
+              <section className="space-y-5 rounded-2xl border border-slate-200 bg-white p-5 shadow-sm sm:p-6">
+                <div className="flex flex-wrap items-center justify-between gap-3">
+                  <div>
+                    <p className="text-xs font-bold uppercase tracking-[0.16em] text-emerald-800">Daily itinerary</p>
+                    <h2 className="mt-1 text-2xl font-bold">Choose your day</h2>
+                    <p className="mt-1 text-sm text-slate-500">{tripDays.length} travel days · details read live from Google Sheets</p>
+                  </div>
+                  <button type="button" onClick={() => setActiveView("home")} className="rounded-lg border border-slate-300 px-3 py-2 text-sm font-semibold hover:bg-slate-50">← Dashboard</button>
+                </div>
+                {tripDays.length === 0 ? (
+                  <p className="rounded-xl bg-slate-50 p-4 text-sm text-slate-600">No travel dates were found in the spreadsheet's second header row.</p>
+                ) : (
+                  <>
+                    <div className="-mx-1 flex gap-2 overflow-x-auto px-1 pb-2">
+                      {tripDays.map((day, index) => {
+                        const selected = index === safeDayIndex;
+                        return (
+                          <button key={day.key} type="button" aria-pressed={selected} onClick={() => setActiveDayIndex(index)} className={`min-w-[100px] shrink-0 rounded-xl border p-3 text-left transition ${selected ? "border-emerald-700 bg-emerald-50 ring-1 ring-emerald-700" : "border-slate-200 bg-white hover:border-emerald-300"}`}>
+                            <span className={`block text-xs font-bold ${selected ? "text-emerald-800" : "text-slate-500"}`}>{day.weekday}</span>
+                            <span className="mt-1 block font-semibold">{day.date}</span>
+                            <span className="mt-1 block text-xs text-slate-500">Day {index + 1}</span>
+                          </button>
+                        );
+                      })}
+                    </div>
+
+                    {selectedDay && (
+                      <section className="overflow-hidden rounded-2xl border border-slate-200">
+                        <div className="flex flex-wrap items-center justify-between gap-3 bg-slate-50 px-4 py-4 sm:px-5">
+                          <div>
+                            <p className="text-xs font-bold uppercase tracking-[0.15em] text-emerald-800">{selectedDay.weekday} · Day {safeDayIndex + 1}</p>
+                            <h3 className="mt-1 text-xl font-bold">{selectedDay.date}</h3>
+                          </div>
+                          <div className="flex gap-2">
+                            <button type="button" disabled={safeDayIndex === 0} onClick={() => setActiveDayIndex((i) => Math.max(i - 1, 0))} className="rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm font-semibold disabled:opacity-40">Previous</button>
+                            <button type="button" disabled={safeDayIndex >= tripDays.length - 1} onClick={() => setActiveDayIndex((i) => Math.min(i + 1, tripDays.length - 1))} className="rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm font-semibold disabled:opacity-40">Next</button>
+                          </div>
+                        </div>
+                        {dayEntries.length === 0 ? (
+                          <p className="px-5 py-8 text-sm text-slate-500">No itinerary details have been entered for this day yet.</p>
+                        ) : (
+                          <div className="divide-y divide-slate-100">
+                            {dayEntries.map((entry) => <div key={entry.key} className="grid gap-1 px-4 py-4 sm:grid-cols-[minmax(9rem,0.35fr)_minmax(0,1fr)] sm:gap-5 sm:px-5"><h4 className="text-sm font-semibold text-slate-600">{entry.label}</h4><p className="whitespace-pre-wrap break-words text-sm leading-6 text-slate-900">{entry.value}</p></div>)}
+                          </div>
+                        )}
+                        <div className="grid gap-3 border-t border-slate-100 bg-white p-4 sm:grid-cols-3">
+                          <InfoPanel icon="🛣️" title="Route & destinations" entries={categorized.route} empty="Route details are not labelled in the sheet yet." />
+                          <InfoPanel icon="📍" title="Places to visit" entries={categorized.places} empty="Place details are not labelled in the sheet yet." />
+                          <InfoPanel icon="🏕️" title="Stay & bookings" entries={categorized.stay} empty="Stay details are not labelled in the sheet yet." />
+                        </div>
+                        <div className="border-t border-slate-100 bg-slate-50 p-4">
+                          <div className="flex items-start gap-3">
+                            <span className="text-xl" aria-hidden="true">📸</span>
+                            <div><h4 className="font-semibold">Travel memories</h4><p className="mt-1 text-sm text-slate-600">Shared photos, memories and private notes are planned, but that feature is not connected yet.</p></div>
+                          </div>
+                        </div>
+                      </section>
+                    )}
+                  </>
+                )}
+              </section>
+            )}
+
+            {!isLoadingItinerary && !itineraryError && ["expenses", "memories", "map"].includes(activeView) && (
+              <section className="rounded-2xl border border-slate-200 bg-white p-6 shadow-sm sm:p-8">
+                <button type="button" onClick={() => setActiveView("home")} className="text-sm font-semibold text-emerald-800 hover:underline">← Back to dashboard</button>
+                <div className="mt-6 flex h-14 w-14 items-center justify-center rounded-2xl bg-emerald-50 text-3xl" aria-hidden="true">{activeView === "expenses" ? "💳" : activeView === "memories" ? "📸" : "🗺️"}</div>
+                <h2 className="mt-4 text-2xl font-bold">{activeView === "expenses" ? "Trip expenses" : activeView === "memories" ? "Travel memories" : "Trip map"}</h2>
+                <p className="mt-2 max-w-xl text-sm leading-6 text-slate-600">{activeView === "expenses" ? "Shared expense tracking has not been connected yet. No spending total is being fabricated." : activeView === "memories" ? "Shared photos, travel notes and private notes are planned for a later feature. No memories have been saved by this screen yet." : "A route map has not been connected yet. This screen does not currently save locations or calculate routes."}</p>
+                <div className="mt-5 rounded-xl bg-slate-50 p-4 text-sm text-slate-600">Your Google Sheets itinerary remains connected and unchanged.</div>
+              </section>
+            )}
+          </>
+        )}
       </main>
+
+      {verifiedEmail && (
+        <nav className="fixed inset-x-0 bottom-0 z-20 border-t border-slate-200 bg-white/95 px-2 pb-[env(safe-area-inset-bottom)] backdrop-blur">
+          <div className="mx-auto grid max-w-2xl grid-cols-5 gap-1 py-2">
+            {[
+              { view: "home" as ViewName, icon: "⌂", label: "Home" },
+              { view: "itinerary" as ViewName, icon: "▤", label: "Itinerary" },
+              { view: "expenses" as ViewName, icon: "＄", label: "Expenses" },
+              { view: "memories" as ViewName, icon: "♡", label: "Memories" },
+              { view: "map" as ViewName, icon: "⌖", label: "Map" },
+            ].map((item) => (
+              <button key={item.view} type="button" onClick={() => setActiveView(item.view)} className={`flex flex-col items-center gap-1 rounded-xl px-1 py-2 text-xs font-medium transition ${activeView === item.view ? "bg-emerald-50 text-emerald-900" : "text-slate-500 hover:bg-slate-50"}`} aria-current={activeView === item.view ? "page" : undefined}>
+                <span className="text-xl leading-none" aria-hidden="true">{item.icon}</span>
+                <span>{item.label}</span>
+              </button>
+            ))}
+          </div>
+        </nav>
+      )}
+    </div>
+  );
+}
+
+function InfoPanel({ icon, title, entries, empty }: { icon: string; title: string; entries: DayEntry[]; empty: string }) {
+  return (
+    <div className="rounded-xl border border-slate-200 p-3">
+      <div className="flex items-center gap-2"><span aria-hidden="true">{icon}</span><h4 className="text-sm font-semibold">{title}</h4></div>
+      {entries.length === 0 ? <p className="mt-2 text-xs leading-5 text-slate-500">{empty}</p> : <div className="mt-2 space-y-3">{entries.map((entry) => <div key={entry.key}><p className="text-xs font-semibold text-slate-700">{entry.label}</p><p className="mt-1 whitespace-pre-wrap break-words text-xs leading-5 text-slate-600">{entry.value}</p></div>)}</div>}
     </div>
   );
 }
