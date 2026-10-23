@@ -1000,16 +1000,20 @@ export default {
           { success: true, data, count: data.length },
           200,
         );
-      } catch {
-        return jsonResponse(
-          {
-            success: false,
-            error: "An unexpected error occurred while reading the itinerary.",
-          },
-          500,
-        );
-      }
-    }
+      } catch (error) {
+        console.error(
+         "Itinerary read failed:",
+         error instanceof Error ? error.message : String(error),
+       );
+
+       return jsonResponse(
+         {
+           success: false,
+           error: "An unexpected error occurred while reading the itinerary.",
+         },
+         500,
+       );
+     }
 
     // Require an approved session for workflow APIs and WebSockets.
     if (
