@@ -1,282 +1,340 @@
+import { useEffect, useState } from "react";
 
-import { useState, useEffect } from "react";
-import { WorkflowDiagram } from "./components/WorkflowDiagram";
-import { CodeDisplay } from "./components/CodeDisplay";
-import { BackgroundDots } from "./components/BackgroundDots";
-import { useWorkflowWebSocket } from "./hooks/useWorkflowWebSocket";
-import { WORKFLOW_STEPS } from "./types";
+type ItineraryRow = Record<string, string>;
+
+type ApiResponse = {
+  success?: boolean;
+  user?: { email?: string; googleId?: string };
+  data?: ItineraryRow[];
+  count?: number;
+  error?: string;
+  connectUrl?: string;
+  message?: string;
+};
 
 declare global {
-	interface Window {
-		google?: {
-			accounts: {
-				id: {
-					initialize: (options: {
-						client_id: string;
-						callback: (response: { credential: string }) => void;
-					}) => void;
-					renderButton: (
-						element: HTMLElement,
-						options: { theme: string; size: string; text: string },
-					) => void;
-				};
-			};
-		};
-	}
+  interface Window {
+    google?: {
+      accounts: {
+        id: {
+          initialize: (options: {
+            client_id: string;
+            callback: (response: { credential: string }) => void;
+          }) => void;
+          renderButton: (
+            element: HTMLElement,
+            options: { theme: string; size: string; text: string },
+          ) => void;
+        };
+      };
+    };
+  }
 }
 
-
 function App() {
-    const [instanceId, setInstanceId] = useState<string | null>(null);
-    const [isStarting, setIsStarting] = useState(false);
-    const [authMessage, setAuthMessage] = useState("");
-    const [isVerifying, setIsVerifying] = useState(false);
-    const [verifiedEmail, setVerifiedEmail] = useState("");
+  const [authMessage, setAuthMessage] = useState("");
+  const [isVerifying, setIsVerifying] = useState(false);
+  const [verifiedEmail, setVerifiedEmail] = useState("");
 
-    // Restore the existing login session after a page refresh.
-    useEffect(() => {
-        let cancelled = false;
+  const [itineraryRows, setItineraryRows] = useState<ItineraryRow[]>([]);
+  const [isLoadingItinerary, setIsLoadingItinerary] = useState(false);
+  const [itineraryError, setItineraryError] = useState("");
+  const [needsSheetsConnection, setNeedsSheetsConnection] = useState(false);
+  const [refreshKey, setRefreshKey] = useState(0);
 
-        async function restoreSession() {
-            try {
-                const result = await fetch("/api/auth/session", {
-                    method: "GET",
-                    credentials: "same-origin",
-                });
+  // Restore the existing app login after a page refresh or OAuth redirect.
+  useEffect(() => {
+    let cancelled = false;
 
-                if (!result.ok) {
-                    return;
-                }
+    async function restoreSession() {
+      try {
+        const response = await fetch("/api/auth/session", {
+          method: "GET",
+          credentials: "same-origin",
+          cache: "no-store",
+        });
+        if (!response.ok) return;
 
-                const data = await result.json();
+        const result = (await response.json()) as ApiResponse;
+        if (!cancelled && result.success && result.user?.email) {
+          setVerifiedEmail(result.user.email);
+          setAuthMessage("Existing session restored.");
+        }
+      } catch (error) {
+        console.error("Session restoration failed:", error);
+      }
+    }
 
-                if (!cancelled && data.success && data.user?.email) {
-                    setVerifiedEmail(data.user.email);
-                    setAuthMessage(
-                        "Existing session restored. Trip access granted."
-                    );
-                }
-            } catch (error) {
-                console.error("Session restoration failed:", error);
+    void restoreSession();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  // Google Identity Services sign-in. The client ID is public and is embedded at build time.
+  useEffect(() => {
+    const clientId = import.meta.env.VITE_GOOGLE_CLIENT_ID as string | undefined;
+
+    if (!clientId) {
+      setAuthMessage("Google sign-in configuration is missing.");
+      return;
+    }
+
+    let attempts = 0;
+    let timer: ReturnType<typeof setInterval> | undefined;
+
+    const setupGoogleSignIn = () => {
+      if (!window.google?.accounts.id) {
+        attempts += 1;
+        if (attempts >= 20 && timer) clearInterval(timer);
+        return;
+      }
+
+      if (timer) clearInterval(timer);
+      const button = document.getElementById("google-sign-in-button");
+      if (!button) return;
+
+      button.replaceChildren();
+      window.google.accounts.id.initialize({
+        client_id: clientId,
+        callback: async (response) => {
+          setAuthMessage("Verifying Google account…");
+          setIsVerifying(true);
+
+          try {
+            const result = await fetch("/api/auth/google", {
+              method: "POST",
+              credentials: "same-origin",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ credential: response.credential }),
+            });
+            const data = (await result.json()) as ApiResponse;
+
+            if (!result.ok || !data.success || !data.user?.email) {
+              throw new Error(data.error || "Google verification failed.");
             }
+
+            setVerifiedEmail(data.user.email);
+            setAuthMessage("Google identity verified. Loading your itinerary…");
+          } catch (error) {
+            setAuthMessage(
+              error instanceof Error
+                ? error.message
+                : "Google verification failed. Please try again.",
+            );
+          } finally {
+            setIsVerifying(false);
+          }
+        },
+      });
+
+      window.google.accounts.id.renderButton(button, {
+        theme: "outline",
+        size: "large",
+        text: "signin_with",
+      });
+    };
+
+    setupGoogleSignIn();
+    if (!window.google?.accounts.id) timer = setInterval(setupGoogleSignIn, 500);
+
+    return () => {
+      if (timer) clearInterval(timer);
+    };
+  }, []);
+
+  // Load rows from the connected Google Sheet whenever a user session is available.
+  useEffect(() => {
+    if (!verifiedEmail) return;
+
+    let cancelled = false;
+
+    async function loadItinerary() {
+      setIsLoadingItinerary(true);
+      setItineraryError("");
+      setNeedsSheetsConnection(false);
+
+      try {
+        const response = await fetch("/api/itinerary", {
+          method: "GET",
+          credentials: "same-origin",
+          cache: "no-store",
+        });
+        const result = (await response.json()) as ApiResponse;
+
+        if (!response.ok || !result.success) {
+          if (!cancelled) {
+            setItineraryRows([]);
+            setNeedsSheetsConnection(
+              response.status === 403 || Boolean(result.connectUrl),
+            );
+            setItineraryError(result.error || `Could not load itinerary (HTTP ${response.status}).`);
+          }
+          return;
         }
 
-        restoreSession();
+        if (!cancelled) {
+          setItineraryRows(Array.isArray(result.data) ? result.data : []);
+          setItineraryError("");
+          setNeedsSheetsConnection(false);
+          setAuthMessage("Signed in. Itinerary loaded from Google Sheets.");
+        }
+      } catch (error) {
+        if (!cancelled) {
+          setItineraryError(
+            error instanceof Error ? error.message : "Could not load itinerary.",
+          );
+        }
+      } finally {
+        if (!cancelled) setIsLoadingItinerary(false);
+      }
+    }
 
-        return () => {
-            cancelled = true;
-        };
-    }, []);
+    void loadItinerary();
+    return () => {
+      cancelled = true;
+    };
+  }, [verifiedEmail, refreshKey]);
 
-    const workflowState = useWorkflowWebSocket(instanceId);
+  const headers = itineraryRows.length > 0 ? Object.keys(itineraryRows[0]) : [];
 
+  return (
+    <div className="min-h-screen bg-slate-50 text-slate-900">
+      <header className="border-b border-slate-200 bg-white">
+        <div className="mx-auto flex max-w-7xl flex-col gap-3 px-4 py-5 sm:flex-row sm:items-center sm:justify-between sm:px-6">
+          <div>
+            <p className="text-xs font-semibold uppercase tracking-[0.18em] text-emerald-700">
+              Shared travel companion
+            </p>
+            <h1 className="mt-1 text-2xl font-bold tracking-tight sm:text-3xl">
+              South Island Campervan Trip
+            </h1>
+            <p className="mt-1 text-sm text-slate-500">
+              Your itinerary, loaded from Google Sheets
+            </p>
+          </div>
+          {verifiedEmail && (
+            <div className="flex flex-col items-start gap-2 sm:items-end">
+              <p className="text-sm text-slate-600">Signed in as {verifiedEmail}</p>
+              <button
+                type="button"
+                onClick={() => window.location.assign("/api/sheets/connect")}
+                className="rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm font-semibold hover:bg-slate-100"
+              >
+                {needsSheetsConnection ? "Connect Google Sheets" : "Reconnect Google Sheets"}
+              </button>
+            </div>
+          )}
+        </div>
+      </header>
 
-	useEffect(() => {
-		if (workflowState.workflowStatus === "completed") {
-			const timer = setTimeout(() => {
-				setInstanceId(null);
-			}, 1500);
-			return () => clearTimeout(timer);
-		}
-	}, [workflowState.workflowStatus]);
+      <main className="mx-auto max-w-7xl space-y-6 px-4 py-6 sm:px-6 sm:py-8">
+        <section className="rounded-2xl border border-slate-200 bg-white p-5 shadow-sm">
+          <h2 className="text-base font-semibold">Google account</h2>
+          <div className="mt-3 flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+            <div>
+              {verifiedEmail ? (
+                <p className="text-sm text-emerald-700">Google identity verified: {verifiedEmail}</p>
+              ) : (
+                <p className="text-sm text-slate-600">
+                  Sign in with an approved Google account to view the shared itinerary.
+                </p>
+              )}
+              {authMessage && (
+                <p className="mt-1 text-sm text-slate-500" aria-live="polite">
+                  {authMessage}
+                </p>
+              )}
+              {isVerifying && <p className="mt-1 text-sm text-slate-500">Verifying account…</p>}
+            </div>
+            <div id="google-sign-in-button" className="min-h-10" />
+          </div>
+        </section>
 
-	useEffect(() => {
-		if (
-			workflowState.workflowStatus === "running" &&
-			workflowState.currentStep
-		) {
-			setIsStarting(false);
-		}
-	}, [workflowState.workflowStatus, workflowState.currentStep]);
+        {verifiedEmail && (
+          <section className="overflow-hidden rounded-2xl border border-slate-200 bg-white shadow-sm">
+            <div className="flex flex-col gap-3 border-b border-slate-200 px-5 py-4 sm:flex-row sm:items-center sm:justify-between">
+              <div>
+                <h2 className="text-lg font-semibold">Itinerary</h2>
+                <p className="mt-1 text-sm text-slate-500">
+                  {isLoadingItinerary
+                    ? "Loading rows from your sheet…"
+                    : `${itineraryRows.length} itinerary row${itineraryRows.length === 1 ? "" : "s"}`}
+                </p>
+              </div>
+              <button
+                type="button"
+                onClick={() => setRefreshKey((value) => value + 1)}
+                disabled={isLoadingItinerary}
+                className="rounded-lg bg-emerald-700 px-4 py-2 text-sm font-semibold text-white hover:bg-emerald-800 disabled:cursor-not-allowed disabled:opacity-50"
+              >
+                {isLoadingItinerary ? "Refreshing…" : "Refresh itinerary"}
+              </button>
+            </div>
 
-	useEffect(() => {
-		const clientId = import.meta.env.VITE_GOOGLE_CLIENT_ID as
-			| string
-			| undefined;
+            {isLoadingItinerary && (
+              <div className="px-5 py-8 text-sm text-slate-500" role="status">
+                Loading your shared itinerary…
+              </div>
+            )}
 
-		if (!clientId) {
-			setAuthMessage("Google sign-in configuration is missing.");
-			return;
-		}
+            {!isLoadingItinerary && itineraryError && (
+              <div className="m-5 rounded-xl border border-amber-200 bg-amber-50 p-4" role="alert">
+                <p className="font-semibold text-amber-900">Itinerary could not be loaded</p>
+                <p className="mt-1 text-sm text-amber-800">{itineraryError}</p>
+                {needsSheetsConnection && (
+                  <button
+                    type="button"
+                    onClick={() => window.location.assign("/api/sheets/connect")}
+                    className="mt-3 rounded-lg bg-amber-900 px-3 py-2 text-sm font-semibold text-white hover:bg-amber-950"
+                  >
+                    Connect Google Sheets
+                  </button>
+                )}
+              </div>
+            )}
 
-		let attempts = 0;
-		let timer: ReturnType<typeof setInterval> | undefined;
+            {!isLoadingItinerary && !itineraryError && itineraryRows.length === 0 && (
+              <div className="px-5 py-8 text-sm text-slate-500">
+                The connection worked, but the selected sheet tab has no itinerary rows yet.
+              </div>
+            )}
 
-		const setupGoogleSignIn = () => {
-			if (!window.google?.accounts.id) {
-				attempts += 1;
-				if (attempts >= 20 && timer) clearInterval(timer);
-				return;
-			}
-
-			if (timer) clearInterval(timer);
-
-			const button = document.getElementById("google-sign-in-button");
-			if (!button) return;
-
-			button.replaceChildren();
-
-			window.google.accounts.id.initialize({
-				client_id: clientId,
-				callback: async (response) => {
-					setAuthMessage("Verifying Google account…");
-					setIsVerifying(true);
-					setVerifiedEmail("");
-
-					try {
-						const result = await fetch("/api/auth/google", {
-							method: "POST",
-							headers: { "Content-Type": "application/json" },
-							body: JSON.stringify({
-								credential: response.credential,
-							}),
-						});
-
-						const data = await result.json();
-
-						if (!result.ok || !data.success) {
-							throw new Error(data.error || "Google verification failed.");
-						}
-
-						setVerifiedEmail(data.user.email);
-						setAuthMessage(
-							"Google identity verified. Trip access granted.",
-						);
-					} catch (error) {
-						setAuthMessage(
-							error instanceof Error
-								? error.message
-								: "Google verification failed. Please try again.",
-						);
-					} finally {
-						setIsVerifying(false);
-					}
-				},
-			});
-
-			window.google.accounts.id.renderButton(button, {
-				theme: "outline",
-				size: "large",
-				text: "signin_with",
-			});
-		};
-
-		setupGoogleSignIn();
-
-		if (!window.google?.accounts.id) {
-			timer = setInterval(setupGoogleSignIn, 500);
-		}
-
-		return () => {
-			if (timer) clearInterval(timer);
-		};
-	}, []);
-
-	const handleStartWorkflow = async () => {
-		setIsStarting(true);
-
-		try {
-			const response = await fetch("/api/workflow/start", {
-				method: "POST",
-			});
-
-			if (!response.ok) {
-				throw new Error("Failed to start workflow");
-			}
-
-			const data = await response.json();
-			setInstanceId(data.instanceId);
-		} catch {
-			alert("Failed to start workflow. Please try again.");
-			setIsStarting(false);
-		}
-	};
-
-	return (
-		<div className="min-h-screen bg-neutral-50/30 dark:bg-neutral-950 flex flex-col relative">
-			<div className="absolute inset-0 text-neutral-200/50 dark:text-neutral-700/40 overflow-hidden">
-				<BackgroundDots />
-			</div>
-
-			<header className="px-6 pt-6 pb-4 relative z-10">
-				<div className="flex items-center justify-between">
-					<div className="flex items-center gap-3">
-						<svg
-							role="img"
-							viewBox="0 0 460 271.2"
-							aria-hidden="true"
-							className="h-5 w-auto opacity-90"
-						>
-							<path
-								fill="#FBAD41"
-								d="M328.6,125.6c-0.8,0-1.5,0.6-1.8,1.4l-4.8,16.7c-2.1,7.2-1.3,13.8,2.2,18.7c3.2,4.5,8.6,7.1,15.1,7.4l26.2,1.6c0.8,0,1.5,0.4,1.9,1c0.4,0.6,0.5,1.5,0.3,2.2c-0.4,1.2-1.6,2.1-2.9,2.2l-27.3,1.6c-14.8,0.7-30.7,12.6-36.3,27.2l-2,5.1c-0.4,1,0.3,2,1.4,2h93.8c1.1,0,2.1-0.7,2.4-1.8c1.6-5.8,2.5-11.9,2.5-18.2c0-37-30.2-67.2-67.3-67.2C330.9,125.5,329.7,125.5,328.6,125.6z"
-							/>
-							<path
-								fill="#F6821F"
-								d="M292.8,204.4c2.1-7.2,1.3-13.8-2.2-18.7c-3.2-4.5-8.6-7.1-15.1-7.4l-123.1-1.6c-0.8,0-1.5-0.4-1.9-1s-0.5-1.4-0.3-2.2c0.4-1.2,1.6-2.1,2.9-2.2l124.2-1.6c14.7-0.7,30.7-12.6,36.3-27.2l7.1-18.5c0.3-0.8,0.4-1.6,0.2-2.4c-8-36.2-40.3-63.2-78.9-63.2c-35.6,0-65.8,23-76.6,54.9c-7-5.2-15.9-8-25.5-7.1c-17.1,1.7-30.8,15.4-32.5,32.5c-0.4,4.4-0.1,8.7,0.9,12.7c-27.9,0.8-50.2,23.6-50.2,51.7c0,2.5,0.2,5,0.5,7.5c0.2,1.2,1.2,2.1,2.4,2.1h227.2c1.3,0,2.5-0.9,2.9-2.2L292.8,204.4z"
-							/>
-						</svg>
-						<div className="w-px h-4 bg-neutral-300/50 dark:bg-neutral-600/50" />
-						<h1 className="text-sm font-medium text-neutral-600 dark:text-neutral-400">
-							Campervan Security Test
-						</h1>
-					</div>
-
-					<a
-						href="https://developers.cloudflare.com/workflows"
-						target="_blank"
-						rel="noopener noreferrer"
-						className="text-xs font-medium text-neutral-600 dark:text-neutral-400 hover:text-neutral-900 dark:hover:text-neutral-200 transition-colors"
-					>
-						Documentation →
-					</a>
-				</div>
-			</header>
-
-			<section className="relative z-10 mx-6 mb-5 rounded-xl border border-neutral-200 bg-white/90 p-5 dark:border-neutral-800 dark:bg-neutral-900/90">
-				<h2 className="mb-3 text-base font-semibold text-neutral-800 dark:text-neutral-100">
-					M3 — Google Sign-in Test
-				</h2>
-				<div id="google-sign-in-button" />
-				{isVerifying && (
-					<p className="mt-3 text-sm text-neutral-600">Verifying account…</p>
-				)}
-				{authMessage && (
-					<p className="mt-3 text-sm text-neutral-700 dark:text-neutral-300">
-						{authMessage}
-					</p>
-				)}
-				{verifiedEmail && (
-					<p className="mt-2 text-sm font-medium text-green-700">
-						Verified Google email: {verifiedEmail}
-					</p>
-				)}
-			</section>
-
-			<main className="flex-1 flex flex-col lg:flex-row overflow-hidden relative z-10">
-				<div className="w-full lg:w-[60%] overflow-hidden px-6 pb-6">
-					<CodeDisplay
-						currentStep={workflowState.currentStep}
-						workflowStatus={workflowState.workflowStatus}
-						onStartWorkflow={handleStartWorkflow}
-						isStarting={isStarting}
-					/>
-				</div>
-
-				<div className="flex-1 overflow-hidden px-6 lg:pl-8 lg:pr-6 pb-6">
-					<WorkflowDiagram
-						steps={WORKFLOW_STEPS}
-						stepStatuses={workflowState.stepStatuses}
-						currentStep={workflowState.currentStep}
-						instanceId={instanceId}
-						workflowStatus={workflowState.workflowStatus}
-						onStartWorkflow={handleStartWorkflow}
-						isStarting={isStarting}
-					/>
-				</div>
-			</main>
-		</div>
-	);
+            {!isLoadingItinerary && !itineraryError && itineraryRows.length > 0 && (
+              <div className="max-w-full overflow-x-auto">
+                <table className="min-w-full divide-y divide-slate-200 text-left text-sm">
+                  <thead className="bg-slate-50">
+                    <tr>
+                      {headers.map((header) => (
+                        <th
+                          key={header}
+                          scope="col"
+                          className="whitespace-nowrap px-4 py-3 font-semibold text-slate-700"
+                        >
+                          {header.replace(/_/g, " ")}
+                        </th>
+                      ))}
+                    </tr>
+                  </thead>
+                  <tbody className="divide-y divide-slate-100">
+                    {itineraryRows.map((row, index) => (
+                      <tr key={index} className="align-top hover:bg-emerald-50/40">
+                        {headers.map((header) => (
+                          <td key={header} className="min-w-32 max-w-sm whitespace-pre-wrap px-4 py-3 text-slate-700">
+                            {row[header] || "—"}
+                          </td>
+                        ))}
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            )}
+          </section>
+        )}
+      </main>
+    </div>
+  );
 }
 
 export default App;
