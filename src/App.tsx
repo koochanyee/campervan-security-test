@@ -242,14 +242,7 @@ function App() {
   }, [selectedDay, itineraryRows, labelKey]);
 
   const dashboardEntries = getEntriesForDay(dashboardDay);
-  const entryCounts = useMemo(() => {
-    const counts = new Map<string, number>();
-    for (const day of tripDays) {
-      counts.set(day.key, itineraryRows.slice(1).reduce((total, row) => total + (String(row[day.key] ?? "").trim() ? 1 : 0), 0));
-    }
-    return counts;
-  }, [itineraryRows, tripDays]);
-
+  
   const categorized = useMemo(() => {
     const groups: Record<string, DayEntry[]> = {
       route: [],
