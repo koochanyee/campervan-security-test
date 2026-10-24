@@ -250,6 +250,36 @@ function App() {
   }, [selectedDay, itineraryRows, labelKey]);
 
   const dashboardEntries = getEntriesForDay(dashboardDay);
+  const dashboardPreviewDays = tripDays
+  .slice(dashboardDayIndex, dashboardDayIndex + 3)
+  .map((day) => {
+    const entries = getEntriesForDay(day);
+
+    const route =
+      entries.find((entry) => /^route$/i.test(entry.label))?.value ?? "";
+
+    const highlights = entries
+      .filter((entry) =>
+        /^(morning|afternoon|evening)$/i.test(entry.label)
+      )
+      .flatMap((entry) =>
+        entry.value
+          .split(/\n+/)
+          .map((line) =>
+            line
+              .trim()
+              .replace(/^\d{1,2}(?::\d{2})?\s*(?:am|pm)?\s*[-–:]?\s*/i, "")
+          )
+          .filter(
+            (line) =>
+              line.length > 4 &&
+              !/^(breakfast|lunch|dinner|self cook|rest|free and easy|sleep|depart|continue|drive to|drive toward|arrive|check in|check out|pack|refuel)/i.test(line)
+          )
+      )
+      .slice(0, 3);
+
+    return { day, route, highlights };
+  });
   
   const categorized = useMemo(() => {
     const groups: Record<string, DayEntry[]> = {
@@ -336,32 +366,68 @@ function App() {
 
                 <section className="grid gap-5 lg:grid-cols-[1.5fr_1fr]">
                   <div className="rounded-2xl border border-slate-200 bg-white p-5 shadow-sm sm:p-6">
-                    <div className="flex flex-wrap items-start justify-between gap-3">
-                      <div>
-                        <p className="text-xs font-bold uppercase tracking-[0.16em] text-emerald-800">{isTripOngoing ? "Today's plan" : "Trip preview"}</p>
-                        <h2 className="mt-1 text-xl font-bold">{dashboardDay ? `${dashboardDay.weekday} · ${dashboardDay.date}` : "Your daily itinerary"}</h2>
-                        <p className="mt-1 text-sm text-slate-500">{dashboardDay ? `Day ${dashboardDayIndex + 1}` : "Dates will appear after loading"}</p>
-                      </div>
-                      <button type="button" onClick={() => navigateToItinerary()} disabled={!dashboardDay} className="rounded-lg border border-slate-300 px-3 py-2 text-sm font-semibold hover:border-emerald-700 hover:text-emerald-800 disabled:opacity-50">View day</button>
-                    </div>
-                    {dashboardEntries.length === 0 ? (
-                      <div className="mt-5 rounded-xl bg-slate-50 p-4 text-sm text-slate-600">{dashboardDay ? "No plan details are entered for this date yet." : "Your trip dates will appear when the itinerary loads."}</div>
-                    ) : (
-                      <div className="mt-4 space-y-3">
-                        {dashboardEntries.slice(0, 4).map((entry) => (
-                          <div key={entry.key} className="flex gap-3 rounded-xl border border-slate-100 p-3">
-                            <div className="flex h-9 w-9 shrink-0 items-center justify-center rounded-lg bg-emerald-50 text-emerald-800" aria-hidden="true">•</div>
-                            <div className="min-w-0">
-                              <h3 className="text-sm font-semibold">{entry.label}</h3>
-                              <p className="mt-1 whitespace-pre-wrap break-words text-sm leading-6 text-slate-600">{entry.value}</p>
-                            </div>
-                          </div>
-                        ))}
-                        {dashboardEntries.length > 4 && <p className="text-xs text-slate-500">+ {dashboardEntries.length - 4} more itinerary entries</p>}
-                      </div>
-                    )}
-                  </div>
+                    <p className="text-xs font-bold uppercase tracking-[0.16em] text-emerald-800">
+                      Trip preview
+                    </p>
+                    <h2 className="mt-1 text-xl font-bold">
+                      Your journey at a glance
+                    </h2>
+                    <p className="mt-1 text-sm text-slate-500">
+                      Upcoming routes and attraction highlights.
+                    </p>
 
+                    <div className="mt-4 space-y-3">
+                      {dashboardPreviewDays.map(({ day, route, highlights }, index) => (
+                        <button
+                          key={day.key}
+                          type="button"
+                          onClick={() => {
+                            setActiveDayIndex(dashboardDayIndex + index);
+                            setActiveView("itinerary");
+                          }}
+                          className="w-full rounded-xl border border-slate-200 p-4 text-left hover:border-emerald-500 hover:bg-emerald-50/40"
+                        >
+                          <p className="text-xs font-bold uppercase tracking-wide text-emerald-800">
+                            Day {dashboardDayIndex + index + 1} · {day.weekday}
+                          </p>
+                          <h3 className="mt-1 font-bold">{day.date}</h3>
+                  
+                          {route && (
+                            <p className="mt-2 text-sm font-medium text-slate-700">
+                              {route}
+                            </p>
+                          )}
+                  
+                          {highlights.length > 0 && (
+                            <ul className="mt-2 space-y-1">
+                              {highlights.map((highlight, highlightIndex) => (
+                                <li
+                                  key={`${day.key}-${highlightIndex}`}
+                                  className="line-clamp-2 text-sm text-slate-600"
+                                >
+                                  • {highlight}
+                                </li>
+                              ))}
+                            </ul>
+                          )}
+                  
+                          <p className="mt-3 text-xs font-semibold text-emerald-800">
+                            View this day →
+                          </p>
+                        </button>
+                      ))}
+                    </div>
+
+                    <button
+                      type="button"
+                      onClick={() => navigateToItinerary()}
+                      disabled={tripDays.length === 0}
+                      className="mt-4 w-full rounded-xl bg-emerald-800 px-4 py-3 text-sm font-bold text-white hover:bg-emerald-900 disabled:opacity-50"
+                    >
+                      Open full itinerary →
+                    </button>
+                  </div>
+                  
                   <div className="grid gap-5 sm:grid-cols-2 lg:grid-cols-1">
                     <section className="rounded-2xl border border-slate-200 bg-white p-5 shadow-sm">
                       <div className="flex items-start gap-3">
