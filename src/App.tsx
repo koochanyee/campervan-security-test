@@ -249,7 +249,6 @@ function App() {
     });
   }, [selectedDay, itineraryRows, labelKey]);
 
-  const dashboardEntries = getEntriesForDay(dashboardDay);
   const dashboardPreviewDays = tripDays
   .slice(dashboardDayIndex, dashboardDayIndex + 3)
   .map((day) => {
