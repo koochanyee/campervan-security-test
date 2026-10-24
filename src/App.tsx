@@ -220,7 +220,6 @@ function App() {
   const today = new Date();
   const liveDayIndex = tripDays.findIndex((day) => day.dateObject && dateIsSameDay(day.dateObject, today));
   const dashboardDayIndex = liveDayIndex >= 0 ? liveDayIndex : safeDayIndex;
-  const dashboardDay = tripDays[dashboardDayIndex];
   const tripStart = tripDays[0]?.dateObject;
   const tripEnd = tripDays[tripDays.length - 1]?.dateObject;
   const isTripOngoing = Boolean(tripStart && tripEnd && today >= tripStart && today <= tripEnd);
@@ -248,7 +247,7 @@ function App() {
       return [{ key: `${selectedDay.key}-${index}`, label, value }];
     });
   }, [selectedDay, itineraryRows, labelKey]);
-
+  
   const dashboardPreviewDays = tripDays
   .slice(dashboardDayIndex, dashboardDayIndex + 3)
   .map((day) => {
