@@ -995,11 +995,101 @@ export default {
 
             return item;
           });
+        
+        // Read supplementary worksheet tabs for practical tips and layering notes.
+        const supplementaryTabs: Record<string, string[][]> = {};
+        let supplementaryError: string | undefined;
+
+        try {
+          const metadataUrl =
+            `https://sheets.googleapis.com/v4/spreadsheets/` +
+            `${encodeURIComponent(env.GOOGLE_SHEET_ID)}` +
+            `?fields=sheets.properties.title`;
+
+          const metadataResponse = await fetch(metadataUrl, {
+            headers: {
+              Authorization: `Bearer ${tokenData.access_token}`,
+            },
+          });
+
+          if (!metadataResponse.ok) {
+            throw new Error("Could not read worksheet metadata");
+          }
+
+          const spreadsheetMeta = (await metadataResponse.json()) as {
+            sheets?: Array<{
+              properties?: {
+                title?: string;
+              };
+            }>;
+          };
+
+          const mainTab = env.GOOGLE_SHEET_TAB.trim();
+
+          const tabTitles = (spreadsheetMeta.sheets ?? [])
+            .map((sheet) => sheet.properties?.title)
+            .filter(
+              (title): title is string =>
+                Boolean(title) && title !== mainTab,
+            );
+
+          if (tabTitles.length > 0) {
+            const batchUrl = new URL(
+              `https://sheets.googleapis.com/v4/spreadsheets/` +
+              `${encodeURIComponent(env.GOOGLE_SHEET_ID)}/values:batchGet`,
+            );
+
+            tabTitles.forEach((title) => {
+              const range =
+                `'${title.replace(/'/g, "''")}'!A:ZZZ`;
+              batchUrl.searchParams.append("ranges", range);
+            });
+
+            const batchResponse = await fetch(batchUrl.toString(), {
+              headers: {
+                Authorization: `Bearer ${tokenData.access_token}`,
+              },
+            });
+
+            if (!batchResponse.ok) {
+              throw new Error("Could not read supplementary worksheets");
+            }
+
+            const batchData = (await batchResponse.json()) as {
+              valueRanges?: Array<{
+                values?: unknown[][];
+              }>;
+            };
+
+            tabTitles.forEach((title, index) => {
+              const values =
+                batchData.valueRanges?.[index]?.values ?? [];
+
+              supplementaryTabs[title] = values.map((row) =>
+                row.map((value) => String(value ?? "")),
+              );
+            });
+          }
+        } catch (error) {
+          console.error(
+            "Supplementary worksheet read failed:",
+            error instanceof Error ? error.message : String(error),
+          );
+          supplementaryError =
+            "Some supplementary worksheet details could not be loaded.";
+        }
 
         return jsonResponse(
-          { success: true, data, count: data.length },
+          {
+            success: true,
+            data,
+            count: data.length,
+            supplementaryTabs,
+            ...(supplementaryError ? { supplementaryError } : {}),
+          },
           200,
         );
+
       } catch (error) {
         console.error(
          "Itinerary read failed:",
