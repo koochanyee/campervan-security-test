@@ -251,7 +251,7 @@ function App() {
       return [{ key: `${selectedDay.key}-${index}`, label, value }];
     });
   }, [selectedDay, itineraryRows, labelKey]);
-  
+   
   const dashboardPreviewDays = tripDays
   .slice(dashboardDayIndex, dashboardDayIndex + 3)
   .map((day) => {
@@ -529,6 +529,68 @@ function App() {
                             {dayEntries.map((entry) => <div key={entry.key} className="grid gap-1 px-4 py-4 sm:grid-cols-[minmax(9rem,0.35fr)_minmax(0,1fr)] sm:gap-5 sm:px-5"><h4 className="text-sm font-semibold text-slate-600">{entry.label}</h4><p className="whitespace-pre-wrap break-words text-sm leading-6 text-slate-900">{entry.value}</p></div>)}
                           </div>
                         )}
+                        <div className="border-t border-slate-100 p-4">
+                          <h4 className="font-semibold text-slate-900">
+                            Practical Tips & Date-Specific Notes
+                          </h4>
+
+                          {Object.entries(supplementaryTabs)
+                            .filter(
+                              ([tabName]) =>
+                                /^\d{1,2}\s+nov$/i.test(tabName) &&
+                                selectedDay.date.toLowerCase().includes(tabName.toLowerCase())
+                            )
+                            .map(([tabName, rows]) => (
+                              <div key={tabName} className="mt-3">
+                                <h5 className="text-sm font-semibold text-emerald-800">
+                                  {tabName} — Supplementary Notes
+                                </h5>
+                                {rows.map((row, rowIndex) => {
+                                  const text = row
+                                    .map((cell) => String(cell ?? "").trim())
+                                    .filter(Boolean)
+                                    .join(" · ");
+
+                                  return text ? (
+                                    <p
+                                      key={`${tabName}-${rowIndex}`}
+                                      className="mt-2 whitespace-pre-wrap break-words text-sm leading-6 text-slate-700"
+                                    >
+                                      {text}
+                                    </p>
+                                  ) : null;
+                                })}
+                              </div>                        
+                            ))}
+
+                          <div className="mt-4 rounded-xl bg-slate-50 p-3">
+                            <h5 className="text-sm font-semibold text-slate-800">
+                              Layering
+                            </h5>
+                            {(() => {
+                              const rows = supplementaryTabs["Layering"] ?? [];
+                              const content = rows
+                                .map((row) =>
+                                  row.map((cell) => String(cell ?? "").trim())
+                                    .filter(Boolean)
+                                    .join(" · ")
+                                )
+                                .filter(Boolean);
+
+                              return content.length > 0 ? (
+                                content.map((text, index) => (
+                                  <p key={index} className="mt-2 text-sm leading-6 text-slate-700">
+                                    {text}
+                                  </p>
+                                ))
+                              ) : (
+                                <p className="mt-1 text-sm text-slate-500">
+                                  No layering notes have been entered in the spreadsheet yet.
+                                </p>
+                              );
+                            })()}
+                          </div>
+                        </div>
                         <div className="grid gap-3 border-t border-slate-100 bg-white p-4 sm:grid-cols-3">
                           <InfoPanel icon="🛣️" title="Route & destinations" entries={categorized.route} empty="Route details are not labelled in the sheet yet." />
                           <InfoPanel icon="📍" title="Places to visit" entries={categorized.places} empty="Place details are not labelled in the sheet yet." />
