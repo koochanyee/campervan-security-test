@@ -18,6 +18,8 @@ type ApiResponse = {
   error?: string;
   connectUrl?: string;
   message?: string;
+  supplementaryTabs?: Record<string, string[][]>;
+  supplementaryError?: string;
 };
 
 type TripDay = {
@@ -74,6 +76,7 @@ function App() {
   const [isVerifying, setIsVerifying] = useState(false);
   const [verifiedEmail, setVerifiedEmail] = useState("");
   const [itineraryRows, setItineraryRows] = useState<ItineraryRow[]>([]);
+  const [supplementaryTabs, setSupplementaryTabs] = useState<Record<string, string[][]>>({});
   const [isLoadingItinerary, setIsLoadingItinerary] = useState(false);
   const [itineraryError, setItineraryError] = useState("");
   const [needsSheetsConnection, setNeedsSheetsConnection] = useState(false);
@@ -182,6 +185,7 @@ function App() {
         if (!cancelled) {
           const rows = Array.isArray(result.data) ? result.data : [];
           setItineraryRows(rows);
+          setSupplementaryTabs(result.supplementaryTabs ?? {});
           setActiveDayIndex(0);
           setItineraryError("");
           setNeedsSheetsConnection(false);
