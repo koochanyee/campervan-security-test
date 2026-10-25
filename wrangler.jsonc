@@ -14,42 +14,7 @@
 	},
 	"observability": {
 		"enabled": true
-	},
-	/**
-	 * Workflows
-	 * Define Workflows to orchestrate multi-step processes
-	 * https://developers.cloudflare.com/workflows/
-	 */
-	"workflows": [
-		{
-			"name": "my-workflow",
-			"binding": "MY_WORKFLOW",
-			"class_name": "MyWorkflow"
-		}
-	],
-	/**
-	 * Durable Objects
-	 * Used for WebSocket state management and real-time updates
-	 * https://developers.cloudflare.com/durable-objects/
-	 */
-	"durable_objects": {
-		"bindings": [
-			{
-				"name": "WORKFLOW_STATUS",
-				"class_name": "WorkflowStatusDO"
-			}
-		]
-	},
-	/**
-	 * Migrations
-	 * Required for Durable Objects
-	 */
-	"migrations": [
-		{
-			"tag": "v1",
-			"new_sqlite_classes": ["WorkflowStatusDO"]
-		}
-	],
+	},	
     "vars": {
       "GOOGLE_SHEET_ID": "1L_GUByHbUMIORDakIRutHUwK9pNMYPAsm1H1fe6RMB0",
       "GOOGLE_SHEET_TAB": "FINAL ITINERARY",
