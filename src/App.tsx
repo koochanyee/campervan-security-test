@@ -251,8 +251,6 @@ function App() {
       return [{ key: `${selectedDay.key}-${index}`, label, value }];
     });
   }, [selectedDay, itineraryRows, labelKey]);
-
-  const supplementaryTabNames = Object.keys(supplementaryTabs);
   
   const dashboardPreviewDays = tripDays
   .slice(dashboardDayIndex, dashboardDayIndex + 3)
