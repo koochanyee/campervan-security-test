@@ -563,31 +563,117 @@ function App() {
                               </div>                        
                             ))}
 
-                          <div className="mt-4 rounded-xl bg-slate-50 p-3">
-                            <h5 className="text-sm font-semibold text-slate-800">
-                              Layering
-                            </h5>
-                            {(() => {
-                              const rows = supplementaryTabs["Layering"] ?? [];
-                              const content = rows
-                                .map((row) =>
-                                  row.map((cell) => String(cell ?? "").trim())
-                                    .filter(Boolean)
-                                    .join(" · ")
-                                )
-                                .filter(Boolean);
-
-                              return content.length > 0 ? (
-                                content.map((text, index) => (
-                                  <p key={index} className="mt-2 text-sm leading-6 text-slate-700">
-                                    {text}
+                          
+                          <div className="mt-4 rounded-xl bg-slate-50 p-3">  
+                          <h5 className="text-sm font-semibold text-slate-800">    
+                          👕 Practical Tips & Layering Notes  
+                          </h5>
+  
+                          {(() => {    
+                          const rows = supplementaryTabs["Layering"] ?? [];    
+                          const rawText = rows      
+                          .flat()      
+                          .map((cell) => String(cell ?? "").trim())      
+                          .find((cell) => cell.startsWith("{"));                          
+   
+                           if (!rawText) {
+                                return (
+                                  <p className="mt-2 text-sm text-slate-500">
+                                    No layering notes are available.
                                   </p>
-                                ))
-                              ) : (
-                                <p className="mt-1 text-sm text-slate-500">
-                                  No layering notes have been entered in the spreadsheet yet.
-                                </p>
-                              );
+                                );
+                              }
+
+                              try {
+                                const parsed = JSON.parse(rawText) as {
+                                  itinerary?: Array<{
+                                    day?: string;
+                                    date?: string;
+                                    location?: string;
+                                    weather_and_activity?: string;
+                                    icons?: string[];
+                                    wear?: string;
+                                  }>;
+                                  core_golden_rule?: string;
+                                };
+
+                                const entries = parsed.itinerary ?? [];
+                                const selectedDate = selectedDay?.date ?? "";
+                          
+                                const normalizeDate = (value: string) =>
+                                  value.toLowerCase().replace(/\s+/g, " ").trim();
+
+                                const layering = entries.find((entry) => {
+                                  const date = normalizeDate(entry.date ?? "");
+                                  const selected = normalizeDate(selectedDate);
+
+                                  if (!date || !selected) return false;
+                                  if (date === selected) return true;
+
+                                  // Support entries covering a date range, e.g. "19–20 Nov".
+                                  const range = date.match(
+                                    /^(\d{1,2})\s*[–-]\s*(\d{1,2})\s+([a-z]+)$/
+                                  );
+                                  const single = selected.match(/^(\d{1,2})\s+([a-z]+)$/);
+
+                                  return Boolean(
+                                    range &&
+                                    single &&
+                                    range[3] === single[2] &&
+                                    Number(single[1]) >= Number(range[1]) &&
+                                    Number(single[1]) <= Number(range[2])
+                                  );
+                                });
+
+                                return (
+                                  <div className="mt-2 space-y-3">
+                                    {layering ? (
+                                      <>
+                                        <div className="flex flex-wrap items-center justify-between gap-2">
+                                          <p className="font-semibold text-slate-800">
+                                            {layering.location ?? layering.day}
+                                          </p>
+                                          <span className="text-xs text-slate-600">
+                                            {layering.weather_and_activity}
+                                          </span>
+                                        </div>
+
+                                        {layering.icons && layering.icons.length > 0 && (
+                                          <p className="text-xl" aria-label="Suggested clothing">
+                                            {layering.icons.join(" ")}
+                                          </p>
+                                        )}
+
+                                        <p className="whitespace-pre-wrap text-sm leading-6 text-slate-700">
+                                          {layering.wear}
+                                        </p>
+                                      </>
+                                    ) : (
+                                      <p className="text-sm text-slate-500">
+                                        No layering recommendation matches {selectedDate || "this day"}.
+                                      </p>
+                                    )}
+
+                                    {parsed.core_golden_rule && (
+                                      <div className="border-t border-slate-200 pt-3">
+                                        <p className="text-xs font-semibold text-slate-700">
+                                          Packing tip
+                                        </p>
+                                        <p className="mt-1 text-sm leading-6 text-slate-600">
+                                          {parsed.core_golden_rule}
+                                        </p>
+                                      </div>
+                                    )}
+                                  </div>
+                                );
+                              } catch {
+                                return (
+                                  <p className="mt-2 text-sm text-amber-700">
+                                    Layering data could not be read. Please check the JSON in the
+                                    Layering spreadsheet tab.
+                                  </p>
+                                );
+                              }
                             })()}
                           </div>
                         </div>
