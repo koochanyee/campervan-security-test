@@ -1141,7 +1141,6 @@ export default {
         if (
           !date ||
           !sessionName ||
-          !oldLocation ||
           !newLocation ||
           date.length > 40 ||
           sessionName.length > 40 ||
@@ -1306,8 +1305,21 @@ export default {
           );
         }
 
+        const columnLetter = (columnIndex: number): string => {
+          let number = columnIndex + 1;
+          let result = "";
+
+          while (number > 0) {
+            const remainder = (number - 1) % 26;
+            result =
+            String.fromCharCode(65 + remainder) + result;
+            number = Math.floor((number - 1) / 26);
+          }
+          return result;
+        };
+
         const writeRange =
-          `'SESSION LOCATIONS'!C${match.rowNumber}`;
+          `'SESSION LOCATIONS'!${columnLetter(locationCol)}${match.rowNumber}`;
         const writeUrl =
           `https://sheets.googleapis.com/v4/spreadsheets/${sheetId}/values/` +
           encodeURIComponent(writeRange) +
