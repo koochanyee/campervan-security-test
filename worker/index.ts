@@ -1078,6 +1078,295 @@ export default {
         );
       }
     }
+
+    
+    // Save a confirmed session location to SESSION LOCATIONS only.
+    if (
+      request.method === "POST" &&
+      url.pathname === "/api/session-location"
+    ) {
+      const session = await readSession(request, env);
+
+      if (!session) {
+        return jsonResponse(
+          { success: false, error: "Authentication required." },
+          401,
+        );
+      }
+
+      // Accept writes only from this same origin.
+      if (request.headers.get("Origin") !== url.origin) {
+        return jsonResponse(
+          { success: false, error: "Invalid request origin." },
+          403,
+        );
+      }
+
+      if (
+        !env.GOOGLE_CLIENT_ID ||
+        !env.GOOGLE_CLIENT_SECRET ||
+        !env.TOKEN_ENCRYPTION_KEY ||
+        !env.GOOGLE_SHEET_ID ||
+        !env.OAUTH_TOKEN_STORE
+      ) {
+        return jsonResponse(
+          { success: false, error: "Google Sheets is not configured." },
+          500,
+        );
+      }
+
+      try {
+        const body = (await request.json()) as {
+          date?: unknown;
+          session?: unknown;
+          oldLocation?: unknown;
+          newLocation?: unknown;
+        };
+
+        const date =
+          typeof body.date === "string" ? body.date.trim() : "";
+        const sessionName =
+          typeof body.session === "string"
+            ? body.session.trim()
+            : "";
+        const oldLocation =
+          typeof body.oldLocation === "string"
+            ? body.oldLocation.trim()
+            : "";
+        const newLocation =
+          typeof body.newLocation === "string"
+            ? body.newLocation.trim()
+            : "";
+
+        if (
+          !date ||
+          !sessionName ||
+          !oldLocation ||
+          !newLocation ||
+          date.length > 40 ||
+          sessionName.length > 40 ||
+          oldLocation.length > 1000 ||
+          newLocation.length > 1000 ||
+          !["Morning", "Afternoon", "Evening"].includes(sessionName)
+        ) {
+          return jsonResponse(
+            { success: false, error: "Invalid session location details." },
+            400,
+          );
+        }
+
+        const tokenKey =
+          `google-refresh:${session.email.toLowerCase()}`;
+        const encryptedRefreshToken =
+          await env.OAUTH_TOKEN_STORE.get(tokenKey);
+
+        if (!encryptedRefreshToken) {
+          return jsonResponse(
+            {
+              success: false,
+              error: "Google Sheets is not connected. Reconnect Google Sheets.",
+              connectUrl: "/api/sheets/connect",
+            },
+            403,
+          );
+        }
+
+        const refreshToken = await decryptToken(
+          encryptedRefreshToken,
+          env.TOKEN_ENCRYPTION_KEY,
+        );
+
+        const tokenResponse = await fetch(
+          "https://oauth2.googleapis.com/token",
+          {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/x-www-form-urlencoded",
+            },
+            body: new URLSearchParams({
+              client_id: env.GOOGLE_CLIENT_ID,
+              client_secret: env.GOOGLE_CLIENT_SECRET,
+              refresh_token: refreshToken,
+              grant_type: "refresh_token",
+            }).toString(),
+          },
+        );
+
+        if (!tokenResponse.ok) {
+          return jsonResponse(
+            {
+              success: false,
+              error: "Google access failed. Reconnect Google Sheets.",
+              connectUrl: "/api/sheets/connect",
+            },
+            502,
+          );
+        }
+
+        const tokenData = (await tokenResponse.json()) as {
+          access_token?: string;
+        };
+
+        if (!tokenData.access_token) {
+          return jsonResponse(
+            { success: false, error: "Google returned no access token." },
+            502,
+          );
+        }
+
+        const sheetId = encodeURIComponent(env.GOOGLE_SHEET_ID);
+        const readRange = "'SESSION LOCATIONS'!A:C";
+        const readUrl =
+          `https://sheets.googleapis.com/v4/spreadsheets/${sheetId}/values/` +
+          encodeURIComponent(readRange);
+
+        const readResponse = await fetch(readUrl, {
+          headers: {
+            Authorization: `Bearer ${tokenData.access_token}`,
+          },
+        });
+
+        if (!readResponse.ok) {
+          return jsonResponse(
+            {
+              success: false,
+              error: "Could not read SESSION LOCATIONS. Check Google Sheets access.",
+            },
+            502,
+          );
+        }
+
+        const sheetData = (await readResponse.json()) as {
+          values?: unknown[][];
+        };
+        const rows = sheetData.values ?? [];
+
+        if (rows.length === 0) {
+          return jsonResponse(
+            { success: false, error: "SESSION LOCATIONS is empty." },
+            409,
+          );
+        }
+
+        const headers = rows[0].map((value) =>
+          String(value ?? "").trim().toLowerCase(),
+        );
+        const dateCol = headers.indexOf("date");
+        const sessionCol = headers.indexOf("session");
+        const locationCol = headers.indexOf("planned location");
+
+        if (dateCol < 0 || sessionCol < 0 || locationCol < 0) {
+          return jsonResponse(
+            {
+              success: false,
+              error: "SESSION LOCATIONS must have Date, Session, and Planned location headers.",
+            },
+            409,
+          );
+        }
+
+        const matches: Array<{ rowNumber: number; location: string }> = [];
+
+        rows.slice(1).forEach((row, index) => {
+          const rowDate = String(row[dateCol] ?? "").trim();
+          const rowSession = String(row[sessionCol] ?? "").trim();
+
+          if (rowDate === date && rowSession === sessionName) {
+            matches.push({
+              rowNumber: index + 2,
+              location: String(row[locationCol] ?? "").trim(),
+            });
+          }
+        });
+
+        if (matches.length !== 1) {
+          return jsonResponse(
+            {
+              success: false,
+              error:
+                matches.length === 0
+                  ? "Session row not found. Refresh the itinerary and try again."
+                  : "Duplicate date and session rows found. Please correct SESSION LOCATIONS first.",
+            },
+            409,
+          );
+        }
+
+        const match = matches[0];
+
+        // Prevent overwriting a change made by someone else.
+        if (match.location !== oldLocation) {
+          return jsonResponse(
+            {
+              success: false,
+              error: "This location has changed since you opened it. Refresh and review the latest value.",
+              currentLocation: match.location,
+            },
+            409,
+          );
+        }
+
+        const writeRange =
+          `'SESSION LOCATIONS'!C${match.rowNumber}`;
+        const writeUrl =
+          `https://sheets.googleapis.com/v4/spreadsheets/${sheetId}/values/` +
+          encodeURIComponent(writeRange) +
+          "?valueInputOption=RAW";
+
+        const writeResponse = await fetch(writeUrl, {
+          method: "PUT",
+          headers: {
+            Authorization: `Bearer ${tokenData.access_token}`,
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify({
+            values: [[newLocation]],
+          }),
+        });
+
+        if (!writeResponse.ok) {
+          const errorText = await writeResponse.text();
+          console.error(
+            "Session location save failed:",
+            writeResponse.status,
+            errorText.slice(0, 500),
+          );
+
+          return jsonResponse(
+            {
+              success: false,
+              error:
+                writeResponse.status === 403
+                  ? "Google Sheets write permission is missing. Reconnect Google Sheets and grant the requested access."
+                  : "Could not save the location. Your change was not confirmed.",
+            },
+            502,
+          );
+        }
+
+        return jsonResponse(
+          {
+            success: true,
+            message: "Session location saved.",
+            date,
+            session: sessionName,
+            oldLocation,
+            newLocation,
+          },
+          200,
+        );
+      } catch (error) {
+        console.error(
+          "Session location save failed:",
+          error instanceof Error ? error.message : String(error),
+        );
+
+        return jsonResponse(
+          { success: false, error: "Could not process the location update." },
+          500,
+        );
+      }
+    }
     
     return jsonResponse(
       { error: "Not Found" },
