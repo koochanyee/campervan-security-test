@@ -606,7 +606,7 @@ export default {
         googleUrl.searchParams.set("response_type", "code");
         googleUrl.searchParams.set(
           "scope",
-          "https://www.googleapis.com/auth/spreadsheets.readonly",
+          "https://www.googleapis.com/auth/spreadsheets",
         );
         googleUrl.searchParams.set("access_type", "offline");
         googleUrl.searchParams.set("prompt", "consent");
