@@ -1379,6 +1379,281 @@ export default {
         );
       }
     }
+
+    
+    // Shared Trip Memories: read and save records in TRIP_MEMORIES.
+    if (
+      (request.method === "GET" || request.method === "POST") &&
+      url.pathname === "/api/memories"
+    ) {
+      const session = await readSession(request, env);
+
+      if (!session) {
+        return jsonResponse(
+          { success: false, error: "Authentication required." },
+          401,
+        );
+      }
+
+      if (
+        !env.GOOGLE_CLIENT_ID ||
+        !env.GOOGLE_CLIENT_SECRET ||
+        !env.TOKEN_ENCRYPTION_KEY ||
+        !env.GOOGLE_SHEET_ID ||
+        !env.OAUTH_TOKEN_STORE
+      ) {
+        return jsonResponse(
+          { success: false, error: "Google Sheets is not configured." },
+          500,
+        );
+      }
+
+      if (
+        request.method === "POST" &&
+        request.headers.get("Origin") !== url.origin
+      ) {
+        return jsonResponse(
+          { success: false, error: "Invalid request origin." },
+          403,
+        );
+      }
+
+      try {
+        const tokenKey =
+          `google-refresh:${session.email.toLowerCase()}`;
+
+        const encryptedRefreshToken =
+          await env.OAUTH_TOKEN_STORE.get(tokenKey);
+
+        if (!encryptedRefreshToken) {
+          return jsonResponse(
+            {
+              success: false,
+              error: "Google Sheets is not connected. Reconnect Google Sheets.",
+              connectUrl: "/api/sheets/connect",
+            },
+            403,
+          );
+        }
+
+        const refreshToken = await decryptToken(
+          encryptedRefreshToken,
+          env.TOKEN_ENCRYPTION_KEY,
+        );
+
+        const tokenResponse = await fetch(
+          "https://oauth2.googleapis.com/token",
+          {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/x-www-form-urlencoded",
+            },
+            body: new URLSearchParams({
+              client_id: env.GOOGLE_CLIENT_ID,
+              client_secret: env.GOOGLE_CLIENT_SECRET,
+              refresh_token: refreshToken,
+              grant_type: "refresh_token",
+            }).toString(),
+          },
+        );
+
+        if (!tokenResponse.ok) {
+          return jsonResponse(
+            {
+              success: false,
+              error: "Google access failed. Reconnect Google Sheets.",
+              connectUrl: "/api/sheets/connect",
+            },
+            502,
+          );
+        }
+
+        const tokenData = (await tokenResponse.json()) as {
+          access_token?: string;
+        };
+
+        if (!tokenData.access_token) {
+          return jsonResponse(
+            { success: false, error: "Google returned no access token." },
+            502,
+          );
+        }
+
+        const range = encodeURIComponent("'TRIP_MEMORIES'!A:H");
+        const sheetUrl =
+          `https://sheets.googleapis.com/v4/spreadsheets/` +
+          `${env.GOOGLE_SHEET_ID}/values/${range}`;
+
+        if (request.method === "GET") {
+          const sheetResponse = await fetch(sheetUrl, {
+            headers: {
+              Authorization: `Bearer ${tokenData.access_token}`,
+            },
+          });
+
+          if (!sheetResponse.ok) {
+            return jsonResponse(
+              {
+                success: false,
+                error: "Could not read TRIP_MEMORIES. Check the worksheet name and Google Sheets access.",
+              },
+              502,
+            );
+          }
+
+          const sheetData = (await sheetResponse.json()) as {
+            values?: unknown[][];
+          };
+
+          const rows = sheetData.values || [];
+          const memories = rows.slice(1).filter(
+            (row) =>
+              typeof row[0] === "string" &&
+              typeof row[1] === "string" &&
+              typeof row[4] === "string" &&
+              String(row[0]).trim() !== "",
+          ).map((row) => ({
+            memory_id: String(row[0] || ""),
+            trip_date: String(row[1] || ""),
+            attraction: String(row[2] || ""),
+            author_email: String(row[3] || ""),
+            content: String(row[4] || ""),
+            created_at: String(row[5] || ""),
+            updated_at: String(row[6] || ""),
+            photo_ids: String(row[7] || ""),
+          }));
+
+          return jsonResponse({
+            success: true,
+            memories,
+          });
+        }
+
+        const body = (await request.json()) as {
+          memory_id?: unknown;
+          trip_date?: unknown;
+          attraction?: unknown;
+          content?: unknown;
+        };
+
+        const memoryId =
+          typeof body.memory_id === "string" ? body.memory_id.trim() : "";
+        const tripDate =
+          typeof body.trip_date === "string" ? body.trip_date.trim() : "";
+        const attraction =
+          typeof body.attraction === "string" ? body.attraction.trim() : "";
+        const content =
+          typeof body.content === "string" ? body.content.trim() : "";
+
+        if (
+          !memoryId ||
+          memoryId.length > 100 ||
+          !tripDate ||
+          tripDate.length > 40 ||
+          attraction.length > 200 ||
+          !content ||
+          content.length > 5000
+        ) {
+          return jsonResponse(
+            { success: false, error: "Invalid memory details." },
+            400,
+          );
+        }
+
+        // Check existing IDs so retries do not normally create duplicates.
+        const existingResponse = await fetch(sheetUrl, {
+          headers: {
+            Authorization: `Bearer ${tokenData.access_token}`,
+          },
+        });
+
+        if (!existingResponse.ok) {
+          return jsonResponse(
+            { success: false, error: "Could not check existing memories." },
+            502,
+          );
+        }
+
+        const existingData = (await existingResponse.json()) as {
+          values?: string[][];
+        };
+
+        const existingRows = existingData.values || [];
+        const existingRow = existingRows.slice(1).find(
+          (row) => String(row[0] || "") === memoryId,
+        );
+
+        if (existingRow) {
+          return jsonResponse({
+            success: true,
+            duplicate: true,
+            message: "Memory already saved.",
+            memory: {
+              memory_id: String(existingRow[0] || ""),
+              trip_date: String(existingRow[1] || ""),
+              attraction: String(existingRow[2] || ""),
+              author_email: String(existingRow[3] || ""),
+              content: String(existingRow[4] || ""),
+              created_at: String(existingRow[5] || ""),
+              updated_at: String(existingRow[6] || ""),
+              photo_ids: String(existingRow[7] || ""),
+            },
+          });
+        }
+
+        const createdAt = new Date().toISOString();
+        const appendUrl =
+          `${sheetUrl}:append?valueInputOption=RAW&insertDataOption=INSERT_ROWS`;
+
+        const appendResponse = await fetch(appendUrl, {
+          method: "POST",
+          headers: {
+            Authorization: `Bearer ${tokenData.access_token}`,
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify({
+            values: [[
+              memoryId,
+              tripDate,
+              attraction,
+              session.email,
+              content,
+              createdAt,
+              createdAt,
+              "",
+            ]],
+          }),
+        });
+
+        if (!appendResponse.ok) {
+          return jsonResponse(
+            { success: false, error: "Could not save the memory to Google Sheets." },
+            502,
+          );
+        }
+
+        return jsonResponse({
+          success: true,
+          duplicate: false,
+          message: "Memory saved.",
+          memory: {
+            memory_id: memoryId,
+            trip_date: tripDate,
+            attraction,
+            author_email: session.email,
+            content,
+            created_at: createdAt,
+            updated_at: createdAt,
+            photo_ids: "",
+          },
+        });
+      } catch {
+        return jsonResponse(
+          { success: false, error: "An unexpected error occurred while accessing memories." },
+          500,
+        );
+      }
+    }
     
     return jsonResponse(
       { error: "Not Found" },
