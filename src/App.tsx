@@ -440,6 +440,171 @@ function App() {
                           <p className="mt-2 text-xs text-slate-500">No spending total is shown until expense data is added.</p>
                         </div>
                       </div>
+                      <button type="button" onClick={() => setActiveView("expenses")} className="mt-4 text-sm font-semibold text-emerald-800 hover:underlontinue|drive to|drive toward|arrive|check in|check out|pack|refuel)/i.test(line)
+          )
+      )
+      .slice(0, 3);
+
+    return { day, route, highlights };
+  });
+  
+  const categorized = useMemo(() => {
+    const groups: Record<string, DayEntry[]> = {
+      route: [],
+      places: [],
+      stay: [],
+      other: [],
+    };
+    for (const entry of dayEntries) {
+      const label = entry.label.toLowerCase();
+      if (/route|drive|driving|destination|distance|travel time|departure|arrival|transport/.test(label)) groups.route.push(entry);
+      else if (/attraction|place|visit|activity|experience|sight|stop|location|walk|hike|tour/.test(label)) groups.places.push(entry);
+      else if (/camp|campsite|accommodation|hotel|booking|check.?in|reservation|stay|overnight/.test(label)) groups.stay.push(entry);
+      else groups.other.push(entry);
+    }
+    return groups;
+  }, [dayEntries]);
+
+  const navigateToItinerary = (dayIndex = dashboardDayIndex) => {
+    setActiveDayIndex(Math.max(0, Math.min(dayIndex, Math.max(0, tripDays.length - 1))));
+    setActiveView("itinerary");
+  };
+
+  return (
+    <div className="min-h-screen bg-[#f4f6f4] pb-24 text-slate-900">
+      <header className="border-b border-slate-200 bg-white">
+        <div className="mx-auto flex max-w-6xl flex-col gap-3 px-4 py-4 sm:flex-row sm:items-center sm:justify-between sm:px-6">
+          <button type="button" onClick={() => setActiveView("home")} className="text-left">
+            <p className="text-xs font-bold uppercase tracking-[0.18em] text-emerald-800">Shared travel companion</p>
+            <h1 className="mt-1 text-2xl font-bold tracking-tight sm:text-3xl">New Zealand Road Trip</h1>
+            <p className="mt-1 text-sm text-slate-500">South Island · {dateRange}</p>
+          </button>
+          <div className="flex flex-wrap items-center gap-2">
+            {verifiedEmail && <span className="text-sm text-slate-600">{verifiedEmail}</span>}
+            {verifiedEmail && <button type="button" onClick={() => window.location.assign("/api/sheets/connect")} className="rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm font-semibold hover:bg-slate-50">{needsSheetsConnection ? "Connect Sheets" : "Reconnect Sheets"}</button>}
+          </div>
+        </div>
+      </header>
+
+      <main className="mx-auto max-w-6xl space-y-6 px-4 py-5 sm:px-6 sm:py-7">
+        {!verifiedEmail && (
+          <section className="rounded-2xl border border-slate-200 bg-white p-5 shadow-sm">
+            <h2 className="text-lg font-semibold">Google account</h2>
+            <p className="mt-2 text-sm text-slate-600">Sign in with an approved Google account to view your shared travel companion.</p>
+            {authMessage && <p className="mt-2 text-sm text-slate-500" aria-live="polite">{authMessage}</p>}
+            {isVerifying && <p className="mt-2 text-sm text-slate-500">Verifying account…</p>}
+            <div id="google-sign-in-button" className="mt-4 min-h-10" />
+          </section>
+        )}
+
+        {verifiedEmail && (
+          <>
+            {itineraryError && (
+              <div className="rounded-xl border border-amber-200 bg-amber-50 p-4" role="alert">
+                <p className="font-semibold text-amber-900">Itinerary could not be loaded</p>
+                <p className="mt-1 text-sm text-amber-800">{itineraryError}</p>
+                <div className="mt-3 flex flex-wrap gap-2">
+                  <button type="button" onClick={() => setRefreshKey((n) => n + 1)} className="rounded-lg bg-amber-900 px-3 py-2 text-sm font-semibold text-white">Try again</button>
+                  {needsSheetsConnection && <button type="button" onClick={() => window.location.assign("/api/sheets/connect")} className="rounded-lg border border-amber-900 px-3 py-2 text-sm font-semibold text-amber-950">Connect Google Sheets</button>}
+                </div>
+              </div>
+            )}
+
+            {isLoadingItinerary && <div className="rounded-xl border border-slate-200 bg-white p-5 text-sm text-slate-600" role="status">Loading your trip details…</div>}
+
+            {!isLoadingItinerary && !itineraryError && activeView === "home" && (
+              <div className="space-y-6">
+                <section className="relative overflow-hidden rounded-3xl bg-gradient-to-br from-emerald-950 via-emerald-800 to-teal-700 p-6 text-white shadow-sm sm:p-8">
+                  <div className="absolute -right-10 -top-12 h-56 w-56 rounded-full border border-white/10" />
+                  <div className="absolute -right-1 top-8 h-36 w-36 rounded-full border border-white/10" />
+                  <div className="relative max-w-2xl">
+                    <span className="inline-flex items-center rounded-full border border-white/25 bg-white/10 px-3 py-1 text-xs font-semibold uppercase tracking-wider">{isTripOngoing ? "During the trip" : isTripUpcoming ? "Your trip is coming up" : "Your trip dashboard"}</span>
+                    <div className="mt-5 flex items-start gap-4">
+                      <div className="flex h-14 w-14 shrink-0 items-center justify-center rounded-2xl bg-white/15 text-3xl" aria-hidden="true">🚐</div>
+                      <div>
+                        <h2 className="text-2xl font-bold sm:text-3xl">New Zealand Road Trip</h2>
+                        <p className="mt-2 text-sm text-emerald-50 sm:text-base">South Island · {dateRange}</p>
+                        <p className="mt-3 max-w-xl text-sm leading-6 text-emerald-50">Your shared home for the daily plan, trip reminders, expenses and memories.</p>
+                      </div>
+                    </div>
+                    <button   type="button"   onClick={() => setActiveView("checklist")}   className="mt-6 rounded-xl bg-white px-5 py-3 text-sm font-bold text-emerald-950 shadow-sm hover:bg-emerald-50" >   START JOURNEY ✈️🚐   <span aria-hidden="true"> →</span> </button>
+                  </div>
+                </section>
+
+                <section className="grid gap-5 lg:grid-cols-[1.5fr_1fr]">
+                  <div className="rounded-2xl border border-slate-200 bg-white p-5 shadow-sm sm:p-6">
+                    <p className="text-xs font-bold uppercase tracking-[0.16em] text-emerald-800">
+                      Trip preview
+                    </p>
+                    <h2 className="mt-1 text-xl font-bold">
+                      Your journey at a glance
+                    </h2>
+                    <p className="mt-1 text-sm text-slate-500">
+                      Upcoming routes and attraction highlights.
+                    </p>
+
+                    <div className="mt-4 space-y-3">
+                      {dashboardPreviewDays.map(({ day, route, highlights }, index) => (
+                        <button
+                          key={day.key}
+                          type="button"
+                          onClick={() => {
+                            setActiveDayIndex(dashboardDayIndex + index);
+                            setActiveView("itinerary");
+                          }}
+                          className="w-full rounded-xl border border-slate-200 p-4 text-left hover:border-emerald-500 hover:bg-emerald-50/40"
+                        >
+                          <p className="text-xs font-bold uppercase tracking-wide text-emerald-800">
+                            Day {dashboardDayIndex + index + 1} · {day.weekday}
+                          </p>
+                          <h3 className="mt-1 font-bold">{day.date}</h3>
+                  
+                          {route && (
+                            <p className="mt-2 text-sm font-medium text-slate-700">
+                              {route}
+                            </p>
+                          )}
+                  
+                          {highlights.length > 0 && (
+                            <ul className="mt-2 space-y-1">
+                              {highlights.map((highlight, highlightIndex) => (
+                                <li
+                                  key={`${day.key}-${highlightIndex}`}
+                                  className="line-clamp-2 text-sm text-slate-600"
+                                >
+                                  • {highlight}
+                                </li>
+                              ))}
+                            </ul>
+                          )}
+                  
+                          <p className="mt-3 text-xs font-semibold text-emerald-800">
+                            View this day →
+                          </p>
+                        </button>
+                      ))}
+                    </div>
+
+                    <button
+                      type="button"
+                      onClick={() => navigateToItinerary()}
+                      disabled={tripDays.length === 0}
+                      className="mt-4 w-full rounded-xl bg-emerald-800 px-4 py-3 text-sm font-bold text-white hover:bg-emerald-900 disabled:opacity-50"
+                    >
+                      Open full itinerary →
+                    </button>
+                  </div>
+                  
+                  <div className="grid gap-5 sm:grid-cols-2 lg:grid-cols-1">
+                    <section className="rounded-2xl border border-slate-200 bg-white p-5 shadow-sm">
+                      <div className="flex items-start gap-3">
+                        <div className="flex h-11 w-11 items-center justify-center rounded-xl bg-amber-50 text-2xl" aria-hidden="true">💳</div>
+                        <div>
+                          <h2 className="font-bold">Trip expenses</h2>
+                          <p className="mt-1 text-sm text-slate-600">Expense tracking is not connected yet.</p>
+                          <p className="mt-2 text-xs text-slate-500">No spending total is shown until expense data is added.</p>
+                        </div>
+                      </div>
                       <button type="button" onClick={() => setActiveView("expenses")} className="mt-4 text-sm font-semibold text-emerald-800 hover:underline">Open expenses →</button>
                     </section>
                     <section className="rounded-2xl border border-slate-200 bg-white p-5 shadow-sm">
