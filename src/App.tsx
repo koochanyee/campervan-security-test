@@ -719,7 +719,6 @@ function App() {
                               <h4 className="font-semibold">🕒 Daily Timeline</h4>
                               {(["Morning", "Afternoon", "Evening"] as const).map((session) => {
                                 const entry = dayEntries.find((item) => item.label.trim().toLowerCase() === session.toLowerCase());
-                                const key = `${selectedDay.date}|${session}`;
                                 const savedLocation = getSessionLocation(session);
                                 const lines = (entry?.value ?? "").split(/\n+/).map((line) => line.trim()).filter(Boolean);
                                 return <div key={session} className="rounded-xl border border-slate-200 p-4">
