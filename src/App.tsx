@@ -68,6 +68,9 @@ declare global {
 
 const TRIP_YEAR = 2026;
 const MONTHS = ["jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"];
+function formatMemoryDate(date: Date): string {
+  return `${date.getDate()} ${date.toLocaleDateString("en-GB", { month: "short" })}`;
+}
 
 function parseTripDate(label: string): Date | null {
   const match = label.trim().match(/^(\d{1,2})\s+([A-Za-z]{3,})/);
@@ -99,13 +102,16 @@ function App() {
   const [memories, setMemories] = useState<TripMemory[]>([]);
   const [memoryAttraction, setMemoryAttraction] = useState("");
   const [memoryContent, setMemoryContent] = useState("");
-  const [memoryDate, setMemoryDate] = useState("");
+  const [memoryDate, setMemoryDate] = useState(() => formatMemoryDate(new Date()));
   const [memoryPreviewOpen, setMemoryPreviewOpen] = useState(false);
   const [isSavingMemory, setIsSavingMemory] = useState(false);
   const [memoryMessage, setMemoryMessage] = useState("");
   const [locationDrafts, setLocationDrafts] = useState<Record<string, string>>({});
   const [locationSaving, setLocationSaving] = useState<string>("");
   const [locationMessage, setLocationMessage] = useState("");
+  const [locationModalSession, setLocationModalSession] = useState<string | null>(null);
+  const [memoryPhotoFiles, setMemoryPhotoFiles] = useState<File[]>([]);
+  const [isDetectingPlace, setIsDetectingPlace] = useState(false);
   const [touchStart, setTouchStart] = useState<{ x: number; y: number } | null>(null);
 
   useEffect(() => {
@@ -346,7 +352,7 @@ function App() {
           .map((line) =>
             line
               .trim()
-              .replace(/^\d{1,2}(?::\d{2})?\s*(?:am|pm)?\s*[-–:]?\s*/i, "")
+              .replace(/^\d{1,2}(?:[:.]\d{2})?\s*(?:a\.?m\.?|p\.?m\.?)?\s*[-–:,]?\s*/i, "")
           )
           .filter(
             (line) =>
@@ -399,6 +405,42 @@ function App() {
     return match?.location ?? "";
   };
 
+  const openSessionLocationEditor = (session: string) => {
+    const key = `${selectedDay?.date ?? ""}|${session}`;
+    setLocationDrafts((current) => ({ ...current, [key]: current[key] ?? getSessionLocation(session) }));
+    setLocationMessage("");
+    setLocationModalSession(session);
+  };
+
+  const detectMemoryPlace = async () => {
+    if (!navigator.geolocation) {
+      setMemoryMessage("Location detection is not supported by this browser.");
+      return;
+    }
+    setIsDetectingPlace(true);
+    setMemoryMessage("Requesting your location permission…");
+    navigator.geolocation.getCurrentPosition(async (position) => {
+      const { latitude, longitude } = position.coords;
+      try {
+        const response = await fetch(`https://nominatim.openstreetmap.org/reverse?format=jsonv2&lat=${latitude}&lon=${longitude}`);
+        if (!response.ok) throw new Error("Could not resolve the GPS coordinates to a place name.");
+        const result = await response.json() as { name?: string; display_name?: string; address?: Record<string, string> };
+        const address = result.address ?? {};
+        const place = result.name || address.tourism || address.amenity || address.natural || address.road || address.suburb || result.display_name;
+        setMemoryAttraction(place || `GPS ${latitude.toFixed(5)}, ${longitude.toFixed(5)}`);
+        setMemoryMessage(`Place detected from GPS (${latitude.toFixed(4)}, ${longitude.toFixed(4)}). Please check the place name before saving.`);
+      } catch (error) {
+        setMemoryAttraction(`GPS ${latitude.toFixed(5)}, ${longitude.toFixed(5)}`);
+        setMemoryMessage(error instanceof Error ? `${error.message} Coordinates added instead.` : "Coordinates added instead.");
+      } finally {
+        setIsDetectingPlace(false);
+      }
+    }, (error) => {
+      setIsDetectingPlace(false);
+      setMemoryMessage(error.code === error.PERMISSION_DENIED ? "Location permission was denied. You can type the place name instead." : "Could not detect location. Please try again or enter the place manually.");
+    }, { enableHighAccuracy: true, timeout: 12000, maximumAge: 60000 });
+  };
+
   const saveSessionLocation = async (session: string) => {
     const key = `${selectedDay?.date ?? ""}|${session}`;
     const newLocation = (locationDrafts[key] ?? getSessionLocation(session)).trim();
@@ -430,6 +472,7 @@ function App() {
       });
       setLocationDrafts((current) => { const next = { ...current }; delete next[key]; return next; });
       setLocationMessage(`${session} location saved.`);
+      setLocationModalSession(null);
     } catch (error) {
       setLocationMessage(error instanceof Error ? error.message : "Could not save the planned location.");
     } finally { setLocationSaving(""); }
@@ -442,6 +485,7 @@ function App() {
 
   return (
     <div className="min-h-screen bg-[#f4f6f4] pb-24 text-slate-900">
+      <style>{`@keyframes itinerarySlideIn { from { opacity: .65; transform: translateX(10px); } to { opacity: 1; transform: translateX(0); } }`}</style>
       <header className="border-b border-slate-200 bg-white">
         <div className="mx-auto flex max-w-6xl flex-col gap-3 px-4 py-4 sm:flex-row sm:items-center sm:justify-between sm:px-6">
           <button type="button" onClick={() => setActiveView("home")} className="text-left">
@@ -644,9 +688,11 @@ function App() {
                         );
                       })}
                     </div>
+                    <div className="flex items-center justify-between gap-3 text-xs text-slate-500"><span>← Swipe the itinerary card to change day →</span><span className="font-semibold">{safeDayIndex + 1} / {tripDays.length}</span></div>
+                    <div className="flex justify-center gap-1.5" aria-label={`Day ${safeDayIndex + 1} of ${tripDays.length}`}>{tripDays.map((day, index) => <button key={`dot-${day.key}`} type="button" onClick={() => setActiveDayIndex(index)} aria-label={`Go to ${day.date}`} aria-current={index === safeDayIndex ? "step" : undefined} className={`h-1.5 rounded-full transition-all duration-300 ${index === safeDayIndex ? "w-7 bg-emerald-700" : "w-1.5 bg-slate-300 hover:bg-emerald-400"}`} />)}</div>
 
                     {selectedDay && (
-                      <section className="overflow-hidden rounded-2xl border border-slate-200">
+                      <section key={selectedDay.key} style={{ animation: "itinerarySlideIn 200ms ease-out" }} className="overflow-hidden rounded-2xl border border-slate-200 transition-all duration-300">
                         <div className="flex flex-wrap items-center justify-between gap-3 bg-slate-50 px-4 py-4 sm:px-5">
                           <div>
                             <p className="text-xs font-bold uppercase tracking-[0.15em] text-emerald-800">{selectedDay.weekday} · Day {safeDayIndex + 1}</p>
@@ -661,29 +707,31 @@ function App() {
                           <p className="px-5 py-8 text-sm text-slate-500">No itinerary details have been entered for this day yet.</p>
                         ) : (
                           <div className="space-y-4 p-4 sm:p-5">
-                            <section className="rounded-xl border border-slate-200 p-4">
-                              <h4 className="font-semibold">🛣️ Route & Driving</h4>
-                              {categorized.route.length ? categorized.route.map((entry) => <div key={entry.key} className="mt-2"><p className="text-xs font-semibold text-slate-500">{entry.label}</p><p className="whitespace-pre-wrap text-sm leading-6">{entry.value}</p></div>) : <p className="mt-2 text-sm text-slate-500">No route or driving details entered for this day.</p>}
-                            </section>
-                            <section className="rounded-xl bg-emerald-50/70 p-4">
-                              <h4 className="font-semibold">✨ Today’s Highlights</h4>
-                              {dashboardPreviewDays.find((item) => item.day.key === selectedDay.key)?.highlights.length ? <ul className="mt-2 list-disc space-y-1 pl-5 text-sm leading-6">{dashboardPreviewDays.find((item) => item.day.key === selectedDay.key)!.highlights.map((item, i) => <li key={`${i}-${item}`}>{item}</li>)}</ul> : <p className="mt-2 text-sm text-slate-500">Highlights will appear here when activities are listed in the itinerary.</p>}
+                            <section className="rounded-2xl border border-emerald-200 bg-gradient-to-br from-emerald-50 to-white p-4 shadow-sm sm:p-5">
+                              <h4 className="text-lg font-bold">⭐ Today Highlight</h4>
+                              <div className="mt-4 space-y-4">
+                                <div><p className="font-semibold">🛣️ Route</p>{categorized.route.filter((entry) => /route|destination|distance|departure|arrival|transport/i.test(entry.label)).length ? categorized.route.filter((entry) => /route|destination|distance|departure|arrival|transport/i.test(entry.label)).map((entry) => <p key={entry.key} className="mt-1 whitespace-pre-wrap text-sm leading-6">{entry.value}</p>) : <p className="mt-1 text-sm text-slate-500">No route details entered for this day.</p>}</div>
+                                <div><p className="font-semibold">🚐 Driving note</p>{categorized.route.filter((entry) => /drive|driving|travel time/i.test(entry.label)).length ? categorized.route.filter((entry) => /drive|driving|travel time/i.test(entry.label)).map((entry) => <p key={entry.key} className="mt-1 whitespace-pre-wrap text-sm leading-6">{entry.value}</p>) : <p className="mt-1 text-sm text-slate-500">No separate driving note entered.</p>}</div>
+                                <div><p className="font-semibold">⚡ Activity</p>{dashboardPreviewDays.find((item) => item.day.key === selectedDay.key)?.highlights.length ? <ul className="mt-1 list-disc space-y-1 pl-5 text-sm leading-6">{dashboardPreviewDays.find((item) => item.day.key === selectedDay.key)!.highlights.map((item, i) => <li key={`${i}-${item}`}>{item}</li>)}</ul> : <p className="mt-1 text-sm text-slate-500">Activity highlights will appear here from the itinerary.</p>}</div>
+                              </div>
                             </section>
                             <section className="space-y-3">
                               <h4 className="font-semibold">🕒 Daily Timeline</h4>
                               {(["Morning", "Afternoon", "Evening"] as const).map((session) => {
                                 const entry = dayEntries.find((item) => item.label.trim().toLowerCase() === session.toLowerCase());
-                                const meal = session === "Morning" ? "BREAKFAST" : session === "Afternoon" ? "LUNCH" : "DINNER";
                                 const key = `${selectedDay.date}|${session}`;
                                 const savedLocation = getSessionLocation(session);
                                 const lines = (entry?.value ?? "").split(/\n+/).map((line) => line.trim()).filter(Boolean);
                                 return <div key={session} className="rounded-xl border border-slate-200 p-4">
-                                  <div className="flex flex-wrap items-center justify-between gap-2"><h5 className="font-bold">{session}</h5><span className="rounded-full bg-amber-100 px-2.5 py-1 text-[10px] font-bold tracking-wide text-amber-900">{meal}</span></div>
+                                  <div className="flex items-center gap-3"><h5 className="font-bold">{session}</h5><span className="text-2xl" aria-hidden="true">{session === "Morning" ? "🧇" : session === "Afternoon" ? "🧆" : "🍲"}</span></div>
                                   {lines.length ? <div className="mt-3 space-y-2">{lines.map((line, i) => {
-                                    const match = line.match(/^(\d{1,2}(?::\d{2})?\s*(?:am|pm)?)(?:\s*[-–:]\s*|\s+)(.+)$/i);
-                                    return <div key={`${session}-${i}`} className="flex items-start gap-2 text-sm leading-6">{match && <span className="shrink-0 rounded-md bg-slate-100 px-2 py-0.5 text-xs font-semibold text-slate-700">{match[1]}</span>}<span>{match ? match[2] : line}</span></div>;
+                                    const match = line.match(/^(\d{1,2}(?:[:.]\d{2})?\s*(?:a\.?m\.?|p\.?m\.?)?)(?:\s*[-–:,]\s*|\s+)(.+)$/i);
+                                    const mealWord = session === "Morning" ? /\b(breakfast)\b/i : session === "Afternoon" ? /\b(lunch)\b/i : /\b(dinner)\b/i;
+                                    const text = match ? match[2] : line;
+                                    const wordMatch = text.match(mealWord);
+                                    return <div key={`${session}-${i}`} className="flex items-start gap-2 text-sm leading-6">{match && <span className="shrink-0 rounded-md bg-slate-100 px-2 py-0.5 text-xs font-semibold text-slate-700">{match[1]}</span>}<span>{wordMatch ? <>{text.slice(0, wordMatch.index)}<strong>{wordMatch[0]}</strong>{text.slice((wordMatch.index ?? 0) + wordMatch[0].length)}</> : text}</span></div>;
                                   })}</div> : <p className="mt-2 text-sm text-slate-500">No {session.toLowerCase()} activities listed.</p>}
-                                  <div className="mt-3 border-t border-slate-100 pt-3"><label className="block text-xs font-semibold text-slate-600">Session & Location</label><div className="mt-1 flex flex-col gap-2 sm:flex-row"><input value={locationDrafts[key] ?? savedLocation} onChange={(event) => setLocationDrafts((current) => ({ ...current, [key]: event.target.value }))} placeholder={`Planned ${session.toLowerCase()} location`} className="min-w-0 flex-1 rounded-lg border border-slate-300 px-3 py-2 text-sm" /><button type="button" onClick={() => void saveSessionLocation(session)} disabled={locationSaving === key || !(locationDrafts[key] ?? savedLocation).trim()} className="rounded-lg bg-emerald-800 px-3 py-2 text-sm font-semibold text-white disabled:opacity-50">{locationSaving === key ? "Saving…" : "Save location"}</button></div></div>
+                                  <button type="button" onClick={() => openSessionLocationEditor(session)} className="mt-3 flex w-full items-start gap-3 rounded-xl border border-dashed border-slate-300 bg-slate-50 p-3 text-left transition hover:border-emerald-400 hover:bg-emerald-50/60"><span className="text-2xl" aria-hidden="true">📍</span><span className="min-w-0 flex-1"><span className="block text-xs font-semibold text-slate-600">Session & Location · Tap to edit</span><span className="mt-1 block whitespace-pre-wrap text-sm text-slate-800">{savedLocation || `Add a ${session.toLowerCase()} location`}</span></span><span className="text-sm font-semibold text-emerald-800">Edit</span></button>
                                 </div>;
                               })}
                               {locationMessage && <p className="text-sm text-slate-600" aria-live="polite">{locationMessage}</p>}
@@ -809,7 +857,7 @@ function App() {
                                         </div>
 
                                         {layering.icons && layering.icons.length > 0 && (
-                                          <p className="text-xl" aria-label="Suggested clothing">
+                                          <p className="text-4xl" aria-label="Suggested clothing">
                                             {layering.icons.join(" ")}
                                           </p>
                                         )}
@@ -853,7 +901,7 @@ function App() {
                           <InfoPanel icon="🏕️" title="Stay & bookings" entries={categorized.stay} empty="Stay details are not labelled in the sheet yet." />
                         </div>
                         <div className="border-t border-slate-100 bg-slate-50 p-4">
-                          <div className="flex items-start justify-between gap-3"><div><h4 className="font-semibold">📸 Travel Memories</h4><p className="mt-1 text-sm text-slate-600">Shared notes saved for {selectedDay.date}.</p></div><button type="button" onClick={() => { setMemoryDate(selectedDay.date); setActiveView("memories"); }} className="shrink-0 rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm font-semibold">Add memory</button></div>
+                          <div className="flex items-start justify-between gap-3"><div><h4 className="font-semibold">📸 Travel Memories</h4><p className="mt-1 text-sm text-slate-600">Shared notes saved for {selectedDay.date}.</p></div><button type="button" onClick={() => { setActiveView("memories"); }} className="shrink-0 rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm font-semibold">Add memory</button></div>
                           {memories.filter((memory) => normalizeTripDate(memory.trip_date) === normalizeTripDate(selectedDay.date)).length ? <div className="mt-3 space-y-3">{memories.filter((memory) => normalizeTripDate(memory.trip_date) === normalizeTripDate(selectedDay.date)).map((memory) => <article key={memory.memory_id} className="rounded-lg border border-slate-200 bg-white p-3"><p className="font-semibold">{memory.attraction}</p><p className="mt-1 whitespace-pre-wrap text-sm leading-6 text-slate-700">{memory.content}</p><p className="mt-2 text-xs text-slate-500">Shared by {memory.author_email || "trip companion"}</p></article>)}</div> : <p className="mt-3 text-sm text-slate-500">No memories saved for this day yet.</p>}
                         </div>
                       </section>
@@ -983,9 +1031,12 @@ function App() {
                 {activeView !== "memories" ? <><p className="mt-2 max-w-xl text-sm leading-6 text-slate-600">{activeView === "expenses" ? "Shared expense tracking has not been connected yet. No spending total is being fabricated." : "A route map has not been connected yet. This screen does not currently save locations or calculate routes."}</p><div className="mt-5 rounded-xl bg-slate-50 p-4 text-sm text-slate-600">Your Google Sheets itinerary remains connected and unchanged.</div></> : <div className="mt-5 space-y-5">
                   <form onSubmit={(event) => { event.preventDefault(); setMemoryPreviewOpen(true); setMemoryMessage(""); }} className="rounded-xl border border-slate-200 p-4">
                     <h3 className="font-semibold">Add a shared memory</h3><p className="mt-1 text-sm text-slate-500">Review the preview before saving. Memories are shared with both approved travellers.</p>
-                    <label className="mt-4 block text-sm font-medium">Trip date</label><select value={memoryDate} onChange={(event) => setMemoryDate(event.target.value)} required className="mt-1 w-full rounded-lg border border-slate-300 px-3 py-2 text-sm"><option value="">Choose a trip date</option>{tripDays.map((day) => <option key={day.key} value={day.date}>{day.date}</option>)}</select>
-                    <label className="mt-3 block text-sm font-medium">Attraction / place</label><input value={memoryAttraction} onChange={(event) => setMemoryAttraction(event.target.value)} required maxLength={160} placeholder="e.g. Lake Tekapo" className="mt-1 w-full rounded-lg border border-slate-300 px-3 py-2 text-sm" />
+                    <label className="mt-4 block text-sm font-medium">Trip date</label><select value={memoryDate} onChange={(event) => setMemoryDate(event.target.value)} required className="mt-1 w-full rounded-lg border border-slate-300 px-3 py-2 text-sm">{!tripDays.some((day) => normalizeTripDate(day.date) === normalizeTripDate(memoryDate)) && <option value={memoryDate}>Today · {memoryDate}</option>}{tripDays.map((day) => <option key={day.key} value={day.date}>{day.date}</option>)}</select>
+                    <label className="mt-3 block text-sm font-medium">Attraction / place</label><div className="mt-1 flex gap-2"><input value={memoryAttraction} onChange={(event) => setMemoryAttraction(event.target.value)} required maxLength={160} placeholder="e.g. Lake Tekapo" className="min-w-0 flex-1 rounded-lg border border-slate-300 px-3 py-2 text-sm" /><button type="button" onClick={() => void detectMemoryPlace()} disabled={isDetectingPlace} className="shrink-0 rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm font-semibold disabled:opacity-50">{isDetectingPlace ? "Locating…" : "📍 Use GPS"}</button></div>
                     <label className="mt-3 block text-sm font-medium">Memory</label><textarea value={memoryContent} onChange={(event) => setMemoryContent(event.target.value)} required maxLength={5000} rows={4} placeholder="What would you like to remember about this place?" className="mt-1 w-full rounded-lg border border-slate-300 px-3 py-2 text-sm" />
+                    <label className="mt-3 block text-sm font-medium">Photos</label><input type="file" accept="image/*" multiple onChange={(event) => setMemoryPhotoFiles(Array.from(event.target.files ?? []))} className="mt-1 block w-full rounded-lg border border-slate-300 p-2 text-sm file:mr-3 file:rounded-md file:border-0 file:bg-emerald-50 file:px-3 file:py-2 file:font-semibold file:text-emerald-800" />
+                    {memoryPhotoFiles.length > 0 && <div className="mt-2 flex flex-wrap gap-2">{memoryPhotoFiles.map((file, index) => <span key={`${file.name}-${index}`} className="rounded-lg bg-slate-100 px-2 py-1 text-xs text-slate-700">📷 {file.name}</span>)}</div>}
+                    <p className="mt-1 text-xs text-amber-700">Photo selection is shown here, but shared photo upload still needs a backend storage integration. Photos are not uploaded or saved yet.</p>
                     <button type="submit" className="mt-3 rounded-lg bg-emerald-800 px-4 py-2.5 text-sm font-semibold text-white">Preview memory</button>
                   </form>
                   {memoryPreviewOpen && <section className="rounded-xl border border-emerald-300 bg-emerald-50/50 p-4"><p className="text-xs font-bold uppercase tracking-wide text-emerald-800">Preview — not saved yet</p><h3 className="mt-2 font-semibold">{memoryAttraction}</h3><p className="mt-1 text-xs text-slate-500">{memoryDate}</p><p className="mt-3 whitespace-pre-wrap text-sm leading-6">{memoryContent}</p><div className="mt-4 flex flex-wrap gap-2"><button type="button" onClick={() => void saveMemory()} disabled={isSavingMemory} className="rounded-lg bg-emerald-800 px-4 py-2.5 text-sm font-semibold text-white disabled:opacity-50">{isSavingMemory ? "Saving…" : "Confirm & save"}</button><button type="button" onClick={() => setMemoryPreviewOpen(false)} className="rounded-lg border border-slate-300 bg-white px-4 py-2.5 text-sm font-semibold">Keep editing</button></div></section>}
@@ -998,6 +1049,18 @@ function App() {
           </>
         )}
       </main>
+
+      {locationModalSession && selectedDay && (
+        <div className="fixed inset-0 z-50 flex items-end justify-center bg-slate-950/40 p-0 sm:items-center sm:p-4" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) setLocationModalSession(null); }}>
+          <section role="dialog" aria-modal="true" aria-labelledby="session-location-title" className="w-full max-w-lg rounded-t-2xl bg-white p-5 shadow-2xl sm:rounded-2xl sm:p-6">
+            <div className="flex items-start justify-between gap-3"><div><p className="text-xs font-bold uppercase tracking-wide text-emerald-800">{selectedDay.date} · {locationModalSession}</p><h2 id="session-location-title" className="mt-1 text-xl font-bold">Edit session location</h2><p className="mt-1 text-sm text-slate-500">Changes sync to the SESSION LOCATION Google Sheet.</p></div><button type="button" aria-label="Close location editor" onClick={() => setLocationModalSession(null)} className="rounded-lg px-3 py-2 text-lg hover:bg-slate-100">✕</button></div>
+            <label className="mt-5 block text-sm font-semibold" htmlFor="session-location-input">Planned location</label>
+            <textarea id="session-location-input" autoFocus rows={3} value={locationDrafts[`${selectedDay.date}|${locationModalSession}`] ?? getSessionLocation(locationModalSession)} onChange={(event) => setLocationDrafts((current) => ({ ...current, [`${selectedDay.date}|${locationModalSession}`]: event.target.value }))} placeholder={`Where will you be during ${locationModalSession.toLowerCase()}?`} className="mt-2 w-full rounded-xl border border-slate-300 p-3 text-sm focus:border-emerald-700 focus:outline-none focus:ring-2 focus:ring-emerald-100" />
+            {locationMessage && <p className="mt-2 text-sm text-slate-600" aria-live="polite">{locationMessage}</p>}
+            <div className="mt-4 flex gap-2"><button type="button" onClick={() => setLocationModalSession(null)} className="flex-1 rounded-xl border border-slate-300 px-4 py-3 text-sm font-semibold">Cancel</button><button type="button" disabled={locationSaving === `${selectedDay.date}|${locationModalSession}` || !(locationDrafts[`${selectedDay.date}|${locationModalSession}`] ?? getSessionLocation(locationModalSession)).trim()} onClick={async () => { await saveSessionLocation(locationModalSession); }} className="flex-1 rounded-xl bg-emerald-800 px-4 py-3 text-sm font-semibold text-white disabled:opacity-50">{locationSaving === `${selectedDay.date}|${locationModalSession}` ? "Saving…" : "Save & sync"}</button></div>
+          </section>
+        </div>
+      )}
 
       {verifiedEmail && (
         <nav className="fixed inset-x-0 bottom-0 z-20 border-t border-slate-200 bg-white/95 px-2 pb-[env(safe-area-inset-bottom)] backdrop-blur">
