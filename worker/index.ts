@@ -1095,7 +1095,6 @@ export default {
             }
             rows = await readSheetRows(token, trip.sheetId, tab);
           }
-          const header = rows[0] || [];
           const statusCols = [9, 10, 11, 12];
           const ralphIndex = session.email.toLowerCase() === "koochanyee@gmail.com" ? 0 : session.email.toLowerCase() === "wookahwai@gmail.com" ? 1 : -1;
           if (ralphIndex < 0) return jsonResponse({ success: false, error: "This account is not assigned a checklist profile." }, 403);
