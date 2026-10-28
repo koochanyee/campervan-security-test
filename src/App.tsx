@@ -26,7 +26,11 @@ type ApiResponse = {
   checklistItems?: ChecklistItem[];
   items?: ChecklistItem[];
   item?: ChecklistItem;
+  trips?: TripConfigSummary[];
+  trip?: TripConfigSummary;
 };
+
+type TripConfigSummary = { id: string; name: string; itineraryTab?: string };
 
 type TripDay = {
   key: string;
@@ -126,6 +130,12 @@ function App() {
   const [selectedTripId, setSelectedTripId] = useState("");
   const [viewHistory, setViewHistory] = useState<ViewName[]>([]);
   const [showAddTripInfo, setShowAddTripInfo] = useState(false);
+  const [trips, setTrips] = useState<TripConfigSummary[]>([]);
+  const [tripNameDraft, setTripNameDraft] = useState("");
+  const [tripSheetIdDraft, setTripSheetIdDraft] = useState("");
+  const [tripTabDraft, setTripTabDraft] = useState("FINAL ITINERARY");
+  const [tripMessage, setTripMessage] = useState("");
+  const [tripSaving, setTripSaving] = useState(false);
 
   const setActiveView = (nextView: ViewName) => {
     if (nextView === activeView) return;
@@ -261,7 +271,7 @@ function App() {
               throw new Error(data.error || "Google verification failed.");
             }
             setVerifiedEmail(data.user.email);
-            setAuthMessage("Google identity verified. Loading your trip dashboard…");
+            setAuthMessage("Google identity verified. Loading trip selection…");
           } catch (error) {
             setAuthMessage(error instanceof Error ? error.message : "Google verification failed. Please try again.");
           } finally {
@@ -278,6 +288,37 @@ function App() {
   }, []);
 
   useEffect(() => {
+    if (!verifiedEmail) return;
+    let cancelled = false;
+    async function loadTrips() {
+      try {
+        const response = await fetch("/api/trips", { credentials: "same-origin", cache: "no-store" });
+        const result = await response.json() as ApiResponse;
+        if (!response.ok || !result.success) throw new Error(result.error || "Could not load trips.");
+        if (!cancelled) setTrips(Array.isArray(result.trips) ? result.trips : []);
+      } catch (error) {
+        if (!cancelled) setTripMessage(error instanceof Error ? error.message : "Could not load trips.");
+      }
+    }
+    void loadTrips();
+    return () => { cancelled = true; };
+  }, [verifiedEmail]);
+
+  const addTrip = async (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    setTripSaving(true); setTripMessage("");
+    try {
+      const response = await fetch("/api/trips", { method: "POST", credentials: "same-origin", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ name: tripNameDraft.trim(), sheetId: tripSheetIdDraft.trim(), itineraryTab: tripTabDraft.trim() || "FINAL ITINERARY" }) });
+      const result = await response.json() as ApiResponse;
+      if (!response.ok || !result.success || !result.trip) throw new Error(result.error || "Could not add this trip.");
+      setTrips((current) => [...current, result.trip as TripConfigSummary]);
+      setTripNameDraft(""); setTripSheetIdDraft(""); setTripTabDraft("FINAL ITINERARY"); setShowAddTripInfo(false);
+      setTripMessage("Trip connected successfully.");
+    } catch (error) { setTripMessage(error instanceof Error ? error.message : "Could not add this trip."); }
+    finally { setTripSaving(false); }
+  };
+
+  useEffect(() => {
     if (!verifiedEmail || !selectedTripId) return;
     let cancelled = false;
     async function loadItinerary() {
@@ -285,7 +326,7 @@ function App() {
       setItineraryError("");
       setNeedsSheetsConnection(false);
       try {
-        const response = await fetch("/api/itinerary", {
+        const response = await fetch(`/api/itinerary?tripId=${encodeURIComponent(selectedTripId)}`, {
           method: "GET",
           credentials: "same-origin",
           cache: "no-store",
@@ -323,7 +364,7 @@ function App() {
     let cancelled = false;
     async function loadMemories() {
       try {
-        const response = await fetch("/api/memories", {
+        const response = await fetch(`/api/memories?tripId=${encodeURIComponent(selectedTripId)}`, {
           method: "GET", credentials: "same-origin", cache: "no-store",
         });
         const result = (await response.json()) as ApiResponse;
@@ -343,8 +384,8 @@ function App() {
     async function loadExpensesAndChecklist() {
       try {
         const [expenseResponse, checklistResponse] = await Promise.all([
-          fetch("/api/expenses", { credentials: "same-origin", cache: "no-store" }),
-          fetch("/api/checklist", { credentials: "same-origin", cache: "no-store" }),
+          fetch(`/api/expenses?tripId=${encodeURIComponent(selectedTripId)}`, { credentials: "same-origin", cache: "no-store" }),
+          fetch(`/api/checklist?tripId=${encodeURIComponent(selectedTripId)}`, { credentials: "same-origin", cache: "no-store" }),
         ]);
         const expenseResult = await expenseResponse.json() as ApiResponse;
         const checklistResult = await checklistResponse.json() as ApiResponse;
@@ -389,14 +430,14 @@ function App() {
       notes: expenseNotes.trim(),
     };
     try {
-      const response = await fetch("/api/expenses", {
+      const response = await fetch(`/api/expenses?tripId=${encodeURIComponent(selectedTripId)}`, {
         method: "POST", credentials: "same-origin",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(record),
+        body: JSON.stringify({ ...record, tripId: selectedTripId }),
       });
       const result = await response.json() as ApiResponse;
       if (!response.ok || !result.success) throw new Error(result.error || "Could not save the expense.");
-      const refreshed = await fetch("/api/expenses", { credentials: "same-origin", cache: "no-store" });
+      const refreshed = await fetch(`/api/expenses?tripId=${encodeURIComponent(selectedTripId)}`, { credentials: "same-origin", cache: "no-store" });
       const refreshedResult = await refreshed.json() as ApiResponse;
       if (refreshed.ok && refreshedResult.success) setExpenses(Array.isArray(refreshedResult.expenses) ? refreshedResult.expenses : [...expenses, record]);
       setExpenseDescription(""); setExpenseAmount(""); setExpenseNotes("");
@@ -414,10 +455,10 @@ function App() {
     setChecklistMessage("");
     setChecklistItems((current) => current.map((entry) => entry.item_id === item.item_id ? updated : entry));
     try {
-      const response = await fetch("/api/checklist", {
+      const response = await fetch(`/api/checklist?tripId=${encodeURIComponent(selectedTripId)}`, {
         method: "POST", credentials: "same-origin",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ item_id: item.item_id, status }),
+        body: JSON.stringify({ item_id: item.item_id, status, tripId: selectedTripId }),
       });
       const result = await response.json() as ApiResponse;
       if (!response.ok || !result.success) throw new Error(result.error || "Could not sync checklist status.");
@@ -436,10 +477,11 @@ function App() {
     setIsSavingMemory(true);
     setMemoryMessage("");
     try {
-      const response = await fetch("/api/memories", {
+      const response = await fetch(`/api/memories?tripId=${encodeURIComponent(selectedTripId)}`, {
         method: "POST", credentials: "same-origin",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
+          tripId: selectedTripId,
           memory_id: typeof crypto !== "undefined" && "randomUUID" in crypto ? crypto.randomUUID() : `${Date.now()}-${Math.random().toString(36).slice(2)}`,
           trip_date: memoryDate,
           attraction: memoryAttraction.trim(),
@@ -448,7 +490,7 @@ function App() {
       });
       const result = (await response.json()) as ApiResponse;
       if (!response.ok || !result.success) throw new Error(result.error || "Could not save this memory.");
-      const refreshed = await fetch("/api/memories", { credentials: "same-origin", cache: "no-store" });
+      const refreshed = await fetch(`/api/memories?tripId=${encodeURIComponent(selectedTripId)}`, { credentials: "same-origin", cache: "no-store" });
       const refreshedResult = (await refreshed.json()) as ApiResponse;
       if (refreshed.ok && refreshedResult.success) setMemories(Array.isArray(refreshedResult.memories) ? refreshedResult.memories : []);
       setMemoryAttraction("");
@@ -647,10 +689,10 @@ function App() {
     setLocationSaving(key);
     setLocationMessage("");
     try {
-      const response = await fetch("/api/session-location", {
+      const response = await fetch(`/api/session-location?tripId=${encodeURIComponent(selectedTripId)}`, {
         method: "POST", credentials: "same-origin",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ date: selectedDay.date, Date: selectedDay.date, session, Session: session, oldLocation, newLocation, "Planned location": newLocation }),
+        body: JSON.stringify({ tripId: selectedTripId, date: selectedDay.date, Date: selectedDay.date, session, Session: session, oldLocation, newLocation, "Planned location": newLocation }),
       });
       const result = (await response.json()) as ApiResponse;
       if (!response.ok || !result.success) throw new Error(result.error || "Could not save the planned location.");
@@ -680,6 +722,7 @@ function App() {
     setActiveDayIndex(Math.max(0, Math.min(dayIndex, Math.max(0, tripDays.length - 1))));
     setActiveView("itinerary");
   };
+  const selectedTrip = trips.find((trip) => trip.id === selectedTripId);
 
   return (
     <div className="min-h-screen bg-[#f4f6f4] pb-24 text-slate-900">
@@ -688,8 +731,8 @@ function App() {
         <div className="mx-auto flex max-w-6xl flex-col gap-3 px-4 py-4 sm:flex-row sm:items-center sm:justify-between sm:px-6">
           <button type="button" onClick={() => setActiveView("home")} className="text-left">
             <p className="text-xs font-bold uppercase tracking-[0.18em] text-emerald-800">Shared travel companion</p>
-            <h1 className="mt-1 text-2xl font-bold tracking-tight sm:text-3xl">New Zealand Road Trip</h1>
-            <p className="mt-1 text-sm text-slate-500">South Island · {dateRange}</p>
+            <h1 className="mt-1 text-2xl font-bold tracking-tight sm:text-3xl">{selectedTrip?.name || "Travel Companion"}</h1>
+            <p className="mt-1 text-sm text-slate-500">{dateRange}</p>
           </button>
           <div className="flex flex-wrap items-center gap-2">
             {verifiedEmail && <span className="text-sm font-semibold text-slate-700">Welcome, {welcomeName}</span>}
@@ -725,17 +768,20 @@ function App() {
               <h2 className="mt-3 text-3xl font-bold">Welcome, {welcomeName} 👋</h2>
               <p className="mt-2 text-sm text-emerald-50">Choose a trip to open its dashboard. Trip details are not loaded until you select one.</p>
             </div>
-            <article className="rounded-2xl border border-slate-200 bg-white p-5 shadow-sm sm:p-6">
-              <div className="flex flex-col gap-4 sm:flex-row sm:items-center">
-                <div className="flex h-16 w-16 shrink-0 items-center justify-center rounded-2xl bg-emerald-50 text-4xl" aria-hidden="true">🚐</div>
-                <div className="min-w-0 flex-1">
-                  <p className="text-xs font-bold uppercase tracking-wide text-emerald-800">Available trip</p>
-                  <h3 className="mt-1 text-xl font-bold">New Zealand — South Island</h3>
-                  <p className="mt-1 text-sm text-slate-600">Shared campervan trip · Google Sheets itinerary</p>
+            {trips.map((trip) => (
+              <article key={trip.id} className="rounded-2xl border border-slate-200 bg-white p-5 shadow-sm sm:p-6">
+                <div className="flex flex-col gap-4 sm:flex-row sm:items-center">
+                  <div className="flex h-16 w-16 shrink-0 items-center justify-center rounded-2xl bg-emerald-50 text-4xl" aria-hidden="true">🚐</div>
+                  <div className="min-w-0 flex-1">
+                    <p className="text-xs font-bold uppercase tracking-wide text-emerald-800">Available trip</p>
+                    <h3 className="mt-1 text-xl font-bold">{trip.name}</h3>
+                    <p className="mt-1 text-sm text-slate-600">Shared trip · Google Sheets itinerary</p>
+                  </div>
+                  <button type="button" onClick={() => { setSelectedTripId(trip.id); setViewHistory([]); setActiveViewState("home"); setRefreshKey((n) => n + 1); }} className="rounded-xl bg-emerald-800 px-5 py-3 text-sm font-bold text-white hover:bg-emerald-900">Open trip →</button>
                 </div>
-                <button type="button" onClick={() => { setSelectedTripId("nz-south-island"); setViewHistory([]); setActiveViewState("home"); setRefreshKey((n) => n + 1); }} className="rounded-xl bg-emerald-800 px-5 py-3 text-sm font-bold text-white hover:bg-emerald-900">Open trip →</button>
-              </div>
-            </article>
+              </article>
+            ))}
+            {trips.length === 0 && <p className="rounded-xl bg-white p-4 text-sm text-slate-600">No trips are registered yet. Add a Google Sheet to begin.</p>}
             <article className="rounded-2xl border border-dashed border-slate-300 bg-white p-5 sm:p-6">
               <div className="flex items-start gap-3">
                 <div className="flex h-12 w-12 shrink-0 items-center justify-center rounded-xl bg-slate-100 text-2xl" aria-hidden="true">＋</div>
@@ -753,8 +799,14 @@ function App() {
                     <h3 id="add-trip-title" className="text-lg font-bold">Add trip itinerary</h3>
                     <button type="button" onClick={() => setShowAddTripInfo(false)} className="rounded-lg px-2 py-1 text-slate-500 hover:bg-slate-100" aria-label="Close">✕</button>
                   </div>
-                  <p className="mt-3 text-sm leading-6 text-slate-600">The current Worker is configured for one Google Sheet. To safely connect another sheet or create an in-app itinerary, the backend needs a trip registry and per-trip data routing first. This prevents one trip's expenses, checklist and memories from mixing with another.</p>
-                  <button type="button" onClick={() => setShowAddTripInfo(false)} className="mt-5 w-full rounded-lg bg-emerald-800 px-4 py-3 text-sm font-semibold text-white">Got it</button>
+                  <p className="mt-3 text-sm leading-6 text-slate-600">Connect an existing Google Sheet that you can access. The itinerary tab must already exist. The app will keep this trip's expenses, checklist and locations separate.</p>
+                  <form onSubmit={addTrip} className="mt-4 space-y-3">
+                    <label className="block text-sm font-semibold">Trip name<input required minLength={2} maxLength={100} value={tripNameDraft} onChange={(event) => setTripNameDraft(event.target.value)} placeholder="e.g. Japan Spring Trip" className="mt-1 w-full rounded-lg border border-slate-300 px-3 py-2 font-normal" /></label>
+                    <label className="block text-sm font-semibold">Google Sheets ID<input required value={tripSheetIdDraft} onChange={(event) => setTripSheetIdDraft(event.target.value)} placeholder="Paste the ID from the Google Sheets URL" className="mt-1 w-full rounded-lg border border-slate-300 px-3 py-2 font-normal" /></label>
+                    <label className="block text-sm font-semibold">Itinerary tab name<input required value={tripTabDraft} onChange={(event) => setTripTabDraft(event.target.value)} placeholder="FINAL ITINERARY" className="mt-1 w-full rounded-lg border border-slate-300 px-3 py-2 font-normal" /></label>
+                    {tripMessage && <p className="text-sm text-slate-600" aria-live="polite">{tripMessage}</p>}
+                    <div className="flex gap-2"><button type="button" onClick={() => setShowAddTripInfo(false)} className="flex-1 rounded-lg border border-slate-300 px-4 py-3 text-sm font-semibold">Cancel</button><button type="submit" disabled={tripSaving} className="flex-1 rounded-lg bg-emerald-800 px-4 py-3 text-sm font-semibold text-white disabled:opacity-50">{tripSaving ? "Checking sheet…" : "Connect trip"}</button></div>
+                  </form>
                 </div>
               </div>
             )}
@@ -787,8 +839,8 @@ function App() {
                       <div className="flex h-14 w-14 shrink-0 items-center justify-center rounded-2xl bg-white/15 text-3xl" aria-hidden="true">🚐</div>
                       <div>
                         <h2 className="text-2xl font-bold sm:text-3xl">Welcome, {welcomeName}</h2>
-                        <p className="mt-1 text-sm font-semibold text-emerald-50">New Zealand Road Trip</p>
-                        <p className="mt-2 text-sm text-emerald-50 sm:text-base">South Island · {dateRange}</p>
+                        <p className="mt-1 text-sm font-semibold text-emerald-50">{selectedTrip?.name || "Selected trip"}</p>
+                        <p className="mt-2 text-sm text-emerald-50 sm:text-base">{dateRange}</p>
                         <p className="mt-3 max-w-xl text-sm leading-6 text-emerald-50">Your shared home for the daily plan, trip reminders, expenses and memories.</p>
                       </div>
                     </div>
@@ -1235,7 +1287,7 @@ function App() {
                 </p>
                 <h2 className="mt-2 text-2xl font-bold">Two travellers, one journey</h2>
                 <p className="mt-3 text-sm leading-6 text-slate-600">
-                  Your shared South Island trip, itinerary and travel memories belong
+                  Your shared trip, itinerary and travel memories belong
                   in one place. Sign in using your own approved Google account.
                 </p>
 
