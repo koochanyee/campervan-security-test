@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useState } from "react";
+import type { FormEvent } from "react";
 
 type ItineraryRow = Record<string, string>;
 type ViewName =
@@ -21,6 +22,10 @@ type ApiResponse = {
   supplementaryTabs?: Record<string, string[][]>;
   supplementaryError?: string;
   memories?: TripMemory[];
+  expenses?: TripExpense[];
+  checklistItems?: ChecklistItem[];
+  items?: ChecklistItem[];
+  item?: ChecklistItem;
 };
 
 type TripDay = {
@@ -45,6 +50,26 @@ type TripMemory = {
   created_at?: string;
   updated_at?: string;
   photo_ids?: string;
+};
+
+type TripExpense = {
+  expense_id: string;
+  date: string;
+  description: string;
+  category: string;
+  amount: number;
+  currency: string;
+  paid_by: string;
+  expense_type: "pre-trip" | "actual-trip";
+  notes?: string;
+};
+
+type ChecklistItem = {
+  item_id: string;
+  category: string;
+  item: string;
+  ralph_status?: string;
+  june_status?: string;
 };
 
 declare global {
@@ -97,8 +122,71 @@ function App() {
   const [needsSheetsConnection, setNeedsSheetsConnection] = useState(false);
   const [refreshKey, setRefreshKey] = useState(0);
   const [activeDayIndex, setActiveDayIndex] = useState(0);
-  const [activeView, setActiveView] = useState<ViewName>("home");
-  const [preTripChecklist, setPreTripChecklist] = useState<Record<string, boolean>>({});
+  const [activeView, setActiveViewState] = useState<ViewName>("home");
+  const [selectedTripId, setSelectedTripId] = useState("");
+  const [viewHistory, setViewHistory] = useState<ViewName[]>([]);
+  const [showAddTripInfo, setShowAddTripInfo] = useState(false);
+
+  const setActiveView = (nextView: ViewName) => {
+    if (nextView === activeView) return;
+    setViewHistory((history) => [...history, activeView]);
+    setActiveViewState(nextView);
+    if (typeof window !== "undefined") {
+      window.history.pushState({ campervanView: nextView }, "");
+    }
+  };
+
+  const goBack = () => {
+    if (viewHistory.length === 0) {
+      goToDashboard();
+      return;
+    }
+    setActiveViewState(viewHistory[viewHistory.length - 1]);
+    setViewHistory(viewHistory.slice(0, -1));
+  };
+
+  const goToDashboard = () => {
+    setViewHistory([]);
+    setActiveViewState("home");
+  };
+
+  useEffect(() => {
+    const handlePopState = () => {
+      if (viewHistory.length === 0) {
+        setActiveViewState("home");
+        return;
+      }
+      setActiveViewState(viewHistory[viewHistory.length - 1]);
+      setViewHistory(viewHistory.slice(0, -1));
+    };
+    window.addEventListener("popstate", handlePopState);
+    return () => window.removeEventListener("popstate", handlePopState);
+  }, [viewHistory]);
+
+  const returnToTripSelection = () => {
+    setSelectedTripId("");
+    setViewHistory([]);
+    setActiveViewState("home");
+    setItineraryRows([]);
+    setSupplementaryTabs({});
+    setActiveDayIndex(0);
+  };
+  const [checklistItems, setChecklistItems] = useState<ChecklistItem[]>([]);
+  const [checklistCategoryIndex, setChecklistCategoryIndex] = useState(0);
+  const [checklistMessage, setChecklistMessage] = useState("");
+  const [checklistSavingId, setChecklistSavingId] = useState("");
+  const [checklistTouchStart, setChecklistTouchStart] = useState<{ x: number; y: number } | null>(null);
+  const [expenses, setExpenses] = useState<TripExpense[]>([]);
+  const [expenseMessage, setExpenseMessage] = useState("");
+  const [expenseSaving, setExpenseSaving] = useState(false);
+  const [expenseType, setExpenseType] = useState<"pre-trip" | "actual-trip">("pre-trip");
+  const [expenseDate, setExpenseDate] = useState(() => new Date().toISOString().slice(0, 10));
+  const [expenseDescription, setExpenseDescription] = useState("");
+  const [expenseCategory, setExpenseCategory] = useState("Other");
+  const [expenseAmount, setExpenseAmount] = useState("");
+  const [expenseCurrency, setExpenseCurrency] = useState("NZD");
+  const [expensePaidBy, setExpensePaidBy] = useState("Ralph");
+  const [expenseNotes, setExpenseNotes] = useState("");
   const [memories, setMemories] = useState<TripMemory[]>([]);
   const [memoryAttraction, setMemoryAttraction] = useState("");
   const [memoryContent, setMemoryContent] = useState("");
@@ -190,7 +278,7 @@ function App() {
   }, []);
 
   useEffect(() => {
-    if (!verifiedEmail) return;
+    if (!verifiedEmail || !selectedTripId) return;
     let cancelled = false;
     async function loadItinerary() {
       setIsLoadingItinerary(true);
@@ -228,10 +316,10 @@ function App() {
     }
     void loadItinerary();
     return () => { cancelled = true; };
-  }, [verifiedEmail, refreshKey]);
+  }, [verifiedEmail, selectedTripId, refreshKey]);
 
   useEffect(() => {
-    if (!verifiedEmail) return;
+    if (!verifiedEmail || !selectedTripId) return;
     let cancelled = false;
     async function loadMemories() {
       try {
@@ -247,7 +335,98 @@ function App() {
     }
     void loadMemories();
     return () => { cancelled = true; };
-  }, [verifiedEmail]);
+  }, [verifiedEmail, selectedTripId]);
+
+  useEffect(() => {
+    if (!verifiedEmail || !selectedTripId) return;
+    let cancelled = false;
+    async function loadExpensesAndChecklist() {
+      try {
+        const [expenseResponse, checklistResponse] = await Promise.all([
+          fetch("/api/expenses", { credentials: "same-origin", cache: "no-store" }),
+          fetch("/api/checklist", { credentials: "same-origin", cache: "no-store" }),
+        ]);
+        const expenseResult = await expenseResponse.json() as ApiResponse;
+        const checklistResult = await checklistResponse.json() as ApiResponse;
+        if (!expenseResponse.ok || !expenseResult.success) throw new Error(expenseResult.error || "Could not load expenses.");
+        if (!checklistResponse.ok || !checklistResult.success) throw new Error(checklistResult.error || "Could not load the shared checklist.");
+        if (!cancelled) {
+          setExpenses(Array.isArray(expenseResult.expenses) ? expenseResult.expenses : []);
+          setChecklistItems(Array.isArray(checklistResult.checklistItems) ? checklistResult.checklistItems : Array.isArray(checklistResult.items) ? checklistResult.items : []);
+          setExpenseMessage("");
+          setChecklistMessage("");
+        }
+      } catch (error) {
+        if (!cancelled) {
+          const message = error instanceof Error ? error.message : "Could not load shared trip records.";
+          setExpenseMessage(message);
+          setChecklistMessage(message);
+        }
+      }
+    }
+    void loadExpensesAndChecklist();
+    return () => { cancelled = true; };
+  }, [verifiedEmail, selectedTripId]);
+
+  const saveExpense = async (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    const amount = Number(expenseAmount);
+    if (!expenseDate || !expenseDescription.trim() || !Number.isFinite(amount) || amount <= 0) {
+      setExpenseMessage("Enter a date, description and amount greater than zero.");
+      return;
+    }
+    setExpenseSaving(true);
+    setExpenseMessage("");
+    const record: TripExpense = {
+      expense_id: typeof crypto !== "undefined" && "randomUUID" in crypto ? crypto.randomUUID() : `${Date.now()}`,
+      date: expenseDate,
+      description: expenseDescription.trim(),
+      category: expenseCategory,
+      amount,
+      currency: expenseCurrency,
+      paid_by: expensePaidBy,
+      expense_type: expenseType,
+      notes: expenseNotes.trim(),
+    };
+    try {
+      const response = await fetch("/api/expenses", {
+        method: "POST", credentials: "same-origin",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(record),
+      });
+      const result = await response.json() as ApiResponse;
+      if (!response.ok || !result.success) throw new Error(result.error || "Could not save the expense.");
+      const refreshed = await fetch("/api/expenses", { credentials: "same-origin", cache: "no-store" });
+      const refreshedResult = await refreshed.json() as ApiResponse;
+      if (refreshed.ok && refreshedResult.success) setExpenses(Array.isArray(refreshedResult.expenses) ? refreshedResult.expenses : [...expenses, record]);
+      setExpenseDescription(""); setExpenseAmount(""); setExpenseNotes("");
+      setExpenseMessage("Expense saved to the shared trip sheet.");
+    } catch (error) {
+      setExpenseMessage(error instanceof Error ? error.message : "Could not save the expense.");
+    } finally { setExpenseSaving(false); }
+  };
+
+  const setChecklistStatus = async (item: ChecklistItem, status: "" | "✓" | "x") => {
+    const currentName = verifiedEmail.toLowerCase() === "koochanyee@gmail.com" ? "Ralph" : "June";
+    const field = currentName === "Ralph" ? "ralph_status" : "june_status";
+    const updated = { ...item, [field]: status } as ChecklistItem;
+    setChecklistSavingId(item.item_id);
+    setChecklistMessage("");
+    setChecklistItems((current) => current.map((entry) => entry.item_id === item.item_id ? updated : entry));
+    try {
+      const response = await fetch("/api/checklist", {
+        method: "POST", credentials: "same-origin",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ item_id: item.item_id, status }),
+      });
+      const result = await response.json() as ApiResponse;
+      if (!response.ok || !result.success) throw new Error(result.error || "Could not sync checklist status.");
+      setChecklistMessage("Checklist synced to Google Sheets.");
+    } catch (error) {
+      setChecklistItems((current) => current.map((entry) => entry.item_id === item.item_id ? item : entry));
+      setChecklistMessage(error instanceof Error ? error.message : "Could not sync checklist status.");
+    } finally { setChecklistSavingId(""); }
+  };
 
   const saveMemory = async () => {
     if (!memoryDate || !memoryAttraction.trim() || !memoryContent.trim()) {
@@ -313,6 +492,25 @@ function App() {
   const dateRange = tripDays.length > 0
     ? `${tripDays[0].date}–${tripDays[tripDays.length - 1].date} ${TRIP_YEAR}`
     : "Trip dates will appear here";
+
+  const welcomeName = verifiedEmail.toLowerCase() === "koochanyee@gmail.com" ? "Ralph" : verifiedEmail.toLowerCase() === "wookahwai@gmail.com" ? "June" : "there";
+  const checklistCategories = Array.from(new Set(checklistItems.map((item) => item.category.trim()).filter(Boolean)));
+  const safeChecklistCategoryIndex = checklistCategories.length ? Math.min(checklistCategoryIndex, checklistCategories.length - 1) : 0;
+  const selectedChecklistCategory = checklistCategories[safeChecklistCategoryIndex] ?? "";
+  const selectedChecklistItems = checklistItems.filter((item) => item.category === selectedChecklistCategory);
+  const currentChecklistField = verifiedEmail.toLowerCase() === "koochanyee@gmail.com" ? "ralph_status" : "june_status";
+  const checklistCompletedCount = checklistItems.filter((item) => item[currentChecklistField] === "✓").length;
+  const preTripExpenses = expenses.filter((expense) => expense.expense_type === "pre-trip");
+  const actualTripExpenses = expenses.filter((expense) => expense.expense_type === "actual-trip");
+  const formatMoney = (amount: number, currency: string) => `${currency || "NZD"} ${Number(amount || 0).toFixed(2)}`;
+  const formatExpenseTotal = (records: TripExpense[]) => {
+    const totals = records.reduce<Record<string, number>>((acc, item) => {
+      const currency = item.currency || "NZD";
+      acc[currency] = (acc[currency] ?? 0) + Number(item.amount || 0);
+      return acc;
+    }, {});
+    return Object.keys(totals).length ? Object.entries(totals).map(([currency, total]) => formatMoney(total, currency)).join(" · ") : formatMoney(0, "NZD");
+  };
 
   const getEntriesForDay = (day: TripDay | undefined): DayEntry[] => {
     if (!day || itineraryRows.length < 2) return [];
@@ -494,8 +692,17 @@ function App() {
             <p className="mt-1 text-sm text-slate-500">South Island · {dateRange}</p>
           </button>
           <div className="flex flex-wrap items-center gap-2">
-            {verifiedEmail && <span className="text-sm text-slate-600">{verifiedEmail}</span>}
-            {verifiedEmail && <button type="button" onClick={() => window.location.assign("/api/sheets/connect")} className="rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm font-semibold hover:bg-slate-50">{needsSheetsConnection ? "Connect Sheets" : "Reconnect Sheets"}</button>}
+            {verifiedEmail && <span className="text-sm font-semibold text-slate-700">Welcome, {welcomeName}</span>}
+            {verifiedEmail && selectedTripId && activeView !== "home" && (
+              <button type="button" onClick={goBack} className="rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm font-semibold hover:bg-slate-50">← Back</button>
+            )}
+            {verifiedEmail && selectedTripId && activeView !== "home" && (
+              <button type="button" onClick={goToDashboard} className="rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm font-semibold hover:bg-slate-50">Dashboard</button>
+            )}
+            {verifiedEmail && selectedTripId && activeView === "home" && (
+              <button type="button" onClick={returnToTripSelection} className="rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm font-semibold hover:bg-slate-50">Trip selection</button>
+            )}
+            {verifiedEmail && selectedTripId && <button type="button" onClick={() => needsSheetsConnection ? window.location.assign("/api/sheets/connect") : setRefreshKey((n) => n + 1)} disabled={isLoadingItinerary} className="rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm font-semibold hover:bg-slate-50 disabled:opacity-50">{needsSheetsConnection ? "Reconnect Google Sheets" : "Refresh itinerary"}</button>}
           </div>
         </div>
       </header>
@@ -511,9 +718,52 @@ function App() {
           </section>
         )}
 
-        {verifiedEmail && (
+        {verifiedEmail && !selectedTripId && (
+          <section className="mx-auto max-w-3xl space-y-5">
+            <div className="rounded-3xl bg-gradient-to-br from-emerald-950 via-emerald-800 to-teal-700 p-6 text-white shadow-sm sm:p-8">
+              <p className="text-xs font-bold uppercase tracking-[0.16em] text-emerald-100">Shared travel companion</p>
+              <h2 className="mt-3 text-3xl font-bold">Welcome, {welcomeName} 👋</h2>
+              <p className="mt-2 text-sm text-emerald-50">Choose a trip to open its dashboard. Trip details are not loaded until you select one.</p>
+            </div>
+            <article className="rounded-2xl border border-slate-200 bg-white p-5 shadow-sm sm:p-6">
+              <div className="flex flex-col gap-4 sm:flex-row sm:items-center">
+                <div className="flex h-16 w-16 shrink-0 items-center justify-center rounded-2xl bg-emerald-50 text-4xl" aria-hidden="true">🚐</div>
+                <div className="min-w-0 flex-1">
+                  <p className="text-xs font-bold uppercase tracking-wide text-emerald-800">Available trip</p>
+                  <h3 className="mt-1 text-xl font-bold">New Zealand — South Island</h3>
+                  <p className="mt-1 text-sm text-slate-600">Shared campervan trip · Google Sheets itinerary</p>
+                </div>
+                <button type="button" onClick={() => { setSelectedTripId("nz-south-island"); setViewHistory([]); setActiveViewState("home"); setRefreshKey((n) => n + 1); }} className="rounded-xl bg-emerald-800 px-5 py-3 text-sm font-bold text-white hover:bg-emerald-900">Open trip →</button>
+              </div>
+            </article>
+            <article className="rounded-2xl border border-dashed border-slate-300 bg-white p-5 sm:p-6">
+              <div className="flex items-start gap-3">
+                <div className="flex h-12 w-12 shrink-0 items-center justify-center rounded-xl bg-slate-100 text-2xl" aria-hidden="true">＋</div>
+                <div className="flex-1">
+                  <h3 className="font-bold">Add trip itinerary</h3>
+                  <p className="mt-1 text-sm leading-6 text-slate-600">Connect another Google Sheet or create a new itinerary in the app.</p>
+                  <button type="button" onClick={() => setShowAddTripInfo(true)} className="mt-3 rounded-lg border border-emerald-800 px-4 py-2 text-sm font-semibold text-emerald-800 hover:bg-emerald-50">Add a trip</button>
+                </div>
+              </div>
+            </article>
+            {showAddTripInfo && (
+              <div className="fixed inset-0 z-50 flex items-end justify-center bg-slate-950/50 p-3 sm:items-center" role="dialog" aria-modal="true" aria-labelledby="add-trip-title">
+                <div className="w-full max-w-lg rounded-2xl bg-white p-5 shadow-xl sm:p-6">
+                  <div className="flex items-start justify-between gap-3">
+                    <h3 id="add-trip-title" className="text-lg font-bold">Add trip itinerary</h3>
+                    <button type="button" onClick={() => setShowAddTripInfo(false)} className="rounded-lg px-2 py-1 text-slate-500 hover:bg-slate-100" aria-label="Close">✕</button>
+                  </div>
+                  <p className="mt-3 text-sm leading-6 text-slate-600">The current Worker is configured for one Google Sheet. To safely connect another sheet or create an in-app itinerary, the backend needs a trip registry and per-trip data routing first. This prevents one trip's expenses, checklist and memories from mixing with another.</p>
+                  <button type="button" onClick={() => setShowAddTripInfo(false)} className="mt-5 w-full rounded-lg bg-emerald-800 px-4 py-3 text-sm font-semibold text-white">Got it</button>
+                </div>
+              </div>
+            )}
+          </section>
+        )}
+
+        {verifiedEmail && selectedTripId && (
           <>
-            {itineraryError && (
+            {selectedTripId && itineraryError && (
               <div className="rounded-xl border border-amber-200 bg-amber-50 p-4" role="alert">
                 <p className="font-semibold text-amber-900">Itinerary could not be loaded</p>
                 <p className="mt-1 text-sm text-amber-800">{itineraryError}</p>
@@ -524,7 +774,7 @@ function App() {
               </div>
             )}
 
-            {isLoadingItinerary && <div className="rounded-xl border border-slate-200 bg-white p-5 text-sm text-slate-600" role="status">Loading your trip details…</div>}
+            {selectedTripId && isLoadingItinerary && <div className="rounded-xl border border-slate-200 bg-white p-5 text-sm text-slate-600" role="status">Loading your trip details…</div>}
 
             {!isLoadingItinerary && !itineraryError && activeView === "home" && (
               <div className="space-y-6">
@@ -536,7 +786,8 @@ function App() {
                     <div className="mt-5 flex items-start gap-4">
                       <div className="flex h-14 w-14 shrink-0 items-center justify-center rounded-2xl bg-white/15 text-3xl" aria-hidden="true">🚐</div>
                       <div>
-                        <h2 className="text-2xl font-bold sm:text-3xl">New Zealand Road Trip</h2>
+                        <h2 className="text-2xl font-bold sm:text-3xl">Welcome, {welcomeName}</h2>
+                        <p className="mt-1 text-sm font-semibold text-emerald-50">New Zealand Road Trip</p>
                         <p className="mt-2 text-sm text-emerald-50 sm:text-base">South Island · {dateRange}</p>
                         <p className="mt-3 max-w-xl text-sm leading-6 text-emerald-50">Your shared home for the daily plan, trip reminders, expenses and memories.</p>
                       </div>
@@ -641,12 +892,13 @@ function App() {
                       <h2 className="text-lg font-bold">Your trip</h2>
                       <p className="mt-1 text-sm text-slate-500">Jump to a part of your travel companion.</p>
                     </div>
-                    <button type="button" onClick={() => setRefreshKey((n) => n + 1)} disabled={isLoadingItinerary} className="text-sm font-semibold text-emerald-800 hover:underline disabled:opacity-50">Refresh data</button>
+                    <button type="button" onClick={() => setRefreshKey((n) => n + 1)} disabled={isLoadingItinerary} className="text-sm font-semibold text-emerald-800 hover:underline disabled:opacity-50">Refresh itinerary</button>
                   </div>
-                  <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
+                  <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3">
                     {[
                       { view: "itinerary" as ViewName, icon: "🗓️", title: "Itinerary", description: "Daily plans and destinations", available: true },
-                      { view: "expenses" as ViewName, icon: "💳", title: "Expenses", description: "Shared trip spending", available: false },
+                      { view: "checklist" as ViewName, icon: "🎒", title: "Things to do & bring", description: "Shared pre-trip checklist", available: true },
+                      { view: "expenses" as ViewName, icon: "💳", title: "Expenses", description: "Pre-trip and actual spending", available: true },
                       { view: "memories" as ViewName, icon: "📸", title: "Memories", description: "Shared travel memories", available: true },
                       { view: "map" as ViewName, icon: "🗺️", title: "Map", description: "Routes and saved places", available: false },
                     ].map((item) => (
@@ -667,7 +919,7 @@ function App() {
                 <div className="flex flex-wrap items-center justify-between gap-3">
                   <div>
                     <p className="text-xs font-bold uppercase tracking-[0.16em] text-emerald-800">Daily itinerary</p>
-                    <h2 className="mt-1 text-2xl font-bold">Choose your day</h2>
+                    <h2 className="mt-1 text-xs font-medium text-slate-500">Swipe or tap a day</h2>
                     <p className="mt-1 text-sm text-slate-500">{tripDays.length} travel days · details read live from Google Sheets</p>
                   </div>
                   <button type="button" onClick={() => setActiveView("home")} className="rounded-lg border border-slate-300 px-3 py-2 text-sm font-semibold hover:bg-slate-50">← Dashboard</button>
@@ -911,67 +1163,56 @@ function App() {
             )}
 
             {!isLoadingItinerary && !itineraryError && activeView === "checklist" && (
-              <section className="rounded-2xl border border-slate-200 bg-white p-5 shadow-sm sm:p-7">
-                <button
-                  type="button"
-                  onClick={() => setActiveView("home")}
-                  className="text-sm font-semibold text-emerald-800 hover:underline"
-                >
-                  ← Back to dashboard
-                </button>
-
-                <p className="mt-6 text-xs font-bold uppercase tracking-[0.16em] text-emerald-800">
-                  Before departure
-                </p>
-                <h2 className="mt-2 text-2xl font-bold">Travel checklist</h2>
-                <p className="mt-2 text-sm text-slate-600">
-                  Check the essentials before starting your South Island journey.
-                </p>
-
-                <div className="mt-5 space-y-3">
-                  {[
-                    { id: "passport", label: "Passport and travel documents" },
-                    { id: "wallet", label: "Wallet, bank cards and cash" },
-                    { id: "visa", label: "Visa / NZeTA requirements checked" },
-                    { id: "booking", label: "Flight, campervan and accommodation bookings" },
-                    { id: "driving", label: "Driving licence and required permits" },
-                    { id: "insurance", label: "Travel and vehicle insurance" },
-                    { id: "phone", label: "Phone, chargers and power bank" },
-                    { id: "medicine", label: "Personal medication and essentials" },
-                  ].map((item) => (
-                    <label
-                      key={item.id}
-                      className="flex cursor-pointer items-start gap-3 rounded-xl border border-slate-200 p-4 hover:bg-slate-50"
-                    >
-                      <input
-                        type="checkbox"
-                        checked={Boolean(preTripChecklist[item.id])}
-                        onChange={(event) =>
-                          setPreTripChecklist((previous) => ({
-                            ...previous,
-                            [item.id]: event.target.checked,
-                          }))
-                        }
-                        className="mt-1 h-4 w-4 accent-emerald-700"
-                      />
-                      <span className="text-sm font-medium text-slate-800">
-                        {item.label}
-                      </span>
-                    </label>
-                  ))}
-                </div>
-
-                <p className="mt-4 text-sm text-slate-500">
-                  Completed: {Object.values(preTripChecklist).filter(Boolean).length} of 8 items
-                </p>
-
-                <button
-                  type="button"
-                  onClick={() => setActiveView("companion")}
-                  className="mt-6 w-full rounded-xl bg-emerald-800 px-5 py-3 font-bold text-white hover:bg-emerald-900"
-                >
-                  See Companion →
-                </button>
+              <section
+                onTouchStart={(event) => setChecklistTouchStart({ x: event.touches[0].clientX, y: event.touches[0].clientY })}
+                onTouchEnd={(event) => {
+                  if (!checklistTouchStart || checklistCategories.length < 2) return;
+                  const dx = event.changedTouches[0].clientX - checklistTouchStart.x;
+                  const dy = event.changedTouches[0].clientY - checklistTouchStart.y;
+                  if (Math.abs(dx) > 45 && Math.abs(dx) > Math.abs(dy) * 1.2) {
+                    setChecklistCategoryIndex((index) => (index + (dx < 0 ? 1 : -1) + checklistCategories.length) % checklistCategories.length);
+                  }
+                  setChecklistTouchStart(null);
+                }}
+                className="rounded-2xl border border-slate-200 bg-white p-5 shadow-sm sm:p-7"
+              >
+                <button type="button" onClick={goToDashboard} className="text-sm font-semibold text-emerald-800 hover:underline">← Back to dashboard</button>
+                <p className="mt-6 text-xs font-bold uppercase tracking-[0.16em] text-emerald-800">Before departure</p>
+                <h2 className="mt-2 text-2xl font-bold">Things to do & bring</h2>
+                <p className="mt-2 text-sm text-slate-600">Your own status is saved separately from {welcomeName === "Ralph" ? "June" : "Ralph"}. Choose Done, To do or Ignored for each item.</p>
+                <div className="mt-4 rounded-xl bg-emerald-50 p-3 text-sm text-emerald-900">Completed: {checklistCompletedCount} of {checklistItems.length} items</div>
+                {checklistCategories.length > 0 ? (
+                  <>
+                    <div className="-mx-1 mt-4 flex gap-2 overflow-x-auto px-1 pb-2" aria-label="Checklist categories">
+                      {checklistCategories.map((category, index) => (
+                        <button key={category} type="button" aria-pressed={index === safeChecklistCategoryIndex} onClick={() => setChecklistCategoryIndex(index)} className={`shrink-0 rounded-full border px-4 py-2 text-sm font-semibold transition ${index === safeChecklistCategoryIndex ? "border-emerald-800 bg-emerald-800 text-white" : "border-slate-200 bg-white text-slate-600 hover:border-emerald-300"}`}>{category}</button>
+                      ))}
+                    </div>
+                    <div key={selectedChecklistCategory} className="mt-3 space-y-3" style={{ animation: "itinerarySlideIn 220ms ease-out" }}>
+                      {selectedChecklistItems.map((item) => {
+                        const status = String(item[currentChecklistField] ?? "");
+                        return (
+                          <article key={item.item_id} className={`rounded-xl border p-4 transition ${status === "x" ? "border-slate-200 bg-slate-50 opacity-75" : status === "✓" ? "border-emerald-200 bg-emerald-50/40" : "border-slate-200 bg-white"}`}>
+                            <p className={`font-medium ${status === "x" ? "text-slate-500 line-through" : "text-slate-800"}`}>{item.item}</p>
+                            <div className="mt-3 flex flex-wrap gap-2">
+                              <button type="button" disabled={checklistSavingId === item.item_id} onClick={() => void setChecklistStatus(item, status === "✓" ? "" : "✓")} className={`rounded-lg border px-3 py-2 text-sm font-semibold disabled:opacity-50 ${status === "✓" ? "border-emerald-800 bg-emerald-800 text-white" : "border-slate-300 bg-white text-slate-700"}`}>{status === "✓" ? "✓ Done" : "□ Mark done"}</button>
+                              <button type="button" disabled={checklistSavingId === item.item_id} onClick={() => void setChecklistStatus(item, status === "x" ? "" : "x")} className={`rounded-lg border px-3 py-2 text-sm font-semibold disabled:opacity-50 ${status === "x" ? "border-slate-500 bg-slate-600 text-white" : "border-slate-300 bg-white text-slate-600"}`}>{status === "x" ? "x Ignored" : "Not applicable"}</button>
+                              {checklistSavingId === item.item_id && <span className="self-center text-xs text-slate-500">Syncing…</span>}
+                            </div>
+                          </article>
+                        );
+                      })}
+                    </div>
+                    <div className="mt-4 flex items-center justify-between gap-3">
+                      <button type="button" disabled={safeChecklistCategoryIndex === 0} onClick={() => setChecklistCategoryIndex((index) => Math.max(0, index - 1))} className="rounded-lg border border-slate-300 px-3 py-2 text-sm font-semibold disabled:opacity-40">← Previous</button>
+                      <span className="text-xs text-slate-500">{safeChecklistCategoryIndex + 1} / {checklistCategories.length} · Swipe to switch</span>
+                      <button type="button" disabled={safeChecklistCategoryIndex >= checklistCategories.length - 1} onClick={() => setChecklistCategoryIndex((index) => Math.min(checklistCategories.length - 1, index + 1))} className="rounded-lg border border-slate-300 px-3 py-2 text-sm font-semibold disabled:opacity-40">Next →</button>
+                    </div>
+                  </>
+                ) : (
+                  <p className="mt-4 rounded-xl border border-dashed border-slate-300 p-4 text-sm text-slate-600">No checklist items were returned from Google Sheets. Confirm the “Things to do & bring” tab and its headers are configured.</p>
+                )}
+                {checklistMessage && <p className="mt-3 text-sm text-slate-600" aria-live="polite">{checklistMessage}</p>}
               </section>
             )}
 
@@ -1024,10 +1265,34 @@ function App() {
 
             {!isLoadingItinerary && !itineraryError && ["expenses", "memories", "map"].includes(activeView) && (
               <section className="rounded-2xl border border-slate-200 bg-white p-6 shadow-sm sm:p-8">
-                <button type="button" onClick={() => setActiveView("home")} className="text-sm font-semibold text-emerald-800 hover:underline">← Back to dashboard</button>
+                <button type="button" onClick={goToDashboard} className="text-sm font-semibold text-emerald-800 hover:underline">← Back to dashboard</button>
                 <div className="mt-6 flex h-14 w-14 items-center justify-center rounded-2xl bg-emerald-50 text-3xl" aria-hidden="true">{activeView === "expenses" ? "💳" : activeView === "memories" ? "📸" : "🗺️"}</div>
                 <h2 className="mt-4 text-2xl font-bold">{activeView === "expenses" ? "Trip expenses" : activeView === "memories" ? "Travel memories" : "Trip map"}</h2>
-                {activeView !== "memories" ? <><p className="mt-2 max-w-xl text-sm leading-6 text-slate-600">{activeView === "expenses" ? "Shared expense tracking has not been connected yet. No spending total is being fabricated." : "A route map has not been connected yet. This screen does not currently save locations or calculate routes."}</p><div className="mt-5 rounded-xl bg-slate-50 p-4 text-sm text-slate-600">Your Google Sheets itinerary remains connected and unchanged.</div></> : <div className="mt-5 space-y-5">
+                {activeView === "expenses" ? <div className="mt-5 space-y-5">
+                  <div className="grid gap-3 sm:grid-cols-3">
+                    <div className="rounded-xl border border-slate-200 p-4"><p className="text-xs font-semibold uppercase text-slate-500">Pre-trip recorded</p><p className="mt-2 text-xl font-bold">{formatExpenseTotal(preTripExpenses)}</p><p className="mt-1 text-xs text-slate-500">Flights, deposits and advance bookings</p></div>
+                    <div className="rounded-xl border border-slate-200 p-4"><p className="text-xs font-semibold uppercase text-slate-500">Actual trip spending</p><p className="mt-2 text-xl font-bold">{formatExpenseTotal(actualTripExpenses)}</p><p className="mt-1 text-xs text-slate-500">Spending during the trip</p></div>
+                    <div className="rounded-xl border border-slate-200 p-4"><p className="text-xs font-semibold uppercase text-slate-500">Records</p><p className="mt-2 text-xl font-bold">{expenses.length}</p><p className="mt-1 text-xs text-slate-500">Shared expense entries</p></div>
+                  </div>
+                  <div className="flex flex-wrap gap-2" role="group" aria-label="Expense type">
+                    <button type="button" onClick={() => setExpenseType("pre-trip")} className={`rounded-full border px-4 py-2 text-sm font-semibold ${expenseType === "pre-trip" ? "border-emerald-800 bg-emerald-800 text-white" : "border-slate-300 bg-white text-slate-700"}`}>Pre-trip</button>
+                    <button type="button" onClick={() => setExpenseType("actual-trip")} className={`rounded-full border px-4 py-2 text-sm font-semibold ${expenseType === "actual-trip" ? "border-emerald-800 bg-emerald-800 text-white" : "border-slate-300 bg-white text-slate-700"}`}>Actual trip</button>
+                  </div>
+                  <form onSubmit={(event) => void saveExpense(event)} className="rounded-xl border border-slate-200 p-4">
+                    <h3 className="font-semibold">Add {expenseType === "pre-trip" ? "pre-trip expense" : "actual trip expense"}</h3>
+                    <div className="mt-4 grid gap-3 sm:grid-cols-2">
+                      <label className="text-sm font-medium">Date<input type="date" required value={expenseDate} onChange={(event) => setExpenseDate(event.target.value)} className="mt-1 block w-full rounded-lg border border-slate-300 px-3 py-2 font-normal" /></label>
+                      <label className="text-sm font-medium">Paid by<select value={expensePaidBy} onChange={(event) => setExpensePaidBy(event.target.value)} className="mt-1 block w-full rounded-lg border border-slate-300 px-3 py-2 font-normal"><option>Ralph</option><option>June</option><option>Shared</option></select></label>
+                      <label className="text-sm font-medium sm:col-span-2">Description<input required maxLength={200} value={expenseDescription} onChange={(event) => setExpenseDescription(event.target.value)} placeholder="e.g. Campervan deposit" className="mt-1 block w-full rounded-lg border border-slate-300 px-3 py-2 font-normal" /></label>
+                      <label className="text-sm font-medium">Category<select value={expenseCategory} onChange={(event) => setExpenseCategory(event.target.value)} className="mt-1 block w-full rounded-lg border border-slate-300 px-3 py-2 font-normal">{["Flights", "Campervan", "Accommodation", "Insurance", "Bookings & activities", "Fuel", "Groceries", "Meals", "Parking & transport", "Shopping", "Other"].map((category) => <option key={category}>{category}</option>)}</select></label>
+                      <div className="grid grid-cols-[1fr_100px] gap-2"><label className="text-sm font-medium">Amount<input type="number" min="0.01" step="0.01" required value={expenseAmount} onChange={(event) => setExpenseAmount(event.target.value)} placeholder="0.00" className="mt-1 block w-full rounded-lg border border-slate-300 px-3 py-2 font-normal" /></label><label className="text-sm font-medium">Currency<select value={expenseCurrency} onChange={(event) => setExpenseCurrency(event.target.value)} className="mt-1 block w-full rounded-lg border border-slate-300 px-2 py-2 font-normal"><option>NZD</option><option>MYR</option><option>AUD</option><option>USD</option></select></label></div>
+                      <label className="text-sm font-medium sm:col-span-2">Notes (optional)<textarea rows={2} maxLength={1000} value={expenseNotes} onChange={(event) => setExpenseNotes(event.target.value)} className="mt-1 block w-full rounded-lg border border-slate-300 px-3 py-2 font-normal" /></label>
+                    </div>
+                    <button type="submit" disabled={expenseSaving} className="mt-4 rounded-lg bg-emerald-800 px-4 py-2.5 text-sm font-semibold text-white disabled:opacity-50">{expenseSaving ? "Saving…" : "Save expense"}</button>
+                    {expenseMessage && <p className="mt-3 text-sm text-slate-600" aria-live="polite">{expenseMessage}</p>}
+                  </form>
+                  <section><h3 className="font-semibold">Expense records</h3>{expenses.length ? <div className="mt-3 space-y-3">{[...expenses].sort((a,b) => (b.date || "").localeCompare(a.date || "")).map((expense) => <article key={expense.expense_id} className="rounded-xl border border-slate-200 p-4"><div className="flex flex-wrap items-start justify-between gap-3"><div className="min-w-0"><p className="font-semibold">{expense.description}</p><p className="mt-1 text-xs text-slate-500">{expense.date} · {expense.category} · Paid by {expense.paid_by}</p><span className="mt-2 inline-block rounded-full bg-slate-100 px-2 py-1 text-xs text-slate-600">{expense.expense_type === "pre-trip" ? "Pre-trip" : "Actual trip"}</span>{expense.notes && <p className="mt-2 whitespace-pre-wrap text-sm text-slate-600">{expense.notes}</p>}</div><p className="shrink-0 font-bold">{formatMoney(Number(expense.amount), expense.currency)}</p></div></article>)}</div> : <p className="mt-2 rounded-xl bg-slate-50 p-4 text-sm text-slate-600">No expenses returned from Google Sheets yet.</p>}</section>
+                </div> : activeView === "map" ? <><p className="mt-2 max-w-xl text-sm leading-6 text-slate-600">A route map has not been connected yet. This screen does not currently save locations or calculate routes.</p><div className="mt-5 rounded-xl bg-slate-50 p-4 text-sm text-slate-600">Your Google Sheets itinerary remains connected and unchanged.</div></> : <div className="mt-5 space-y-5">
                   <form onSubmit={(event) => { event.preventDefault(); setMemoryPreviewOpen(true); setMemoryMessage(""); }} className="rounded-xl border border-slate-200 p-4">
                     <h3 className="font-semibold">Add a shared memory</h3><p className="mt-1 text-sm text-slate-500">Review the preview before saving. Memories are shared with both approved travellers.</p>
                     <label className="mt-4 block text-sm font-medium">Trip date</label><select value={memoryDate} onChange={(event) => setMemoryDate(event.target.value)} required className="mt-1 w-full rounded-lg border border-slate-300 px-3 py-2 text-sm">{!tripDays.some((day) => normalizeTripDate(day.date) === normalizeTripDate(memoryDate)) && <option value={memoryDate}>Today · {memoryDate}</option>}{tripDays.map((day) => <option key={day.key} value={day.date}>{day.date}</option>)}</select>
@@ -1063,10 +1328,11 @@ function App() {
 
       {verifiedEmail && (
         <nav className="fixed inset-x-0 bottom-0 z-20 border-t border-slate-200 bg-white/95 px-2 pb-[env(safe-area-inset-bottom)] backdrop-blur">
-          <div className="mx-auto grid max-w-2xl grid-cols-5 gap-1 py-2">
+          <div className="mx-auto grid max-w-3xl grid-cols-6 gap-1 py-2">
             {[
               { view: "home" as ViewName, icon: "⌂", label: "Home" },
               { view: "itinerary" as ViewName, icon: "▤", label: "Itinerary" },
+              { view: "checklist" as ViewName, icon: "🎒", label: "Checklist" },
               { view: "expenses" as ViewName, icon: "＄", label: "Expenses" },
               { view: "memories" as ViewName, icon: "♡", label: "Memories" },
               { view: "map" as ViewName, icon: "⌖", label: "Map" },
