@@ -487,6 +487,225 @@ function App() {
       setExpenseMessage(error instanceof Error ? error.message : "Could not save the expense.");
     } finally { setExpenseSaving(false); }
   };
+} catch (error) {
+        console.error("Session restoration failed:", error);
+      }
+    }
+    void restoreSession();
+    return () => { cancelled = true; };
+  }, []);
+
+  useEffect(() => {
+    const clientId = import.meta.env.VITE_GOOGLE_CLIENT_ID as string | undefined;
+    if (!clientId) {
+      setAuthMessage("Google sign-in configuration is missing.");
+      return;
+    }
+
+    let attempts = 0;
+    let timer: ReturnType<typeof setInterval> | undefined;
+    const setupGoogleSignIn = () => {
+      if (!window.google?.accounts.id) {
+        attempts += 1;
+        if (attempts >= 20 && timer) clearInterval(timer);
+        return;
+      }
+      if (timer) clearInterval(timer);
+      const button = document.getElementById("google-sign-in-button");
+      if (!button) return;
+      button.replaceChildren();
+      window.google.accounts.id.initialize({
+        client_id: clientId,
+        callback: async (response) => {
+          setAuthMessage("Verifying Google account…");
+          setIsVerifying(true);
+          try {
+            const result = await fetch("/api/auth/google", {
+              method: "POST",
+              credentials: "same-origin",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ credential: response.credential }),
+            });
+            const data = (await result.json()) as ApiResponse;
+            if (!result.ok || !data.success || !data.user?.email) {
+              throw new Error(data.error || "Google verification failed.");
+            }
+            setVerifiedEmail(data.user.email);
+            setAuthMessage("Google identity verified. Loading trip selection…");
+          } catch (error) {
+            setAuthMessage(error instanceof Error ? error.message : "Google verification failed. Please try again.");
+          } finally {
+            setIsVerifying(false);
+          }
+        },
+      });
+      window.google.accounts.id.renderButton(button, { theme: "outline", size: "large", text: "signin_with" });
+    };
+
+    setupGoogleSignIn();
+    if (!window.google?.accounts.id) timer = setInterval(setupGoogleSignIn, 500);
+    return () => { if (timer) clearInterval(timer); };
+  }, []);
+
+  useEffect(() => {
+    if (!verifiedEmail) return;
+    let cancelled = false;
+    async function loadTrips() {
+      try {
+        const response = await fetch("/api/trips", { credentials: "same-origin", cache: "no-store" });
+        const result = await response.json() as ApiResponse;
+        if (!response.ok || !result.success) throw new Error(result.error || "Could not load trips.");
+        if (!cancelled) setTrips(Array.isArray(result.trips) ? result.trips : []);
+      } catch (error) {
+        if (!cancelled) setTripMessage(error instanceof Error ? error.message : "Could not load trips.");
+      }
+    }
+    void loadTrips();
+    return () => { cancelled = true; };
+  }, [verifiedEmail]);
+
+  const addTrip = async (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    setTripSaving(true); setTripMessage("");
+    try {
+      const response = await fetch("/api/trips", { method: "POST", credentials: "same-origin", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ name: tripNameDraft.trim(), sheetId: tripSheetIdDraft.trim(), itineraryTab: tripTabDraft.trim() || "FINAL ITINERARY" }) });
+      const result = await response.json() as ApiResponse;
+      if (!response.ok || !result.success || !result.trip) throw new Error(result.error || "Could not add this trip.");
+      setTrips((current) => [...current, result.trip as TripConfigSummary]);
+      setTripNameDraft(""); setTripSheetIdDraft(""); setTripTabDraft("FINAL ITINERARY"); setShowAddTripInfo(false);
+      setTripMessage("Trip connected successfully.");
+    } catch (error) { setTripMessage(error instanceof Error ? error.message : "Could not add this trip."); }
+    finally { setTripSaving(false); }
+  };
+
+  useEffect(() => {
+    if (!verifiedEmail || !selectedTripId) return;
+    let cancelled = false;
+    async function loadItinerary() {
+      setIsLoadingItinerary(true);
+      setItineraryError("");
+      setNeedsSheetsConnection(false);
+      try {
+        const response = await fetch(`/api/itinerary?tripId=${encodeURIComponent(selectedTripId)}`, {
+          method: "GET",
+          credentials: "same-origin",
+          cache: "no-store",
+        });
+        const result = (await response.json()) as ApiResponse;
+        if (!response.ok || !result.success) {
+          if (!cancelled) {
+            setItineraryRows([]);
+            setNeedsSheetsConnection(response.status === 403 || Boolean(result.connectUrl));
+            setItineraryError(result.error || `Could not load itinerary (HTTP ${response.status}).`);
+          }
+          return;
+        }
+        if (!cancelled) {
+          const rows = Array.isArray(result.data) ? result.data : [];
+          setItineraryRows(rows);
+          setSupplementaryTabs(result.supplementaryTabs ?? {});
+          setActiveDayIndex(0);
+          setItineraryError("");
+          setNeedsSheetsConnection(false);
+          setAuthMessage("Signed in. Itinerary loaded from Google Sheets.");
+        }
+      } catch (error) {
+        if (!cancelled) setItineraryError(error instanceof Error ? error.message : "Could not load itinerary.");
+      } finally {
+        if (!cancelled) setIsLoadingItinerary(false);
+      }
+    }
+    void loadItinerary();
+    return () => { cancelled = true; };
+  }, [verifiedEmail, selectedTripId, refreshKey]);
+
+  useEffect(() => {
+    if (!verifiedEmail || !selectedTripId) return;
+    let cancelled = false;
+    async function loadMemories() {
+      try {
+        const response = await fetch(`/api/memories?tripId=${encodeURIComponent(selectedTripId)}`, {
+          method: "GET", credentials: "same-origin", cache: "no-store",
+        });
+        const result = (await response.json()) as ApiResponse;
+        if (!response.ok || !result.success) throw new Error(result.error || "Could not load travel memories.");
+        if (!cancelled) setMemories(Array.isArray(result.memories) ? result.memories : []);
+      } catch (error) {
+        if (!cancelled) setMemoryMessage(error instanceof Error ? error.message : "Could not load travel memories.");
+      }
+    }
+    void loadMemories();
+    return () => { cancelled = true; };
+  }, [verifiedEmail, selectedTripId]);
+
+  useEffect(() => {
+    if (!verifiedEmail || !selectedTripId) return;
+    let cancelled = false;
+    async function loadExpensesAndChecklist() {
+      try {
+        const [expenseResponse, checklistResponse] = await Promise.all([
+          fetch(`/api/expenses?tripId=${encodeURIComponent(selectedTripId)}`, { credentials: "same-origin", cache: "no-store" }),
+          fetch(`/api/checklist?tripId=${encodeURIComponent(selectedTripId)}`, { credentials: "same-origin", cache: "no-store" }),
+        ]);
+        const expenseResult = await expenseResponse.json() as ApiResponse;
+        const checklistResult = await checklistResponse.json() as ApiResponse;
+        if (!expenseResponse.ok || !expenseResult.success) throw new Error(expenseResult.error || "Could not load expenses.");
+        if (!checklistResponse.ok || !checklistResult.success) throw new Error(checklistResult.error || "Could not load the shared checklist.");
+        if (!cancelled) {
+          setExpenses(Array.isArray(expenseResult.expenses) ? expenseResult.expenses : []);
+          setChecklistItems(Array.isArray(checklistResult.checklistItems) ? checklistResult.checklistItems : Array.isArray(checklistResult.items) ? checklistResult.items : []);
+          setExpenseMessage("");
+          setChecklistMessage("");
+        }
+      } catch (error) {
+        if (!cancelled) {
+          const message = error instanceof Error ? error.message : "Could not load shared trip records.";
+          setExpenseMessage(message);
+          setChecklistMessage(message);
+        }
+      }
+    }
+    void loadExpensesAndChecklist();
+    return () => { cancelled = true; };
+  }, [verifiedEmail, selectedTripId]);
+
+  const saveExpense = async (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    const amount = Number(expenseAmount);
+    if (!expenseDate || !expenseDescription.trim() || !Number.isFinite(amount) || amount <= 0) {
+      setExpenseMessage("Enter a date, description and amount greater than zero.");
+      return;
+    }
+    setExpenseSaving(true);
+    setExpenseMessage("");
+    const record: TripExpense = {
+      expense_id: typeof crypto !== "undefined" && "randomUUID" in crypto ? crypto.randomUUID() : `${Date.now()}`,
+      date: expenseDate,
+      description: expenseDescription.trim(),
+      category: expenseCategory,
+      amount,
+      currency: expenseCurrency,
+      paid_by: expensePaidBy,
+      expense_type: expenseType,
+      notes: expenseNotes.trim(),
+    };
+    try {
+      const response = await fetch(`/api/expenses?tripId=${encodeURIComponent(selectedTripId)}`, {
+        method: "POST", credentials: "same-origin",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ ...record, tripId: selectedTripId }),
+      });
+      const result = await response.json() as ApiResponse;
+      if (!response.ok || !result.success) throw new Error(result.error || "Could not save the expense.");
+      const refreshed = await fetch(`/api/expenses?tripId=${encodeURIComponent(selectedTripId)}`, { credentials: "same-origin", cache: "no-store" });
+      const refreshedResult = await refreshed.json() as ApiResponse;
+      if (refreshed.ok && refreshedResult.success) setExpenses(Array.isArray(refreshedResult.expenses) ? refreshedResult.expenses : [...expenses, record]);
+      setExpenseDescription(""); setExpenseAmount(""); setExpenseNotes("");
+      setExpenseMessage("Expense saved to the shared trip sheet.");
+    } catch (error) {
+      setExpenseMessage(error instanceof Error ? error.message : "Could not save the expense.");
+    } finally { setExpenseSaving(false); }
+  };
      if (!window.google?.accounts.id) {
         attempts += 1;
         if (attempts >= 20 && timer) clearInterval(timer);
