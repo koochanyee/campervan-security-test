@@ -66,6 +66,7 @@ type TripExpense = {
   paid_by: string;
   expense_type: "pre-trip" | "actual-trip";
   notes?: string;
+  source?: string;
 };
 
 type ChecklistItem = {
@@ -74,6 +75,10 @@ type ChecklistItem = {
   item: string;
   ralph_status?: string;
   june_status?: string;
+  quantity?: string;
+  notes?: string;
+  due_date?: string;
+  checklist_type?: "packing" | "todo";
 };
 
 declare global {
@@ -93,6 +98,32 @@ declare global {
       };
     };
   }
+}
+
+function getMemoryPhotoIds(photoIds?: string): string[] {
+  if (!photoIds) return [];
+  try {
+    const parsed: unknown = JSON.parse(photoIds);
+    return Array.isArray(parsed) ? parsed.filter((id): id is string => typeof id === "string" && Boolean(id.trim())) : [];
+  } catch {
+    return photoIds.split(",").map((id) => id.trim()).filter(Boolean);
+  }
+}
+
+function googleMapsUrl(route: string): string {
+  const cleaned = route.replace(/[⭐❤️💙🔌✈️🚐🛣️]/gu, "").trim();
+  const isFlight = /\b(KUL|SIN)\b|flight|airport transfer/i.test(cleaned);
+  const normalisePlace = (place: string) => place.replace(/\bCC\b/gi, "Christchurch").replace(/\bChch\b/gi, "Christchurch").replace(/\bMt\s+Cook\b/gi, "Aoraki / Mount Cook").trim();
+  const parts = cleaned.split(/\s*(?:→|➜|⟶|->|—>|\bto\b)\s*/i).map(normalisePlace).filter(Boolean);
+  if (!isFlight && parts.length >= 2) {
+    const origin = parts[0];
+    const destination = parts[parts.length - 1];
+    const waypoints = parts.slice(1, -1);
+    const params = new URLSearchParams({ api: "1", origin, destination, travelmode: "driving" });
+    if (waypoints.length) params.set("waypoints", waypoints.join("|"));
+    return `https://www.google.com/maps/dir/?${params.toString()}`;
+  }
+  return `https://www.google.com/maps/search/?api=1&query=${encodeURIComponent(normalisePlace(cleaned || route))}`;
 }
 
 const TRIP_YEAR = 2026;
@@ -477,6 +508,18 @@ function App() {
     setIsSavingMemory(true);
     setMemoryMessage("");
     try {
+      if (memoryPhotoFiles.length > 4) throw new Error("Choose up to 4 photos per memory.");
+      const photos = await Promise.all(memoryPhotoFiles.map(async (file) => {
+        if (!file.type.startsWith("image/")) throw new Error(`${file.name} is not an image.`);
+        if (file.size > 4 * 1024 * 1024) throw new Error(`${file.name} is larger than 4 MB. Please choose a smaller photo.`);
+        const dataBase64 = await new Promise<string>((resolve, reject) => {
+          const reader = new FileReader();
+          reader.onload = () => resolve(String(reader.result || "").split(",")[1] || "");
+          reader.onerror = () => reject(new Error(`Could not read ${file.name}.`));
+          reader.readAsDataURL(file);
+        });
+        return { name: file.name, mime_type: file.type, data_base64: dataBase64 };
+      }));
       const response = await fetch(`/api/memories?tripId=${encodeURIComponent(selectedTripId)}`, {
         method: "POST", credentials: "same-origin",
         headers: { "Content-Type": "application/json" },
@@ -486,6 +529,7 @@ function App() {
           trip_date: memoryDate,
           attraction: memoryAttraction.trim(),
           content: memoryContent.trim(),
+          photos,
         }),
       });
       const result = (await response.json()) as ApiResponse;
@@ -495,6 +539,7 @@ function App() {
       if (refreshed.ok && refreshedResult.success) setMemories(Array.isArray(refreshedResult.memories) ? refreshedResult.memories : []);
       setMemoryAttraction("");
       setMemoryContent("");
+      setMemoryPhotoFiles([]);
       setMemoryPreviewOpen(false);
       setMemoryMessage("Memory saved and shared with your travel companion.");
     } catch (error) {
@@ -697,9 +742,9 @@ function App() {
       const result = (await response.json()) as ApiResponse;
       if (!response.ok || !result.success) throw new Error(result.error || "Could not save the planned location.");
       setSupplementaryTabs((current) => {
-        const tabName = Object.keys(current).find((name) => /^session\s+locations?$/i.test(name));
-        if (!tabName) return current;
-        const rows = current[tabName].map((row) => [...row]);
+        const existingTabName = Object.keys(current).find((name) => /^session\s+locations?$/i.test(name));
+        const tabName = existingTabName || "SESSION LOCATION";
+        const rows = (current[tabName] ?? [["Date", "Session", "Planned location"]]).map((row) => [...row]);
         if (rows.length) {
           const headers = rows[0].map((cell) => String(cell ?? "").trim().toLowerCase());
           const dateIndex = headers.findIndex((h) => h === "date" || h.includes("trip date"));
@@ -707,6 +752,7 @@ function App() {
           const locationIndex = headers.findIndex((h) => h === "planned location" || h === "location");
           const rowIndex = rows.findIndex((row, i) => i > 0 && normalizeTripDate(String(row[dateIndex] ?? "")) === normalizeTripDate(selectedDay.date) && String(row[sessionIndex] ?? "").toLowerCase() === session.toLowerCase());
           if (rowIndex > 0 && locationIndex >= 0) rows[rowIndex][locationIndex] = newLocation;
+          else if (locationIndex >= 0 && dateIndex >= 0 && sessionIndex >= 0) rows.push([selectedDay.date, session, newLocation]);
         }
         return { ...current, [tabName]: rows };
       });
@@ -952,7 +998,7 @@ function App() {
                       { view: "checklist" as ViewName, icon: "🎒", title: "Things to do & bring", description: "Shared pre-trip checklist", available: true },
                       { view: "expenses" as ViewName, icon: "💳", title: "Expenses", description: "Pre-trip and actual spending", available: true },
                       { view: "memories" as ViewName, icon: "📸", title: "Memories", description: "Shared travel memories", available: true },
-                      { view: "map" as ViewName, icon: "🗺️", title: "Map", description: "Routes and saved places", available: false },
+                      { view: "map" as ViewName, icon: "🗺️", title: "Map", description: "Routes and saved places", available: true },
                     ].map((item) => (
                       <button key={item.view} type="button" onClick={() => setActiveView(item.view)} className="rounded-2xl border border-slate-200 bg-white p-4 text-left shadow-sm transition hover:-translate-y-0.5 hover:border-emerald-300 hover:shadow">
                         <span className="text-2xl" aria-hidden="true">{item.icon}</span>
@@ -1025,15 +1071,15 @@ function App() {
                                 const entry = dayEntries.find((item) => item.label.trim().toLowerCase() === session.toLowerCase());
                                 const savedLocation = getSessionLocation(session);
                                 const lines = (entry?.value ?? "").split(/\n+/).map((line) => line.trim()).filter(Boolean);
-                                return <div key={session} className="rounded-xl border border-slate-200 p-4">
-                                  <div className="flex items-center gap-3"><h5 className="font-bold">{session}</h5><span className="text-2xl" aria-hidden="true">{session === "Morning" ? "🧇" : session === "Afternoon" ? "🧆" : "🍲"}</span></div>
+                                return <div key={session} className={`rounded-xl border p-4 ${lines.length ? "border-slate-200 bg-white" : "border-dashed border-slate-300 bg-slate-50/70"}`}>
+                                  <div className="flex items-center gap-3"><h5 className={`font-bold ${lines.length ? "text-slate-900" : "text-slate-500"}`}>{session}</h5><span className="text-2xl" aria-hidden="true">{session === "Morning" ? "🧇" : session === "Afternoon" ? "🧆" : "🍲"}</span></div>
                                   {lines.length ? <div className="mt-3 space-y-2">{lines.map((line, i) => {
                                     const match = line.match(/^(\d{1,2}(?:[:.]\d{2})?\s*(?:a\.?m\.?|p\.?m\.?)?)(?:\s*[-–:,]\s*|\s+)(.+)$/i);
                                     const mealWord = session === "Morning" ? /\b(breakfast)\b/i : session === "Afternoon" ? /\b(lunch)\b/i : /\b(dinner)\b/i;
                                     const text = match ? match[2] : line;
                                     const wordMatch = text.match(mealWord);
                                     return <div key={`${session}-${i}`} className="flex items-start gap-2 text-sm leading-6">{match && <span className="shrink-0 rounded-md bg-slate-100 px-2 py-0.5 text-xs font-semibold text-slate-700">{match[1]}</span>}<span>{wordMatch ? <>{text.slice(0, wordMatch.index)}<strong>{wordMatch[0]}</strong>{text.slice((wordMatch.index ?? 0) + wordMatch[0].length)}</> : text}</span></div>;
-                                  })}</div> : <p className="mt-2 text-sm text-slate-500">No {session.toLowerCase()} activities listed.</p>}
+                                  })}</div> : <p className="mt-2 text-xs text-slate-400">No planned activity</p>}
                                   <button type="button" onClick={() => openSessionLocationEditor(session)} className="mt-3 flex w-full items-start gap-3 rounded-xl border border-dashed border-slate-300 bg-slate-50 p-3 text-left transition hover:border-emerald-400 hover:bg-emerald-50/60"><span className="text-2xl" aria-hidden="true">📍</span><span className="min-w-0 flex-1"><span className="block text-xs font-semibold text-slate-600">Session & Location · Tap to edit</span><span className="mt-1 block whitespace-pre-wrap text-sm text-slate-800">{savedLocation || `Add a ${session.toLowerCase()} location`}</span></span><span className="text-sm font-semibold text-emerald-800">Edit</span></button>
                                 </div>;
                               })}
@@ -1161,7 +1207,7 @@ function App() {
 
                                         {layering.icons && layering.icons.length > 0 && (
                                           <p className="text-4xl" aria-label="Suggested clothing">
-                                            {layering.icons.join(" ")}
+                                            {layering.icons.map((icon) => /fleece|wool|yarn|🧶|🧵|🧣/i.test(icon) ? "🧥" : icon).join(" ")}
                                           </p>
                                         )}
 
@@ -1205,7 +1251,7 @@ function App() {
                         </div>
                         <div className="border-t border-slate-100 bg-slate-50 p-4">
                           <div className="flex items-start justify-between gap-3"><div><h4 className="font-semibold">📸 Travel Memories</h4><p className="mt-1 text-sm text-slate-600">Shared notes saved for {selectedDay.date}.</p></div><button type="button" onClick={() => { setActiveView("memories"); }} className="shrink-0 rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm font-semibold">Add memory</button></div>
-                          {memories.filter((memory) => normalizeTripDate(memory.trip_date) === normalizeTripDate(selectedDay.date)).length ? <div className="mt-3 space-y-3">{memories.filter((memory) => normalizeTripDate(memory.trip_date) === normalizeTripDate(selectedDay.date)).map((memory) => <article key={memory.memory_id} className="rounded-lg border border-slate-200 bg-white p-3"><p className="font-semibold">{memory.attraction}</p><p className="mt-1 whitespace-pre-wrap text-sm leading-6 text-slate-700">{memory.content}</p><p className="mt-2 text-xs text-slate-500">Shared by {memory.author_email || "trip companion"}</p></article>)}</div> : <p className="mt-3 text-sm text-slate-500">No memories saved for this day yet.</p>}
+                          {memories.filter((memory) => normalizeTripDate(memory.trip_date) === normalizeTripDate(selectedDay.date)).length ? <div className="mt-3 space-y-3">{memories.filter((memory) => normalizeTripDate(memory.trip_date) === normalizeTripDate(selectedDay.date)).map((memory) => <article key={memory.memory_id} className="rounded-lg border border-slate-200 bg-white p-3"><p className="font-semibold">{memory.attraction}</p><p className="mt-1 whitespace-pre-wrap text-sm leading-6 text-slate-700">{memory.content}</p>{getMemoryPhotoIds(memory.photo_ids).length > 0 && <div className="mt-3 grid grid-cols-2 gap-2">{getMemoryPhotoIds(memory.photo_ids).map((photoId) => <a key={photoId} href={`https://drive.google.com/uc?export=view&id=${encodeURIComponent(photoId)}`} target="_blank" rel="noreferrer" className="overflow-hidden rounded-lg border border-slate-200"><img src={`https://drive.google.com/uc?export=view&id=${encodeURIComponent(photoId)}`} alt={`Photo for ${memory.attraction}`} loading="lazy" className="h-28 w-full object-cover" /><span className="block px-2 py-1 text-xs font-semibold text-emerald-800">Open photo ↗</span></a>)}</div>}<p className="mt-2 text-xs text-slate-500">Shared by {memory.author_email || "trip companion"}</p></article>)}</div> : <p className="mt-3 text-sm text-slate-500">No memories saved for this day yet.</p>}
                         </div>
                       </section>
                     )}
@@ -1246,6 +1292,7 @@ function App() {
                         return (
                           <article key={item.item_id} className={`rounded-xl border p-4 transition ${status === "x" ? "border-slate-200 bg-slate-50 opacity-75" : status === "✓" ? "border-emerald-200 bg-emerald-50/40" : "border-slate-200 bg-white"}`}>
                             <p className={`font-medium ${status === "x" ? "text-slate-500 line-through" : "text-slate-800"}`}>{item.item}</p>
+                            {(item.quantity || item.due_date || item.notes) && <p className="mt-1 whitespace-pre-wrap text-sm leading-5 text-slate-500">{[item.quantity ? `Qty: ${item.quantity}` : "", item.due_date ? `Due: ${item.due_date}` : "", item.notes || ""].filter(Boolean).join(" · ")}</p>}
                             <div className="mt-3 flex flex-wrap gap-2">
                               <button type="button" disabled={checklistSavingId === item.item_id} onClick={() => void setChecklistStatus(item, status === "✓" ? "" : "✓")} className={`rounded-lg border px-3 py-2 text-sm font-semibold disabled:opacity-50 ${status === "✓" ? "border-emerald-800 bg-emerald-800 text-white" : "border-slate-300 bg-white text-slate-700"}`}>{status === "✓" ? "✓ Done" : "□ Mark done"}</button>
                               <button type="button" disabled={checklistSavingId === item.item_id} onClick={() => void setChecklistStatus(item, status === "x" ? "" : "x")} className={`rounded-lg border px-3 py-2 text-sm font-semibold disabled:opacity-50 ${status === "x" ? "border-slate-500 bg-slate-600 text-white" : "border-slate-300 bg-white text-slate-600"}`}>{status === "x" ? "x Ignored" : "Not applicable"}</button>
@@ -1343,8 +1390,8 @@ function App() {
                     <button type="submit" disabled={expenseSaving} className="mt-4 rounded-lg bg-emerald-800 px-4 py-2.5 text-sm font-semibold text-white disabled:opacity-50">{expenseSaving ? "Saving…" : "Save expense"}</button>
                     {expenseMessage && <p className="mt-3 text-sm text-slate-600" aria-live="polite">{expenseMessage}</p>}
                   </form>
-                  <section><h3 className="font-semibold">Expense records</h3>{expenses.length ? <div className="mt-3 space-y-3">{[...expenses].sort((a,b) => (b.date || "").localeCompare(a.date || "")).map((expense) => <article key={expense.expense_id} className="rounded-xl border border-slate-200 p-4"><div className="flex flex-wrap items-start justify-between gap-3"><div className="min-w-0"><p className="font-semibold">{expense.description}</p><p className="mt-1 text-xs text-slate-500">{expense.date} · {expense.category} · Paid by {expense.paid_by}</p><span className="mt-2 inline-block rounded-full bg-slate-100 px-2 py-1 text-xs text-slate-600">{expense.expense_type === "pre-trip" ? "Pre-trip" : "Actual trip"}</span>{expense.notes && <p className="mt-2 whitespace-pre-wrap text-sm text-slate-600">{expense.notes}</p>}</div><p className="shrink-0 font-bold">{formatMoney(Number(expense.amount), expense.currency)}</p></div></article>)}</div> : <p className="mt-2 rounded-xl bg-slate-50 p-4 text-sm text-slate-600">No expenses returned from Google Sheets yet.</p>}</section>
-                </div> : activeView === "map" ? <><p className="mt-2 max-w-xl text-sm leading-6 text-slate-600">A route map has not been connected yet. This screen does not currently save locations or calculate routes.</p><div className="mt-5 rounded-xl bg-slate-50 p-4 text-sm text-slate-600">Your Google Sheets itinerary remains connected and unchanged.</div></> : <div className="mt-5 space-y-5">
+                  <section><h3 className="font-semibold">Expense records</h3>{expenses.length ? <div className="mt-3 space-y-3">{[...expenses].sort((a,b) => (b.date || "").localeCompare(a.date || "")).map((expense) => <article key={expense.expense_id} className="rounded-xl border border-slate-200 p-4"><div className="flex flex-wrap items-start justify-between gap-3"><div className="min-w-0"><p className="font-semibold">{expense.description}</p><p className="mt-1 text-xs text-slate-500">{expense.date || "Planned / booked"} · {expense.category} · Paid by {expense.paid_by}</p><span className="mt-2 inline-block rounded-full bg-slate-100 px-2 py-1 text-xs text-slate-600">{expense.expense_type === "pre-trip" ? "Pre-trip" : "Actual trip"}{expense.source === "FINAL EXPENSES" ? " · From planning sheet" : ""}</span>{expense.notes && <p className="mt-2 whitespace-pre-wrap text-sm text-slate-600">{expense.notes}</p>}</div><p className="shrink-0 font-bold">{formatMoney(Number(expense.amount), expense.currency)}</p></div></article>)}</div> : <p className="mt-2 rounded-xl bg-slate-50 p-4 text-sm text-slate-600">No expenses returned from Google Sheets yet.</p>}</section>
+                </div> : activeView === "map" ? <div className="mt-5 space-y-4"><p className="max-w-xl text-sm leading-6 text-slate-600">Open a day's route in Google Maps for driving directions. Flight days open a location search instead of driving directions.</p>{tripDays.map((day, index) => { const routeEntry = getEntriesForDay(day).find((entry) => /^(route|route\s*\/.*|route\s*and.*)$/i.test(entry.label.trim())) || getEntriesForDay(day).find((entry) => /route/i.test(entry.label)); const routeText = routeEntry?.value.trim() || ""; return <article key={day.key} className="rounded-xl border border-slate-200 p-4"><div className="flex items-start justify-between gap-3"><div><p className="text-xs font-semibold uppercase tracking-wide text-emerald-800">Day {index + 1} · {day.date}</p><h3 className="mt-1 font-semibold">{routeText || "Route not entered"}</h3></div><span aria-hidden="true" className="text-2xl">🛣️</span></div>{routeText ? <a href={googleMapsUrl(routeText)} target="_blank" rel="noreferrer" className="mt-3 inline-flex rounded-lg bg-emerald-800 px-4 py-2.5 text-sm font-semibold text-white hover:bg-emerald-900">{/\b(KUL|SIN)\b|flight|airport transfer/i.test(routeText) ? "Open locations in Google Maps ↗" : "Open driving route in Google Maps ↗"}</a> : <p className="mt-2 text-sm text-slate-500">Add route details to this day's itinerary to enable directions.</p>}</article>; })}<p className="text-xs text-slate-500">Google Maps opens separately. Route accuracy depends on the place names in your itinerary.</p></div> : <div className="mt-5 space-y-5">
                   <form onSubmit={(event) => { event.preventDefault(); setMemoryPreviewOpen(true); setMemoryMessage(""); }} className="rounded-xl border border-slate-200 p-4">
                     <h3 className="font-semibold">Add a shared memory</h3><p className="mt-1 text-sm text-slate-500">Review the preview before saving. Memories are shared with both approved travellers.</p>
                     <label className="mt-4 block text-sm font-medium">Trip date</label><select value={memoryDate} onChange={(event) => setMemoryDate(event.target.value)} required className="mt-1 w-full rounded-lg border border-slate-300 px-3 py-2 text-sm">{!tripDays.some((day) => normalizeTripDate(day.date) === normalizeTripDate(memoryDate)) && <option value={memoryDate}>Today · {memoryDate}</option>}{tripDays.map((day) => <option key={day.key} value={day.date}>{day.date}</option>)}</select>
@@ -1352,13 +1399,13 @@ function App() {
                     <label className="mt-3 block text-sm font-medium">Memory</label><textarea value={memoryContent} onChange={(event) => setMemoryContent(event.target.value)} required maxLength={5000} rows={4} placeholder="What would you like to remember about this place?" className="mt-1 w-full rounded-lg border border-slate-300 px-3 py-2 text-sm" />
                     <label className="mt-3 block text-sm font-medium">Photos</label><input type="file" accept="image/*" multiple onChange={(event) => setMemoryPhotoFiles(Array.from(event.target.files ?? []))} className="mt-1 block w-full rounded-lg border border-slate-300 p-2 text-sm file:mr-3 file:rounded-md file:border-0 file:bg-emerald-50 file:px-3 file:py-2 file:font-semibold file:text-emerald-800" />
                     {memoryPhotoFiles.length > 0 && <div className="mt-2 flex flex-wrap gap-2">{memoryPhotoFiles.map((file, index) => <span key={`${file.name}-${index}`} className="rounded-lg bg-slate-100 px-2 py-1 text-xs text-slate-700">📷 {file.name}</span>)}</div>}
-                    <p className="mt-1 text-xs text-amber-700">Photo selection is shown here, but shared photo upload still needs a backend storage integration. Photos are not uploaded or saved yet.</p>
+                    <p className="mt-1 text-xs text-slate-500">Up to 4 photos, 4 MB each. First-time photo upload may require reconnecting Google Sheets to approve Drive file access.</p>
                     <button type="submit" className="mt-3 rounded-lg bg-emerald-800 px-4 py-2.5 text-sm font-semibold text-white">Preview memory</button>
                   </form>
                   {memoryPreviewOpen && <section className="rounded-xl border border-emerald-300 bg-emerald-50/50 p-4"><p className="text-xs font-bold uppercase tracking-wide text-emerald-800">Preview — not saved yet</p><h3 className="mt-2 font-semibold">{memoryAttraction}</h3><p className="mt-1 text-xs text-slate-500">{memoryDate}</p><p className="mt-3 whitespace-pre-wrap text-sm leading-6">{memoryContent}</p><div className="mt-4 flex flex-wrap gap-2"><button type="button" onClick={() => void saveMemory()} disabled={isSavingMemory} className="rounded-lg bg-emerald-800 px-4 py-2.5 text-sm font-semibold text-white disabled:opacity-50">{isSavingMemory ? "Saving…" : "Confirm & save"}</button><button type="button" onClick={() => setMemoryPreviewOpen(false)} className="rounded-lg border border-slate-300 bg-white px-4 py-2.5 text-sm font-semibold">Keep editing</button></div></section>}
                   {memoryMessage && <p className="text-sm text-slate-600" aria-live="polite">{memoryMessage}</p>}
-                  <section><h3 className="font-semibold">Shared memory collection</h3>{memories.length ? <div className="mt-3 space-y-3">{[...memories].sort((a,b) => (a.trip_date || "").localeCompare(b.trip_date || "")).map((memory) => <article key={memory.memory_id} className="rounded-xl border border-slate-200 p-4"><div className="flex flex-wrap items-start justify-between gap-2"><h4 className="font-semibold">{memory.attraction}</h4><span className="text-xs text-slate-500">{memory.trip_date}</span></div><p className="mt-2 whitespace-pre-wrap text-sm leading-6 text-slate-700">{memory.content}</p><p className="mt-2 text-xs text-slate-500">Shared by {memory.author_email || "trip companion"}</p></article>)}</div> : <p className="mt-2 text-sm text-slate-500">No shared memories have been saved yet.</p>}</section>
-                  <p className="text-xs text-slate-500">Photo uploads are not enabled yet; this form saves text memories only.</p>
+                  <section><h3 className="font-semibold">Shared memory collection</h3>{memories.length ? <div className="mt-3 space-y-3">{[...memories].sort((a,b) => (a.trip_date || "").localeCompare(b.trip_date || "")).map((memory) => <article key={memory.memory_id} className="rounded-xl border border-slate-200 p-4"><div className="flex flex-wrap items-start justify-between gap-2"><h4 className="font-semibold">{memory.attraction}</h4><span className="text-xs text-slate-500">{memory.trip_date}</span></div><p className="mt-2 whitespace-pre-wrap text-sm leading-6 text-slate-700">{memory.content}</p>{getMemoryPhotoIds(memory.photo_ids).length > 0 && <div className="mt-3 grid grid-cols-2 gap-2 sm:grid-cols-3">{getMemoryPhotoIds(memory.photo_ids).map((photoId) => <a key={photoId} href={`https://drive.google.com/uc?export=view&id=${encodeURIComponent(photoId)}`} target="_blank" rel="noreferrer" className="block overflow-hidden rounded-lg border border-slate-200"><img src={`https://drive.google.com/uc?export=view&id=${encodeURIComponent(photoId)}`} alt={`Photo for ${memory.attraction}`} loading="lazy" className="h-32 w-full object-cover" /><span className="block px-2 py-1 text-xs font-semibold text-emerald-800">Open photo ↗</span></a>)}</div>}<p className="mt-2 text-xs text-slate-500">Shared by {memory.author_email || "trip companion"}</p></article>)}</div> : <p className="mt-2 text-sm text-slate-500">No shared memories have been saved yet.</p>}</section>
+
                 </div>}
               </section>
             )}
