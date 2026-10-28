@@ -356,6 +356,101 @@ async function decryptToken(
   return new TextDecoder().decode(plaintext);
 }
 
+
+
+interface TripConfig {
+  id: string;
+  name: string;
+  sheetId: string;
+  itineraryTab: string;
+  createdAt?: string;
+}
+
+const TRIP_REGISTRY_KEY = "trip-registry:shared:v1";
+const EXPENSE_HEADERS = ["expense_id", "date", "description", "category", "amount", "currency", "paid_by", "expense_type", "notes", "created_at"];
+const CHECKLIST_HEADERS = ["item_id", "category", "item", "ralph_status", "june_status"];
+
+async function getTripRegistry(env: Env): Promise<TripConfig[]> {
+  const saved = await env.OAUTH_TOKEN_STORE.get(TRIP_REGISTRY_KEY);
+  let trips: TripConfig[] = [];
+  if (saved) {
+    try { trips = JSON.parse(saved) as TripConfig[]; } catch { trips = []; }
+  }
+  if (!trips.some((trip) => trip.id === "nz-south-island") && env.GOOGLE_SHEET_ID) {
+    trips.unshift({ id: "nz-south-island", name: "New Zealand — South Island", sheetId: env.GOOGLE_SHEET_ID, itineraryTab: env.GOOGLE_SHEET_TAB || "FINAL ITINERARY" });
+  }
+  return trips;
+}
+
+async function resolveTrip(request: Request, env: Env, bodyTripId?: string): Promise<TripConfig | null> {
+  const url = new URL(request.url);
+  const tripId = (url.searchParams.get("tripId") || bodyTripId || "nz-south-island").trim();
+  const trips = await getTripRegistry(env);
+  return trips.find((trip) => trip.id === tripId) || null;
+}
+
+async function googleAccessToken(session: SessionPayload, env: Env): Promise<string> {
+  if (!env.GOOGLE_CLIENT_ID || !env.GOOGLE_CLIENT_SECRET || !env.TOKEN_ENCRYPTION_KEY || !env.OAUTH_TOKEN_STORE) {
+    throw new Error("Google Sheets is not configured.");
+  }
+  const encrypted = await env.OAUTH_TOKEN_STORE.get(`google-refresh:${session.email.toLowerCase()}`);
+  if (!encrypted) throw new Error("Google Sheets is not connected. Reconnect Google Sheets.");
+  const refreshToken = await decryptToken(encrypted, env.TOKEN_ENCRYPTION_KEY);
+  const response = await fetch("https://oauth2.googleapis.com/token", {
+    method: "POST",
+    headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    body: new URLSearchParams({ client_id: env.GOOGLE_CLIENT_ID, client_secret: env.GOOGLE_CLIENT_SECRET, refresh_token: refreshToken, grant_type: "refresh_token" }).toString(),
+  });
+  if (!response.ok) throw new Error("Google access failed. Reconnect Google Sheets.");
+  const data = await response.json() as { access_token?: string };
+  if (!data.access_token) throw new Error("Google returned no access token.");
+  return data.access_token;
+}
+
+function quoteSheetTab(tab: string): string { return `'${tab.replace(/'/g, "''")}'`; }
+function sheetsValuesUrl(sheetId: string, range: string): string {
+  return `https://sheets.googleapis.com/v4/spreadsheets/${encodeURIComponent(sheetId)}/values/${encodeURIComponent(range)}`;
+}
+
+async function ensureSheetTab(accessToken: string, sheetId: string, tabName: string, headers: string[]): Promise<void> {
+  const metadataResponse = await fetch(`https://sheets.googleapis.com/v4/spreadsheets/${encodeURIComponent(sheetId)}?fields=sheets(properties(title))`, { headers: { Authorization: `Bearer ${accessToken}` } });
+  if (!metadataResponse.ok) throw new Error("Could not inspect the selected Google Sheet. Check access and the spreadsheet ID.");
+  const metadata = await metadataResponse.json() as { sheets?: Array<{ properties?: { title?: string } }> };
+  const exists = (metadata.sheets || []).some((sheet) => sheet.properties?.title === tabName);
+  if (!exists) {
+    const addResponse = await fetch(`https://sheets.googleapis.com/v4/spreadsheets/${encodeURIComponent(sheetId)}:batchUpdate`, {
+      method: "POST", headers: { Authorization: `Bearer ${accessToken}`, "Content-Type": "application/json" },
+      body: JSON.stringify({ requests: [{ addSheet: { properties: { title: tabName } } }] }),
+    });
+    if (!addResponse.ok) throw new Error(`Could not create the ${tabName} tab in Google Sheets.`);
+  }
+  const range = `${quoteSheetTab(tabName)}!A1:${String.fromCharCode(64 + headers.length)}1`;
+  const readResponse = await fetch(sheetsValuesUrl(sheetId, range), { headers: { Authorization: `Bearer ${accessToken}` } });
+  if (!readResponse.ok) throw new Error(`Could not read the ${tabName} tab.`);
+  const existing = await readResponse.json() as { values?: unknown[][] };
+  if (!existing.values?.[0]?.some((cell) => String(cell ?? "").trim())) {
+    const writeResponse = await fetch(`${sheetsValuesUrl(sheetId, range)}?valueInputOption=RAW`, {
+      method: "PUT", headers: { Authorization: `Bearer ${accessToken}`, "Content-Type": "application/json" }, body: JSON.stringify({ values: [headers] }),
+    });
+    if (!writeResponse.ok) throw new Error(`Could not initialise the ${tabName} headers.`);
+  }
+}
+
+async function findExistingTab(accessToken: string, sheetId: string, candidates: string[], fallback: string): Promise<string> {
+  const response = await fetch(`https://sheets.googleapis.com/v4/spreadsheets/${encodeURIComponent(sheetId)}?fields=sheets(properties(title))`, { headers: { Authorization: `Bearer ${accessToken}` } });
+  if (!response.ok) return fallback;
+  const data = await response.json() as { sheets?: Array<{ properties?: { title?: string } }> };
+  const names = (data.sheets || []).map((sheet) => sheet.properties?.title || "");
+  return candidates.find((candidate) => names.includes(candidate)) || fallback;
+}
+
+async function readSheetRows(accessToken: string, sheetId: string, tabName: string): Promise<string[][]> {
+  const response = await fetch(sheetsValuesUrl(sheetId, `${quoteSheetTab(tabName)}!A:Z`), { headers: { Authorization: `Bearer ${accessToken}` } });
+  if (!response.ok) throw new Error(`Could not read the ${tabName} tab. Check the tab name and Google Sheets access.`);
+  const data = await response.json() as { values?: unknown[][] };
+  return (data.values || []).map((row) => row.map((cell) => String(cell ?? "")));
+}
+
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
     const url = new URL(request.url);
@@ -814,9 +909,123 @@ export default {
     }
 
     
+
+    // Shared trip registry. A trip stores its own spreadsheet destination.
+    if (url.pathname === "/api/trips" && (request.method === "GET" || request.method === "POST")) {
+      const session = await readSession(request, env);
+      if (!session) return jsonResponse({ success: false, error: "Authentication required." }, 401);
+      if (request.method === "POST" && request.headers.get("Origin") !== url.origin) return jsonResponse({ success: false, error: "Invalid request origin." }, 403);
+      try {
+        const trips = await getTripRegistry(env);
+        if (request.method === "GET") return jsonResponse({ success: true, trips: trips.map(({ id, name, itineraryTab }) => ({ id, name, itineraryTab })) });
+        const body = await request.json() as { name?: unknown; sheetId?: unknown; itineraryTab?: unknown };
+        const name = typeof body.name === "string" ? body.name.trim() : "";
+        const sheetId = typeof body.sheetId === "string" ? body.sheetId.trim() : "";
+        const itineraryTab = typeof body.itineraryTab === "string" && body.itineraryTab.trim() ? body.itineraryTab.trim() : "FINAL ITINERARY";
+        if (name.length < 2 || name.length > 100 || !/^[A-Za-z0-9_-]{20,}$/.test(sheetId) || itineraryTab.length > 100) return jsonResponse({ success: false, error: "Enter a trip name and a valid Google Sheets spreadsheet ID." }, 400);
+        const accessToken = await googleAccessToken(session, env);
+        const check = await fetch(`https://sheets.googleapis.com/v4/spreadsheets/${encodeURIComponent(sheetId)}?fields=spreadsheetId,properties(title),sheets(properties(title))`, { headers: { Authorization: `Bearer ${accessToken}` } });
+        if (!check.ok) return jsonResponse({ success: false, error: "This Google Sheet could not be opened. Check its ID and share it with the signed-in Google account." }, 400);
+        const metadata = await check.json() as { spreadsheetId?: string; properties?: { title?: string }; sheets?: Array<{ properties?: { title?: string } }> };
+        if (!(metadata.sheets || []).some((sheet) => sheet.properties?.title === itineraryTab)) return jsonResponse({ success: false, error: `The sheet does not contain a tab named “${itineraryTab}”.` }, 400);
+        if (trips.some((trip) => trip.sheetId === sheetId)) return jsonResponse({ success: false, error: "This Google Sheet is already registered as a trip." }, 409);
+        const baseId = name.toLowerCase().normalize("NFKD").replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "").slice(0, 40) || "trip";
+        let id = baseId; let suffix = 2;
+        while (trips.some((trip) => trip.id === id)) id = `${baseId}-${suffix++}`;
+        const trip: TripConfig = { id, name, sheetId, itineraryTab, createdAt: new Date().toISOString() };
+        trips.push(trip);
+        await env.OAUTH_TOKEN_STORE.put(TRIP_REGISTRY_KEY, JSON.stringify(trips));
+        return jsonResponse({ success: true, trip: { id: trip.id, name: trip.name, itineraryTab: trip.itineraryTab } }, 201);
+      } catch (error) { return jsonResponse({ success: false, error: error instanceof Error ? error.message : "Could not manage trips." }, 500); }
+    }
+
+    // Shared trip expenses stored in the selected trip spreadsheet.
+    if (url.pathname === "/api/expenses" && (request.method === "GET" || request.method === "POST")) {
+      const session = await readSession(request, env);
+      if (!session) return jsonResponse({ success: false, error: "Authentication required." }, 401);
+      if (request.method === "POST" && request.headers.get("Origin") !== url.origin) return jsonResponse({ success: false, error: "Invalid request origin." }, 403);
+      try {
+        let body: Record<string, unknown> = {};
+        if (request.method === "POST") body = await request.json() as Record<string, unknown>;
+        const trip = await resolveTrip(request, env, typeof body.tripId === "string" ? body.tripId : undefined);
+        if (!trip) return jsonResponse({ success: false, error: "Select a valid trip first." }, 404);
+        const token = await googleAccessToken(session, env);
+        const tab = "TRIP EXPENSES";
+        await ensureSheetTab(token, trip.sheetId, tab, EXPENSE_HEADERS);
+        const rows = await readSheetRows(token, trip.sheetId, tab);
+        if (request.method === "GET") {
+          const header = (rows[0] || []).map((cell) => cell.trim().toLowerCase());
+          const idx = (name: string) => header.indexOf(name);
+          const expenses = rows.slice(1).filter((row) => row[idx("expense_id")]?.trim()).map((row) => ({
+            expense_id: row[idx("expense_id")] || "", date: row[idx("date")] || "", description: row[idx("description")] || "", category: row[idx("category")] || "Other",
+            amount: Number(row[idx("amount")] || 0), currency: row[idx("currency")] || "NZD", paid_by: row[idx("paid_by")] || "Ralph", expense_type: row[idx("expense_type")] || "actual-trip", notes: row[idx("notes")] || "",
+          }));
+          return jsonResponse({ success: true, expenses, tripId: trip.id });
+        }
+        const expenseId = typeof body.expense_id === "string" ? body.expense_id.trim() : "";
+        const date = typeof body.date === "string" ? body.date.trim() : "";
+        const description = typeof body.description === "string" ? body.description.trim() : "";
+        const category = typeof body.category === "string" ? body.category.trim() : "Other";
+        const amount = Number(body.amount);
+        const currency = typeof body.currency === "string" ? body.currency.trim().toUpperCase() : "NZD";
+        const paidBy = typeof body.paid_by === "string" ? body.paid_by.trim() : "";
+        const expenseType = body.expense_type;
+        const notes = typeof body.notes === "string" ? body.notes.trim() : "";
+        if (!expenseId || expenseId.length > 100 || !date || !description || description.length > 250 || !Number.isFinite(amount) || amount <= 0 || !["pre-trip", "actual-trip"].includes(String(expenseType)) || !["Ralph", "June"].includes(paidBy) || !/^[A-Z]{3}$/.test(currency) || category.length > 100 || notes.length > 2000) return jsonResponse({ success: false, error: "Invalid expense details." }, 400);
+        if (rows.slice(1).some((row) => row[0] === expenseId)) return jsonResponse({ success: true, duplicate: true, message: "Expense already saved." });
+        const appendUrl = `${sheetsValuesUrl(trip.sheetId, `${quoteSheetTab(tab)}!A:J`)}:append?valueInputOption=RAW&insertDataOption=INSERT_ROWS`;
+        const append = await fetch(appendUrl, { method: "POST", headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" }, body: JSON.stringify({ values: [[expenseId, date, description, category, amount, currency, paidBy, expenseType, notes, new Date().toISOString()]] }) });
+        if (!append.ok) return jsonResponse({ success: false, error: "Could not save the expense to Google Sheets." }, 502);
+        return jsonResponse({ success: true, message: "Expense saved.", tripId: trip.id }, 201);
+      } catch (error) { return jsonResponse({ success: false, error: error instanceof Error ? error.message : "Could not access trip expenses." }, 500); }
+    }
+
+    // Checklist keeps separate status cells for Ralph and June; a write only touches the signed-in person's cell.
+    if (url.pathname === "/api/checklist" && (request.method === "GET" || request.method === "POST")) {
+      const session = await readSession(request, env);
+      if (!session) return jsonResponse({ success: false, error: "Authentication required." }, 401);
+      if (request.method === "POST" && request.headers.get("Origin") !== url.origin) return jsonResponse({ success: false, error: "Invalid request origin." }, 403);
+      try {
+        let body: Record<string, unknown> = {};
+        if (request.method === "POST") body = await request.json() as Record<string, unknown>;
+        const trip = await resolveTrip(request, env, typeof body.tripId === "string" ? body.tripId : undefined);
+        if (!trip) return jsonResponse({ success: false, error: "Select a valid trip first." }, 404);
+        const token = await googleAccessToken(session, env);
+        const tab = await findExistingTab(token, trip.sheetId, ["Things to do n bring", "Thing to do n bring", "Things to do & bring", "Thing to do & bring", "THINGS TO DO N BRING", "THINGS TO DO & BRING"], "Things to do n bring");
+        await ensureSheetTab(token, trip.sheetId, tab, CHECKLIST_HEADERS);
+        const rows = await readSheetRows(token, trip.sheetId, tab);
+        const headers = (rows[0] || []).map((cell) => cell.trim().toLowerCase().replace(/[^a-z0-9]/g, ""));
+        const col = (...names: string[]) => headers.findIndex((header) => names.some((name) => header === name.toLowerCase().replace(/[^a-z0-9]/g, "")));
+        const idCol = col("item_id", "itemid", "id", "checklist_id"), categoryCol = col("category", "group"), itemCol = col("item", "task", "description", "checklist_item"), ralphCol = col("ralph_status", "ralph", "ralph_checkbox"), juneCol = col("june_status", "june", "june_checkbox");
+        if ([idCol, categoryCol, itemCol, ralphCol, juneCol].some((value) => value < 0)) return jsonResponse({ success: false, error: "Checklist tab must have item ID, category, item, Ralph status and June status columns. Recommended headers: item_id, category, item, ralph_status, june_status." }, 409);
+        if (request.method === "GET") {
+          const checklistItems = rows.slice(1).filter((row) => row[idCol]?.trim() && row[itemCol]?.trim()).map((row) => ({ item_id: row[idCol], category: row[categoryCol] || "Other", item: row[itemCol], ralph_status: row[ralphCol] || "", june_status: row[juneCol] || "" }));
+          return jsonResponse({ success: true, checklistItems, tripId: trip.id });
+        }
+        const itemId = typeof body.item_id === "string" ? body.item_id.trim() : "";
+        const status = typeof body.status === "string" ? body.status : "";
+        if (!itemId || itemId.length > 150 || !["", "✓", "x"].includes(status)) return jsonResponse({ success: false, error: "Invalid checklist status." }, 400);
+        const statusCol = session.email.toLowerCase() === "koochanyee@gmail.com" ? ralphCol : session.email.toLowerCase() === "wookahwai@gmail.com" ? juneCol : -1;
+        if (statusCol < 0) return jsonResponse({ success: false, error: "This account is not assigned a checklist profile." }, 403);
+        const matches: number[] = [];
+        rows.slice(1).forEach((row, index) => { if (row[idCol] === itemId) matches.push(index + 2); });
+        if (matches.length !== 1) return jsonResponse({ success: false, error: matches.length ? "Duplicate checklist item IDs found." : "Checklist item not found." }, 409);
+        let column = ""; let n = statusCol + 1;
+        while (n > 0) { const rem = (n - 1) % 26; column = String.fromCharCode(65 + rem) + column; n = Math.floor((n - 1) / 26); }
+        const writeUrl = `${sheetsValuesUrl(trip.sheetId, `${quoteSheetTab(tab)}!${column}${matches[0]}`)}?valueInputOption=RAW`;
+        const write = await fetch(writeUrl, { method: "PUT", headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" }, body: JSON.stringify({ values: [[status]] }) });
+        if (!write.ok) return jsonResponse({ success: false, error: "Could not sync checklist status to Google Sheets." }, 502);
+        return jsonResponse({ success: true, item_id: itemId, status, tripId: trip.id });
+      } catch (error) { return jsonResponse({ success: false, error: error instanceof Error ? error.message : "Could not access the shared checklist." }, 500); }
+    }
+
     // Read the signed-in user's Google Sheets itinerary.
     if (request.method === "GET" && url.pathname === "/api/itinerary") {
       const session = await readSession(request, env);
+      const trip = await resolveTrip(request, env);
+      if (!trip) return jsonResponse({ success: false, error: "Select a valid trip first." }, 404);
+      const activeSheetId = trip.sheetId;
+      const activeItineraryTab = trip.itineraryTab;
 
       if (!session) {
         return jsonResponse(
@@ -829,8 +1038,8 @@ export default {
         !env.GOOGLE_CLIENT_ID ||
         !env.GOOGLE_CLIENT_SECRET ||
         !env.TOKEN_ENCRYPTION_KEY ||
-        !env.GOOGLE_SHEET_ID ||
-        !env.GOOGLE_SHEET_TAB ||
+        !activeSheetId ||
+        !activeItineraryTab ||
         !env.OAUTH_TOKEN_STORE
       ) {
         return jsonResponse(
@@ -901,11 +1110,11 @@ export default {
         }
 
         const range =
-          `'${env.GOOGLE_SHEET_TAB.replace(/'/g, "''")}'!A:ZZZ`;
+          `'${activeItineraryTab.replace(/'/g, "''")}'!A:ZZZ`;
 
         const sheetUrl =
           `https://sheets.googleapis.com/v4/spreadsheets/` +
-          `${encodeURIComponent(env.GOOGLE_SHEET_ID)}/values/` +
+          `${encodeURIComponent(activeSheetId)}/values/` +
           `${encodeURIComponent(range)}`;
 
         const sheetResponse = await fetch(sheetUrl, {
@@ -976,8 +1185,8 @@ export default {
         try {
           const metadataUrl =
             `https://sheets.googleapis.com/v4/spreadsheets/` +
-            `${encodeURIComponent(env.GOOGLE_SHEET_ID)}` +
-            `?fields=sheets.properties.title`;
+            `${encodeURIComponent(activeSheetId)}` +
+            `?fields=sheets(properties(title))`;
 
           const metadataResponse = await fetch(metadataUrl, {
             headers: {
@@ -1009,7 +1218,7 @@ export default {
           if (tabTitles.length > 0) {
             const batchUrl = new URL(
               `https://sheets.googleapis.com/v4/spreadsheets/` +
-              `${encodeURIComponent(env.GOOGLE_SHEET_ID)}/values:batchGet`,
+              `${encodeURIComponent(activeSheetId)}/values:batchGet`,
             );
 
             tabTitles.forEach((title) => {
@@ -1086,6 +1295,8 @@ export default {
       url.pathname === "/api/session-location"
     ) {
       const session = await readSession(request, env);
+      const trip = await resolveTrip(request, env);
+      if (!trip) return jsonResponse({ success: false, error: "Select a valid trip first." }, 404);
 
       if (!session) {
         return jsonResponse(
@@ -1106,7 +1317,7 @@ export default {
         !env.GOOGLE_CLIENT_ID ||
         !env.GOOGLE_CLIENT_SECRET ||
         !env.TOKEN_ENCRYPTION_KEY ||
-        !env.GOOGLE_SHEET_ID ||
+        !trip.sheetId ||
         !env.OAUTH_TOKEN_STORE
       ) {
         return jsonResponse(
@@ -1213,8 +1424,9 @@ export default {
           );
         }
 
-        const sheetId = encodeURIComponent(env.GOOGLE_SHEET_ID);
-        const readRange = "'SESSION LOCATIONS'!A:C";
+        const sessionTab = await findExistingTab(tokenData.access_token, trip.sheetId, ["SESSION LOCATION", "SESSION LOCATIONS"], "SESSION LOCATION");
+        const sheetId = encodeURIComponent(trip.sheetId);
+        const readRange = `${quoteSheetTab(sessionTab)}!A:C`;
         const readUrl =
           `https://sheets.googleapis.com/v4/spreadsheets/${sheetId}/values/` +
           encodeURIComponent(readRange);
@@ -1319,7 +1531,7 @@ export default {
         };
 
         const writeRange =
-          `'SESSION LOCATIONS'!${columnLetter(locationCol)}${match.rowNumber}`;
+          `${quoteSheetTab(sessionTab)}!${columnLetter(locationCol)}${match.rowNumber}`;
         const writeUrl =
           `https://sheets.googleapis.com/v4/spreadsheets/${sheetId}/values/` +
           encodeURIComponent(writeRange) +
@@ -1387,6 +1599,8 @@ export default {
       url.pathname === "/api/memories"
     ) {
       const session = await readSession(request, env);
+      const trip = await resolveTrip(request, env);
+      if (!trip) return jsonResponse({ success: false, error: "Select a valid trip first." }, 404);
 
       if (!session) {
         return jsonResponse(
@@ -1399,7 +1613,7 @@ export default {
         !env.GOOGLE_CLIENT_ID ||
         !env.GOOGLE_CLIENT_SECRET ||
         !env.TOKEN_ENCRYPTION_KEY ||
-        !env.GOOGLE_SHEET_ID ||
+        !trip.sheetId ||
         !env.OAUTH_TOKEN_STORE
       ) {
         return jsonResponse(
@@ -1479,10 +1693,12 @@ export default {
           );
         }
 
-        const range = encodeURIComponent("'TRIP_MEMORIES'!A:H");
+        const memoryTab = await findExistingTab(tokenData.access_token, trip.sheetId, ["TRIP MEMORIES", "TRIP_MEMORIES"], "TRIP MEMORIES");
+        await ensureSheetTab(tokenData.access_token, trip.sheetId, memoryTab, ["memory_id", "trip_date", "attraction", "author_email", "content", "created_at", "updated_at", "photo_ids"]);
+        const range = encodeURIComponent(`${quoteSheetTab(memoryTab)}!A:H`);
         const sheetUrl =
           `https://sheets.googleapis.com/v4/spreadsheets/` +
-          `${env.GOOGLE_SHEET_ID}/values/${range}`;
+          `${encodeURIComponent(trip.sheetId)}/values/${range}`;
 
         if (request.method === "GET") {
           const sheetResponse = await fetch(sheetUrl, {
