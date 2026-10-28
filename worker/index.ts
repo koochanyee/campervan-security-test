@@ -451,6 +451,40 @@ async function readSheetRows(accessToken: string, sheetId: string, tabName: stri
   return (data.values || []).map((row) => row.map((cell) => String(cell ?? "")));
 }
 
+
+async function uploadSharedMemoryPhoto(accessToken: string, photo: { name?: unknown; mime_type?: unknown; data_base64?: unknown }, shareEmail: string): Promise<string> {
+  const name = typeof photo.name === "string" ? photo.name.replace(/[^a-zA-Z0-9._-]/g, "_").slice(0, 120) : "travel-memory.jpg";
+  const mimeType = typeof photo.mime_type === "string" && /^image\/(jpeg|png|webp|gif|heic|heif)$/.test(photo.mime_type) ? photo.mime_type : "";
+  const encoded = typeof photo.data_base64 === "string" ? photo.data_base64.replace(/^data:image\/[^;]+;base64,/, "") : "";
+  if (!mimeType || !encoded) throw new Error("A selected photo has an unsupported image format.");
+  const binary = atob(encoded);
+  if (binary.length > 4 * 1024 * 1024) throw new Error("Each photo must be 4 MB or smaller.");
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+  const form = new FormData();
+  form.append("metadata", new Blob([JSON.stringify({ name, mimeType, description: "Shared campervan travel memory" })], { type: "application/json" }));
+  form.append("file", new Blob([bytes], { type: mimeType }), name);
+  const upload = await fetch("https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart&fields=id,name,mimeType,webViewLink", {
+    method: "POST", headers: { Authorization: `Bearer ${accessToken}` }, body: form,
+  });
+  if (!upload.ok) {
+    if (upload.status === 403 || upload.status === 401) throw new Error("Photo upload needs Google Drive permission. Choose Reconnect Google Sheets, approve Drive file access, then try again.");
+    throw new Error("Google Drive could not upload the selected photo.");
+  }
+  const file = await upload.json() as { id?: string };
+  if (!file.id) throw new Error("Google Drive did not return a photo ID.");
+  const permission = await fetch(`https://www.googleapis.com/drive/v3/files/${encodeURIComponent(file.id)}/permissions?sendNotificationEmail=false`, {
+    method: "POST", headers: { Authorization: `Bearer ${accessToken}`, "Content-Type": "application/json" },
+    body: JSON.stringify({ type: "user", role: "reader", emailAddress: shareEmail }),
+  });
+  if (!permission.ok) {
+    try { await fetch(`https://www.googleapis.com/drive/v3/files/${encodeURIComponent(file.id)}`, { method: "DELETE", headers: { Authorization: `Bearer ${accessToken}` } }); } catch { /* best-effort cleanup */ }
+    if (permission.status === 403 || permission.status === 401) throw new Error("Google Drive photo sharing is not authorised. Reconnect Google Sheets and approve Drive file access.");
+    throw new Error("The photo uploaded, but it could not be shared with the other traveller.");
+  }
+  return file.id;
+}
+
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
     const url = new URL(request.url);
@@ -701,7 +735,7 @@ export default {
         googleUrl.searchParams.set("response_type", "code");
         googleUrl.searchParams.set(
           "scope",
-          "https://www.googleapis.com/auth/spreadsheets",
+          "https://www.googleapis.com/auth/spreadsheets https://www.googleapis.com/auth/drive.file",
         );
         googleUrl.searchParams.set("access_type", "offline");
         googleUrl.searchParams.set("prompt", "consent");
@@ -939,7 +973,8 @@ export default {
       } catch (error) { return jsonResponse({ success: false, error: error instanceof Error ? error.message : "Could not manage trips." }, 500); }
     }
 
-    // Shared trip expenses stored in the selected trip spreadsheet.
+    // Shared trip expenses. Import the existing FINAL EXPENSES planning table,
+    // then append new records to TRIP EXPENSES without modifying the planning table.
     if (url.pathname === "/api/expenses" && (request.method === "GET" || request.method === "POST")) {
       const session = await readSession(request, env);
       if (!session) return jsonResponse({ success: false, error: "Authentication required." }, 401);
@@ -956,11 +991,44 @@ export default {
         if (request.method === "GET") {
           const header = (rows[0] || []).map((cell) => cell.trim().toLowerCase());
           const idx = (name: string) => header.indexOf(name);
-          const expenses = rows.slice(1).filter((row) => row[idx("expense_id")]?.trim()).map((row) => ({
+          const loggedExpenses = rows.slice(1).filter((row) => row[idx("expense_id")]?.trim()).map((row) => ({
             expense_id: row[idx("expense_id")] || "", date: row[idx("date")] || "", description: row[idx("description")] || "", category: row[idx("category")] || "Other",
-            amount: Number(row[idx("amount")] || 0), currency: row[idx("currency")] || "NZD", paid_by: row[idx("paid_by")] || "Ralph", expense_type: row[idx("expense_type")] || "actual-trip", notes: row[idx("notes")] || "",
+            amount: Number(row[idx("amount")] || 0), currency: row[idx("currency")] || "NZD", paid_by: row[idx("paid_by")] || "Ralph", expense_type: row[idx("expense_type")] || "actual-trip", notes: row[idx("notes")] || "", source: "TRIP EXPENSES",
           }));
-          return jsonResponse({ success: true, expenses, tripId: trip.id });
+          let plannedExpenses: Array<Record<string, unknown>> = [];
+          try {
+            const planningTab = await findExistingTab(token, trip.sheetId, ["FINAL EXPENSES", "Final Expenses"], "FINAL EXPENSES");
+            const planningRows = await readSheetRows(token, trip.sheetId, planningTab);
+            let group = "Pre-trip";
+            plannedExpenses = planningRows.slice(3).flatMap((row, index) => {
+              const sheetRow = index + 4;
+              const description = String(row[0] || "").trim();
+              const amountText = String(row[1] || "").replace(/,/g, "").replace(/[^0-9.-]/g, "");
+              const amount = Number(amountText);
+              if (description && (!Number.isFinite(amount) || amount <= 0)) { group = description; return []; }
+              if (!description || !Number.isFinite(amount) || amount <= 0) return [];
+              const charges = [
+                row[5] ? `Sep charged: MYR ${row[5]}` : "",
+                row[6] ? `Oct charged: MYR ${row[6]}` : "",
+                row[7] ? `Nov charged: MYR ${row[7]}` : "",
+                row[8] !== undefined && row[8] !== "" ? `Balance: MYR ${row[8]}` : "",
+                row[9] ? String(row[9]) : "",
+              ].filter(Boolean);
+              return [{
+                expense_id: `planned-final-expenses-row-${sheetRow}`,
+                date: "",
+                description,
+                category: group,
+                amount,
+                currency: "MYR",
+                paid_by: String(row[3] || "Shared"),
+                expense_type: "pre-trip",
+                notes: [row[4] === "TRUE" ? "Booked: Yes" : row[4] === "FALSE" ? "Booked: No" : "", ...charges].filter(Boolean).join(" · "),
+                source: "FINAL EXPENSES",
+              }];
+            });
+          } catch { /* A trip may not have a FINAL EXPENSES tab; logged expenses still load. */ }
+          return jsonResponse({ success: true, expenses: [...plannedExpenses, ...loggedExpenses], tripId: trip.id });
         }
         const expenseId = typeof body.expense_id === "string" ? body.expense_id.trim() : "";
         const date = typeof body.date === "string" ? body.date.trim() : "";
@@ -971,7 +1039,7 @@ export default {
         const paidBy = typeof body.paid_by === "string" ? body.paid_by.trim() : "";
         const expenseType = body.expense_type;
         const notes = typeof body.notes === "string" ? body.notes.trim() : "";
-        if (!expenseId || expenseId.length > 100 || !date || !description || description.length > 250 || !Number.isFinite(amount) || amount <= 0 || !["pre-trip", "actual-trip"].includes(String(expenseType)) || !["Ralph", "June"].includes(paidBy) || !/^[A-Z]{3}$/.test(currency) || category.length > 100 || notes.length > 2000) return jsonResponse({ success: false, error: "Invalid expense details." }, 400);
+        if (!expenseId || expenseId.length > 100 || !date || !description || description.length > 250 || !Number.isFinite(amount) || amount <= 0 || !["pre-trip", "actual-trip"].includes(String(expenseType)) || !["Ralph", "June", "Shared"].includes(paidBy) || !/^[A-Z]{3}$/.test(currency) || category.length > 100 || notes.length > 2000) return jsonResponse({ success: false, error: "Invalid expense details." }, 400);
         if (rows.slice(1).some((row) => row[0] === expenseId)) return jsonResponse({ success: true, duplicate: true, message: "Expense already saved." });
         const appendUrl = `${sheetsValuesUrl(trip.sheetId, `${quoteSheetTab(tab)}!A:J`)}:append?valueInputOption=RAW&insertDataOption=INSERT_ROWS`;
         const append = await fetch(appendUrl, { method: "POST", headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" }, body: JSON.stringify({ values: [[expenseId, date, description, category, amount, currency, paidBy, expenseType, notes, new Date().toISOString()]] }) });
@@ -980,7 +1048,9 @@ export default {
       } catch (error) { return jsonResponse({ success: false, error: error instanceof Error ? error.message : "Could not access trip expenses." }, 500); }
     }
 
-    // Checklist keeps separate status cells for Ralph and June; a write only touches the signed-in person's cell.
+    // Read the existing workbook layout for "Thing to do n bring". The workbook has
+    // packing items in A:E and dated to-do items in G:I. Ralph/June status columns
+    // are added in J:M so their selections never overwrite each other or the source checkboxes.
     if (url.pathname === "/api/checklist" && (request.method === "GET" || request.method === "POST")) {
       const session = await readSession(request, env);
       if (!session) return jsonResponse({ success: false, error: "Authentication required." }, 401);
@@ -991,29 +1061,95 @@ export default {
         const trip = await resolveTrip(request, env, typeof body.tripId === "string" ? body.tripId : undefined);
         if (!trip) return jsonResponse({ success: false, error: "Select a valid trip first." }, 404);
         const token = await googleAccessToken(session, env);
-        const tab = await findExistingTab(token, trip.sheetId, ["Things to do n bring", "Thing to do n bring", "Things to do & bring", "Thing to do & bring", "THINGS TO DO N BRING", "THINGS TO DO & BRING"], "Things to do n bring");
+        const tab = await findExistingTab(token, trip.sheetId, ["Thing to do n bring", "Things to do n bring", "Thing to do & bring", "Things to do & bring", "THINGS TO DO N BRING", "THINGS TO DO & BRING"], "Thing to do n bring");
+        let rows: string[][];
+        try {
+          rows = await readSheetRows(token, trip.sheetId, tab);
+        } catch {
+          await ensureSheetTab(token, trip.sheetId, tab, CHECKLIST_HEADERS);
+          rows = await readSheetRows(token, trip.sheetId, tab);
+        }
+        const norm = (value: string) => value.toLowerCase().replace(/[^a-z0-9]/g, "");
+        const first = rows[0] || [];
+        const legacyLayout = norm(first[0] || "") === "category" && norm(first[1] || "") === "item";
+        if (legacyLayout) {
+          const expectedStatusHeaders = ["Ralph pack status", "June pack status", "Ralph to-do status", "June to-do status"];
+          const existingJtoM = [9, 10, 11, 12].map((col) => String(first[col] || "").trim());
+          if (existingJtoM.some(Boolean) && !expectedStatusHeaders.every((value, i) => norm(existingJtoM[i]) === norm(value))) {
+            return jsonResponse({ success: false, error: "Columns J:M in the checklist tab are already in use. Please keep them clear or move the new per-person status columns before syncing." }, 409);
+          }
+          const statusesWereMissing = !expectedStatusHeaders.some((value) => first.some((cell) => norm(String(cell || "")) === norm(value)));
+          if (statusesWereMissing) {
+            const headerWrite = await fetch(`${sheetsValuesUrl(trip.sheetId, `${quoteSheetTab(tab)}!J1:M1`)}?valueInputOption=RAW`, { method: "PUT", headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" }, body: JSON.stringify({ values: [expectedStatusHeaders] }) });
+            if (!headerWrite.ok) return jsonResponse({ success: false, error: "Could not add Ralph/June checklist status columns." }, 502);
+            const meaningfulRows = rows.slice(1).map((row, index) => ({ row, sheetRow: index + 2 })).filter(({ row }) => String(row[1] || "").trim() || String(row[8] || "").trim());
+            if (meaningfulRows.length) {
+              const lastRow = meaningfulRows[meaningfulRows.length - 1].sheetRow;
+              const initial = rows.slice(1, lastRow).map((row) => {
+                const packChecked = ["TRUE", "✓", "☑", "1"].includes(String(row[3] || "").trim().toUpperCase());
+                const todoChecked = ["TRUE", "✓", "☑", "1"].includes(String(row[6] || "").trim().toUpperCase());
+                return [packChecked ? "✓" : "", packChecked ? "✓" : "", todoChecked ? "✓" : "", todoChecked ? "✓" : ""];
+              });
+              const statusWrite = await fetch(`${sheetsValuesUrl(trip.sheetId, `${quoteSheetTab(tab)}!J2:M${lastRow}`)}?valueInputOption=RAW`, { method: "PUT", headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" }, body: JSON.stringify({ values: initial }) });
+              if (!statusWrite.ok) return jsonResponse({ success: false, error: "Could not initialise individual checklist statuses." }, 502);
+            }
+            rows = await readSheetRows(token, trip.sheetId, tab);
+          }
+          const header = rows[0] || [];
+          const statusCols = [9, 10, 11, 12];
+          const ralphIndex = session.email.toLowerCase() === "koochanyee@gmail.com" ? 0 : session.email.toLowerCase() === "wookahwai@gmail.com" ? 1 : -1;
+          if (ralphIndex < 0) return jsonResponse({ success: false, error: "This account is not assigned a checklist profile." }, 403);
+          if (request.method === "GET") {
+            const result: Array<Record<string, unknown>> = [];
+            let currentCategory = "Other";
+            rows.slice(1).forEach((row, index) => {
+              const sheetRow = index + 2;
+              const categoryCell = String(row[0] || "").trim();
+              if (categoryCell) currentCategory = categoryCell;
+              const packItem = String(row[1] || "").trim();
+              if (packItem) result.push({ item_id: `pack-${sheetRow}`, category: currentCategory, item: packItem, quantity: String(row[2] || "").trim(), notes: String(row[4] || "").trim(), checklist_type: "packing", ralph_status: String(row[statusCols[0]] || "").trim(), june_status: String(row[statusCols[1]] || "").trim() });
+              const todoItem = String(row[8] || "").trim();
+              if (todoItem) result.push({ item_id: `todo-${sheetRow}`, category: "Things to do", item: todoItem, due_date: String(row[7] || "").trim(), checklist_type: "todo", ralph_status: String(row[statusCols[2]] || "").trim(), june_status: String(row[statusCols[3]] || "").trim() });
+            });
+            return jsonResponse({ success: true, checklistItems: result, tripId: trip.id });
+          }
+          const itemId = typeof body.item_id === "string" ? body.item_id.trim() : "";
+          const status = typeof body.status === "string" ? body.status : "";
+          if (!/^(pack|todo)-\d+$/.test(itemId) || !["", "✓", "x"].includes(status)) return jsonResponse({ success: false, error: "Invalid checklist item or status." }, 400);
+          const sheetRow = Number(itemId.split("-")[1]);
+          const row = rows[sheetRow - 1] || [];
+          const isTodo = itemId.startsWith("todo-");
+          if (!String(row[isTodo ? 8 : 1] || "").trim()) return jsonResponse({ success: false, error: "Checklist item not found." }, 404);
+          const statusCol = isTodo ? (ralphIndex === 0 ? 11 : 12) : (ralphIndex === 0 ? 9 : 10);
+          const colLetter = String.fromCharCode(65 + statusCol);
+          const writeUrl = `${sheetsValuesUrl(trip.sheetId, `${quoteSheetTab(tab)}!${colLetter}${sheetRow}`)}?valueInputOption=RAW`;
+          const write = await fetch(writeUrl, { method: "PUT", headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" }, body: JSON.stringify({ values: [[status]] }) });
+          if (!write.ok) return jsonResponse({ success: false, error: "Could not sync checklist status to Google Sheets." }, 502);
+          return jsonResponse({ success: true, item_id: itemId, status, tripId: trip.id });
+        }
+
+        // Compatibility path for a newer, normalised checklist sheet.
         await ensureSheetTab(token, trip.sheetId, tab, CHECKLIST_HEADERS);
-        const rows = await readSheetRows(token, trip.sheetId, tab);
-        const headers = (rows[0] || []).map((cell) => cell.trim().toLowerCase().replace(/[^a-z0-9]/g, ""));
-        const col = (...names: string[]) => headers.findIndex((header) => names.some((name) => header === name.toLowerCase().replace(/[^a-z0-9]/g, "")));
+        rows = await readSheetRows(token, trip.sheetId, tab);
+        const headers = (rows[0] || []).map((cell) => norm(cell));
+        const col = (...names: string[]) => headers.findIndex((header) => names.some((name) => header === norm(name)));
         const idCol = col("item_id", "itemid", "id", "checklist_id"), categoryCol = col("category", "group"), itemCol = col("item", "task", "description", "checklist_item"), ralphCol = col("ralph_status", "ralph", "ralph_checkbox"), juneCol = col("june_status", "june", "june_checkbox");
-        if ([idCol, categoryCol, itemCol, ralphCol, juneCol].some((value) => value < 0)) return jsonResponse({ success: false, error: "Checklist tab must have item ID, category, item, Ralph status and June status columns. Recommended headers: item_id, category, item, ralph_status, june_status." }, 409);
+        if ([idCol, categoryCol, itemCol, ralphCol, juneCol].some((value) => value < 0)) return jsonResponse({ success: false, error: "Checklist tab needs item ID, category, item, Ralph status and June status columns." }, 409);
         if (request.method === "GET") {
           const checklistItems = rows.slice(1).filter((row) => row[idCol]?.trim() && row[itemCol]?.trim()).map((row) => ({ item_id: row[idCol], category: row[categoryCol] || "Other", item: row[itemCol], ralph_status: row[ralphCol] || "", june_status: row[juneCol] || "" }));
           return jsonResponse({ success: true, checklistItems, tripId: trip.id });
         }
         const itemId = typeof body.item_id === "string" ? body.item_id.trim() : "";
         const status = typeof body.status === "string" ? body.status : "";
-        if (!itemId || itemId.length > 150 || !["", "✓", "x"].includes(status)) return jsonResponse({ success: false, error: "Invalid checklist status." }, 400);
+        if (!itemId || !["", "✓", "x"].includes(status)) return jsonResponse({ success: false, error: "Invalid checklist status." }, 400);
         const statusCol = session.email.toLowerCase() === "koochanyee@gmail.com" ? ralphCol : session.email.toLowerCase() === "wookahwai@gmail.com" ? juneCol : -1;
         if (statusCol < 0) return jsonResponse({ success: false, error: "This account is not assigned a checklist profile." }, 403);
         const matches: number[] = [];
         rows.slice(1).forEach((row, index) => { if (row[idCol] === itemId) matches.push(index + 2); });
-        if (matches.length !== 1) return jsonResponse({ success: false, error: matches.length ? "Duplicate checklist item IDs found." : "Checklist item not found." }, 409);
+        if (matches.length !== 1) return jsonResponse({ success: false, error: "Checklist item not found or duplicated." }, 409);
         let column = ""; let n = statusCol + 1;
         while (n > 0) { const rem = (n - 1) % 26; column = String.fromCharCode(65 + rem) + column; n = Math.floor((n - 1) / 26); }
-        const writeUrl = `${sheetsValuesUrl(trip.sheetId, `${quoteSheetTab(tab)}!${column}${matches[0]}`)}?valueInputOption=RAW`;
-        const write = await fetch(writeUrl, { method: "PUT", headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" }, body: JSON.stringify({ values: [[status]] }) });
+        const write = await fetch(`${sheetsValuesUrl(trip.sheetId, `${quoteSheetTab(tab)}!${column}${matches[0]}`)}?valueInputOption=RAW`, { method: "PUT", headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" }, body: JSON.stringify({ values: [[status]] }) });
         if (!write.ok) return jsonResponse({ success: false, error: "Could not sync checklist status to Google Sheets." }, 502);
         return jsonResponse({ success: true, item_id: itemId, status, tripId: trip.id });
       } catch (error) { return jsonResponse({ success: false, error: error instanceof Error ? error.message : "Could not access the shared checklist." }, 500); }
@@ -1425,6 +1561,7 @@ export default {
         }
 
         const sessionTab = await findExistingTab(tokenData.access_token, trip.sheetId, ["SESSION LOCATION", "SESSION LOCATIONS"], "SESSION LOCATION");
+        await ensureSheetTab(tokenData.access_token, trip.sheetId, sessionTab, ["Date", "Session", "Planned location"]);
         const sheetId = encodeURIComponent(trip.sheetId);
         const readRange = `${quoteSheetTab(sessionTab)}!A:C`;
         const readUrl =
@@ -1490,14 +1627,19 @@ export default {
           }
         });
 
+        if (matches.length === 0 && !oldLocation) {
+          const appendUrl = `${sheetsValuesUrl(trip.sheetId, `${quoteSheetTab(sessionTab)}!A:C`)}:append?valueInputOption=RAW&insertDataOption=INSERT_ROWS`;
+          const appendResponse = await fetch(appendUrl, { method: "POST", headers: { Authorization: `Bearer ${tokenData.access_token}`, "Content-Type": "application/json" }, body: JSON.stringify({ values: [[date, sessionName, newLocation]] }) });
+          if (!appendResponse.ok) return jsonResponse({ success: false, error: "Could not add this session location to Google Sheets." }, 502);
+          return jsonResponse({ success: true, message: "Session location added.", date, session: sessionName, oldLocation: "", newLocation }, 200);
+        }
         if (matches.length !== 1) {
           return jsonResponse(
             {
               success: false,
-              error:
-                matches.length === 0
-                  ? "Session row not found. Refresh the itinerary and try again."
-                  : "Duplicate date and session rows found. Please correct SESSION LOCATIONS first.",
+              error: matches.length === 0
+                ? "Session row not found for the existing location. Refresh the itinerary and try again."
+                : "Duplicate date and session rows found. Please correct SESSION LOCATIONS first.",
             },
             409,
           );
@@ -1750,6 +1892,7 @@ export default {
           trip_date?: unknown;
           attraction?: unknown;
           content?: unknown;
+          photos?: Array<{ name?: unknown; mime_type?: unknown; data_base64?: unknown }>;
         };
 
         const memoryId =
@@ -1817,6 +1960,19 @@ export default {
           });
         }
 
+        const photos = Array.isArray(body.photos) ? body.photos : [];
+        if (photos.length > 4) return jsonResponse({ success: false, error: "Choose up to 4 photos per memory." }, 400);
+        let encodedTotal = 0;
+        for (const photo of photos) {
+          const encoded = typeof photo.data_base64 === "string" ? photo.data_base64.replace(/^data:image\/[^;]+;base64,/, "") : "";
+          encodedTotal += encoded.length;
+          if (!encoded || encoded.length > 5_600_000) return jsonResponse({ success: false, error: "Each photo must be 4 MB or smaller." }, 400);
+        }
+        if (encodedTotal > 14_000_000) return jsonResponse({ success: false, error: "Total photo size must be under 10 MB per memory." }, 400);
+        const otherTraveller = session.email.toLowerCase() === "koochanyee@gmail.com" ? "wookahwai@gmail.com" : "koochanyee@gmail.com";
+        const photoIds: string[] = [];
+        for (const photo of photos) photoIds.push(await uploadSharedMemoryPhoto(tokenData.access_token, photo, otherTraveller));
+        const photoIdsValue = photoIds.length ? JSON.stringify(photoIds) : "";
         const createdAt = new Date().toISOString();
         const appendUrl =
           `${sheetUrl}:append?valueInputOption=RAW&insertDataOption=INSERT_ROWS`;
@@ -1836,7 +1992,7 @@ export default {
               content,
               createdAt,
               createdAt,
-              "",
+              photoIdsValue,
             ]],
           }),
         });
@@ -1860,12 +2016,12 @@ export default {
             content,
             created_at: createdAt,
             updated_at: createdAt,
-            photo_ids: "",
+            photo_ids: photoIdsValue,
           },
         });
-      } catch {
+      } catch (error) {
         return jsonResponse(
-          { success: false, error: "An unexpected error occurred while accessing memories." },
+          { success: false, error: error instanceof Error ? error.message : "An unexpected error occurred while accessing memories." },
           500,
         );
       }
