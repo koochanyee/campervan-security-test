@@ -991,8 +991,8 @@ export default {
       } catch (error) { return jsonResponse({ success: false, error: error instanceof Error ? error.message : "Could not manage trips." }, 500); }
     }
 
-    // Shared trip expenses. Read FINAL EXPENSES as-is; create TRIP EXPENSES only
-    // when the user saves a new app expense, never as a prerequisite for loading.
+    // Shared trip expenses. Load both the existing FINAL EXPENSES planning rows
+    // and valid app-entered rows from TRIP EXPENSES. Never modify FINAL EXPENSES.
     if (url.pathname === "/api/expenses" && (request.method === "GET" || request.method === "POST")) {
       const session = await readSession(request, env);
       if (!session) return jsonResponse({ success: false, error: "Authentication required." }, 401);
@@ -1005,50 +1005,88 @@ export default {
         const token = await googleAccessToken(session, env);
         const tab = "TRIP EXPENSES";
         if (request.method === "POST") await ensureSheetTab(token, trip.sheetId, tab, EXPENSE_HEADERS);
-        let loggedExpenses: Array<Record<string, unknown>> = [];
+
         if (request.method === "GET") {
+          const loggedExpenses: Array<Record<string, unknown>> = [];
           const existingTab = await findExistingTab(token, trip.sheetId, [tab], "");
           if (existingTab) {
             const rows = await readSheetRows(token, trip.sheetId, existingTab);
             const header = (rows[0] || []).map((cell) => cell.trim().toLowerCase());
             const idx = (name: string) => header.indexOf(name);
-            loggedExpenses = rows.slice(1).filter((row) => idx("expense_id") >= 0 && row[idx("expense_id")]?.trim()).map((row) => ({
-              expense_id: row[idx("expense_id")] || "", date: row[idx("date")] || "", description: row[idx("description")] || "", category: row[idx("category")] || "Other",
-              amount: Number(row[idx("amount")] || 0), currency: row[idx("currency")] || "NZD", paid_by: row[idx("paid_by")] || "Ralph", expense_type: row[idx("expense_type")] || "actual-trip", notes: row[idx("notes")] || "", source: "TRIP EXPENSES",
-            }));
+            const idIdx = idx("expense_id"), dateIdx = idx("date"), descIdx = idx("description");
+            const amountIdx = idx("amount"), currencyIdx = idx("currency"), paidByIdx = idx("paid_by");
+            const categoryIdx = idx("category"), notesIdx = idx("notes");
+            rows.slice(1).forEach((row) => {
+              const expenseId = idIdx >= 0 ? String(row[idIdx] || "").trim() : "";
+              const description = descIdx >= 0 ? String(row[descIdx] || "").trim() : "";
+              const amountText = amountIdx >= 0 ? String(row[amountIdx] || "").replace(/,/g, "").replace(/[^0-9.-]/g, "") : "";
+              const amount = Number(amountText);
+              // Ignore partial/test rows: they are not usable expense records and
+              // otherwise appear as blank cards in the frontend.
+              if (!expenseId || !description || !Number.isFinite(amount) || amount <= 0) return;
+              const date = dateIdx >= 0 ? String(row[dateIdx] || "").trim() : "";
+              const inferredType = date >= "2026-11-07" ? "actual-trip" : "pre-trip";
+              loggedExpenses.push({
+                expense_id: expenseId,
+                date,
+                description,
+                category: categoryIdx >= 0 ? String(row[categoryIdx] || "Other") : "Other",
+                amount,
+                currency: currencyIdx >= 0 ? String(row[currencyIdx] || "NZD") : "NZD",
+                paid_by: paidByIdx >= 0 ? String(row[paidByIdx] || "Ralph") : "Ralph",
+                // Date is the source of truth for the trip boundary: before 7 Nov is
+                // pre-trip; 7 Nov onward is actual-trip, even if an old row has a stale type.
+                expense_type: inferredType,
+                notes: notesIdx >= 0 ? String(row[notesIdx] || "") : "",
+                source: "TRIP EXPENSES",
+              });
+            });
           }
-          let plannedExpenses: Array<Record<string, unknown>> = [];
-          try {
-            const planningTab = await findExistingTab(token, trip.sheetId, ["FINAL EXPENSES", "Final Expenses"], "");
-            if (planningTab) {
-              const planningRows = await readSheetRows(token, trip.sheetId, planningTab);
-              let group = "Pre-trip";
-              plannedExpenses = planningRows.slice(3, 27).flatMap((row, index) => {
-                const sheetRow = index + 4;
-                const description = String(row[0] || "").trim();
-                const amountText = String(row[1] || "").replace(/,/g, "").replace(/[^0-9.-]/g, "");
-                const amount = Number(amountText);
-                if (description && (!Number.isFinite(amount) || amount <= 0)) { group = description; return []; }
-                if (!description || !Number.isFinite(amount) || amount <= 0) return [];
-                const charges = [
-                  row[5] ? `Sep charged: MYR ${row[5]}` : "",
-                  row[6] ? `Oct charged: MYR ${row[6]}` : "",
-                  row[7] ? `Nov charged: MYR ${row[7]}` : "",
-                  row[8] !== undefined && row[8] !== "" ? `Balance: MYR ${row[8]}` : "",
-                  row[9] ? String(row[9]) : "",
-                ].filter(Boolean);
-                return [{
-                  expense_id: `planned-final-expenses-row-${sheetRow}`, date: "", description, category: group, amount,
-                  currency: "MYR", paid_by: String(row[3] || "Shared"), expense_type: "pre-trip",
-                  notes: [row[4] === "TRUE" ? "Booked: Yes" : row[4] === "FALSE" ? "Booked: No" : "", ...charges].filter(Boolean).join(" · "), source: "FINAL EXPENSES",
-                }];
+
+          const plannedExpenses: Array<Record<string, unknown>> = [];
+          const planningTab = await findExistingTab(token, trip.sheetId, ["FINAL EXPENSES", "Final Expenses"], "");
+          if (planningTab) {
+            const planningRows = await readSheetRows(token, trip.sheetId, planningTab);
+            let group = "Pre-trip";
+            for (let i = 0; i < planningRows.length; i++) {
+              const row = planningRows[i] || [];
+              const description = String(row[0] || "").trim();
+              const amountText = String(row[1] || "").replace(/,/g, "").replace(/[^0-9.-]/g, "");
+              const amount = Number(amountText);
+              const rowLabel = description.toLowerCase().replace(/[^a-z0-9]/g, "");
+              if (rowLabel === "total" || rowLabel === "grandtotal") break;
+              if (!description) continue;
+              if (["item", "itemlist", "description", "category", "expense", "expenses"].includes(rowLabel)) continue;
+              if (!Number.isFinite(amount) || amount <= 0) {
+                // Category title rows have a label in column A and no total cost.
+                group = description;
+                continue;
+              }
+              const splitText = String(row[2] || "").replace(/,/g, "").replace(/[^0-9.-]/g, "");
+              const splitShare = Number(splitText);
+              const paidBy = String(row[3] || "Shared").trim() || "Shared";
+              const paidFlag = String(row[4] ?? "").trim().toUpperCase();
+              const notes = [row[9] ? String(row[9]).trim() : ""].filter(Boolean).join(" · ");
+              const sheetRow = i + 1;
+              plannedExpenses.push({
+                expense_id: `planned-final-expenses-row-${sheetRow}`,
+                date: "",
+                description,
+                category: group,
+                amount,
+                split_share: Number.isFinite(splitShare) && splitText ? splitShare : amount / 2,
+                currency: "MYR",
+                paid_by: paidBy,
+                expense_type: "pre-trip",
+                payment_status: ["TRUE", "✓", "☑", "1"].includes(paidFlag) ? "Paid" : "Estimate",
+                notes,
+                source: "FINAL EXPENSES",
               });
             }
-          } catch (error) {
-            console.error("Could not read FINAL EXPENSES:", error instanceof Error ? error.message : String(error));
           }
-          return jsonResponse({ success: true, expenses: [...plannedExpenses, ...loggedExpenses], tripId: trip.id });
+          return jsonResponse({ success: true, expenses: [...plannedExpenses, ...loggedExpenses], tripId: trip.id, sources: { planned: "FINAL EXPENSES", actual: existingTab || null } });
         }
+
         const rows = await readSheetRows(token, trip.sheetId, tab);
         const expenseId = typeof body.expense_id === "string" ? body.expense_id.trim() : "";
         const date = typeof body.date === "string" ? body.date.trim() : "";
@@ -1057,13 +1095,16 @@ export default {
         const amount = Number(body.amount);
         const currency = typeof body.currency === "string" ? body.currency.trim().toUpperCase() : "NZD";
         const paidBy = typeof body.paid_by === "string" ? body.paid_by.trim() : "";
-        const expenseType = body.expense_type;
+        const expenseType = date >= "2026-11-07" ? "actual-trip" : "pre-trip";
         const notes = typeof body.notes === "string" ? body.notes.trim() : "";
         if (!expenseId || expenseId.length > 100 || !date || !description || description.length > 250 || !Number.isFinite(amount) || amount <= 0 || !["pre-trip", "actual-trip"].includes(String(expenseType)) || !["Ralph", "June", "Shared"].includes(paidBy) || !/^[A-Z]{3}$/.test(currency) || category.length > 100 || notes.length > 2000) return jsonResponse({ success: false, error: "Invalid expense details." }, 400);
         if (rows.slice(1).some((row) => row[0] === expenseId)) return jsonResponse({ success: true, duplicate: true, message: "Expense already saved." });
         const appendUrl = `${sheetsValuesUrl(trip.sheetId, `${quoteSheetTab(tab)}!A:J`)}:append?valueInputOption=RAW&insertDataOption=INSERT_ROWS`;
         const append = await fetch(appendUrl, { method: "POST", headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" }, body: JSON.stringify({ values: [[expenseId, date, description, category, amount, currency, paidBy, expenseType, notes, new Date().toISOString()]] }) });
-        if (!append.ok) return jsonResponse({ success: false, error: "Could not save the expense to Google Sheets." }, 502);
+        if (!append.ok) {
+          const detail = (await append.text().catch(() => "")).slice(0, 400);
+          return jsonResponse({ success: false, error: `Could not save the expense to Google Sheets (HTTP ${append.status}). ${detail}` }, 502);
+        }
         return jsonResponse({ success: true, message: "Expense saved.", tripId: trip.id }, 201);
       } catch (error) { return jsonResponse({ success: false, error: error instanceof Error ? error.message : "Could not access trip expenses." }, 500); }
     }
@@ -1099,20 +1140,56 @@ export default {
         if (!mainTab) return jsonResponse({ success: false, error: "Could not find the existing pre-trip checklist tab ‘Thing to do n bring’ in the selected workbook." }, 404);
         const rows = await readSheetRows(token, trip.sheetId, mainTab);
         const norm = (value: string) => value.toLowerCase().replace(/[^a-z0-9]/g, "");
-        const first = rows[0] || [];
-        if (norm(first[0] || "") !== "category" || norm(first[1] || "") !== "item") return jsonResponse({ success: false, error: `The tab “${mainTab}” was found, but its first row did not match the expected Category / Item headers.` }, 409);
+        const header = rows[0] || [];
+        const findHeader = (tests: string[]) => header.findIndex((cell) => tests.includes(norm(String(cell || ""))));
+        const categoryIdx = Math.max(0, findHeader(["category"]));
+        const itemIdx = findHeader(["item"]) >= 0 ? findHeader(["item"]) : 1;
+        const qtyIdx = findHeader(["qty", "quantity"]) >= 0 ? findHeader(["qty", "quantity"]) : 2;
+        const ralphIdx = findHeader(["ralph"]);
+        const juneIdx = findHeader(["june"]);
+        const notesIdx = findHeader(["notes"]) >= 0 ? findHeader(["notes"]) : (ralphIdx >= 0 ? 5 : 4);
+        // Legacy workbook has a blank header in D and a checkbox there; newer
+        // layout may use D/E for Ralph/June, in which case D is not must-have.
+        const mustHaveIdx = header[3]?.trim() ? -1 : 3;
+        const todoIdx = findHeader(["thingstodo", "todo", "task"]) >= 0 ? findHeader(["thingstodo", "todo", "task"]) : 8;
+        const dueIdx = findHeader(["duedate", "due", "month"]) >= 0 ? findHeader(["duedate", "due", "month"]) : Math.max(0, todoIdx - 1);
+        if (norm(String(header[categoryIdx] || "")) !== "category" || norm(String(header[itemIdx] || "")) !== "item") {
+          return jsonResponse({ success: false, error: `The tab “${mainTab}” was found, but its first row did not match the expected Category / Item headers.` }, 409);
+        }
         let currentCategory = "Other";
+        const savedStatus = (itemId: string, key: "ralph_status" | "june_status", row: string[], statusCol: number) => {
+          const itemStatuses = statuses[itemId] || {};
+          if (Object.prototype.hasOwnProperty.call(itemStatuses, key)) return itemStatuses[key] || "";
+          return statusCol >= 0 ? String(row[statusCol] || "").trim() : "";
+        };
         rows.slice(1).forEach((row, index) => {
           const sheetRow = index + 2;
-          const categoryCell = String(row[0] || "").trim();
+          const categoryCell = String(row[categoryIdx] || "").trim();
           if (categoryCell) currentCategory = categoryCell;
-          const packItem = String(row[1] || "").trim();
-          const mustHave = ["TRUE", "✓", "☑", "1"].includes(String(row[3] || "").trim().toUpperCase());
-          if (packItem) result.push({ item_id: `pack-${sheetRow}`, category: currentCategory, item: packItem, quantity: String(row[2] || "").trim(), notes: String(row[4] || "").trim(), must_have: mustHave, checklist_type: "packing", ralph_status: statuses[`pack-${sheetRow}`]?.ralph_status || "", june_status: statuses[`pack-${sheetRow}`]?.june_status || "" });
-          const todoItem = String(row[8] || "").trim();
-          if (todoItem) result.push({ item_id: `todo-${sheetRow}`, category: "Things to do", item: todoItem, due_date: String(row[7] || "").trim(), checklist_type: "todo", ralph_status: statuses[`todo-${sheetRow}`]?.ralph_status || "", june_status: statuses[`todo-${sheetRow}`]?.june_status || "" });
+          const packItem = String(row[itemIdx] || "").trim();
+          const mustHave = mustHaveIdx >= 0 && ["TRUE", "✓", "☑", "1"].includes(String(row[mustHaveIdx] || "").trim().toUpperCase());
+          if (packItem) {
+            const itemId = `pack-${sheetRow}`;
+            result.push({
+              item_id: itemId, category: currentCategory, item: packItem,
+              quantity: String(row[qtyIdx] || "").trim(), notes: String(row[notesIdx] || "").trim(),
+              must_have: mustHave, checklist_type: "packing",
+              ralph_status: savedStatus(itemId, "ralph_status", row, ralphIdx),
+              june_status: savedStatus(itemId, "june_status", row, juneIdx),
+            });
+          }
+          const todoItem = String(row[todoIdx] || "").trim();
+          if (todoItem) {
+            const itemId = `todo-${sheetRow}`;
+            result.push({
+              item_id: itemId, category: "Things to do", item: todoItem,
+              due_date: String(row[dueIdx] || "").trim(), checklist_type: "todo",
+              ralph_status: savedStatus(itemId, "ralph_status", row, -1),
+              june_status: savedStatus(itemId, "june_status", row, -1),
+            });
+          }
         });
-        const groceryTab = await findExistingTab(token, trip.sheetId, ["Shopping List or Things to Bring", "Shopping List or Things to Brin"], "");
+        const groceryTab = await findExistingTab(token, trip.sheetId, ["Shopping List or Things to Brin", "Shopping List or Things to Bring"], "");
         if (groceryTab) {
           const groceryRows = await readSheetRows(token, trip.sheetId, groceryTab);
           let groceryCategory = "Pack ’n Save";
@@ -1815,7 +1892,7 @@ export default {
           );
         }
 
-        const memoryTab = await findExistingTab(tokenData.access_token, trip.sheetId, ["TRIP MEMORIES", "TRIP_MEMORIES"], "TRIP MEMORIES");
+        const memoryTab = await findExistingTab(tokenData.access_token, trip.sheetId, ["TRIP_MEMORIES", "TRIP MEMORIES"], "TRIP_MEMORIES");
         await ensureSheetTab(tokenData.access_token, trip.sheetId, memoryTab, ["memory_id", "trip_date", "attraction", "author_email", "content", "created_at", "updated_at", "photo_ids"]);
         const range = encodeURIComponent(`${quoteSheetTab(memoryTab)}!A:H`);
         const sheetUrl =
