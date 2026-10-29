@@ -190,6 +190,15 @@ function App() {
     try { return typeof window === "undefined" || window.localStorage.getItem("campervan-show-highlight-photo") !== "false"; }
     catch { return true; }
   });
+  const [dataSaverMode, setDataSaverMode] = useState(() => {
+    try { return typeof window !== "undefined" && window.localStorage.getItem("campervan-data-saver") === "true"; }
+    catch { return false; }
+  });
+
+  useEffect(() => {
+    try { window.localStorage.setItem("campervan-data-saver", String(dataSaverMode)); }
+    catch { /* Preference remains usable for this session if browser storage is unavailable. */ }
+  }, [dataSaverMode]);
 
   useEffect(() => {
     try { window.localStorage.setItem("campervan-show-highlight-photo", String(showHighlightPhoto)); }
@@ -427,7 +436,7 @@ function App() {
       setIsLoadingItinerary(true);
       setItineraryError("");
       try {
-        const response = await fetch(`/api/itinerary?tripId=${encodeURIComponent(selectedTripId)}`, {
+        const response = await fetch(`/api/itinerary?tripId=${encodeURIComponent(selectedTripId)}&lite=${dataSaverMode ? "1" : "0"}`, {
           method: "GET",
           credentials: "same-origin",
           cache: "no-store",
@@ -444,7 +453,14 @@ function App() {
           const rows = Array.isArray(result.data) ? result.data : [];
           setItineraryRows(rows);
           setSupplementaryTabs(result.supplementaryTabs ?? {});
-          setActiveDayIndex(0);
+          const dateRow = rows[0] ?? {};
+          const dateKeys = Object.keys(dateRow).slice(1);
+          const now = new Date();
+          const todayIndex = dateKeys.findIndex((key) => {
+            const parsed = parseTripDate(String(dateRow[key] ?? ""));
+            return Boolean(parsed && dateIsSameDay(parsed, now));
+          });
+          setActiveDayIndex(todayIndex >= 0 ? todayIndex : 0);
           setItineraryError("");
               setAuthMessage("Signed in. Itinerary loaded from Google Sheets.");
         }
@@ -651,7 +667,9 @@ function App() {
     } catch (error) {
       const message = error instanceof Error ? error.message : "Could not save this memory.";
       setMemoryMessage(message);
-      if (memoryPhotoFiles.length > 0 && /drive|permission|authorization|scope|access/i.test(message)) {
+      // Only start OAuth for explicit authentication/scope failures. Folder sharing
+      // or ordinary Drive API errors must not send the user through reconnect again.
+      if (memoryPhotoFiles.length > 0 && /Google Sheets is not connected|Google access failed|authorization is missing the required upload scope|invalid_grant/i.test(message)) {
         setShowDriveAccessModal(true);
       }
     } finally {
@@ -699,6 +717,8 @@ function App() {
   const checklistCompletedCount = checklistItems.filter((item) => item[currentChecklistField] === "✓").length;
   const preTripExpenses = expenses.filter((expense) => expense.expense_type === "pre-trip");
   const actualTripExpenses = expenses.filter((expense) => expense.expense_type === "actual-trip");
+  const paidOrActualExpenses = expenses.filter((expense) => expense.source !== "FINAL EXPENSES" || expense.payment_status === "Paid");
+  const paidPreTripExpenses = paidOrActualExpenses.filter((expense) => expense.expense_type === "pre-trip");
   const formatMoney = (amount: number, currency: string) => `${currency || "NZD"} ${Number(amount || 0).toFixed(2)}`;
   const formatExpenseTotal = (records: TripExpense[]) => {
     const totals = records.reduce<Record<string, number>>((acc, item) => {
@@ -882,7 +902,7 @@ function App() {
 
   return (
     <div className="min-h-screen bg-[#f4f6f4] pb-40 text-slate-900">
-      <style>{`@keyframes itinerarySlideIn { from { opacity: .65; transform: translateX(10px); } to { opacity: 1; transform: translateX(0); } }`}</style>
+      <style>{`@keyframes itinerarySlideIn { from { opacity: .65; transform: translateX(10px); } to { opacity: 1; transform: translateX(0); } } @keyframes travelLoadingMove { 0% { transform: translateX(-8vw); } 100% { transform: translateX(108vw); } } @keyframes travelLoadingFloat { 0%,100% { transform: translateY(0); } 50% { transform: translateY(-4px); } } @media (prefers-reduced-motion: reduce) { .travel-loading-vehicle { animation: none !important; } }`}</style>
       <header className="border-b border-slate-200 bg-white">
         <div className="mx-auto flex max-w-6xl flex-col gap-3 px-4 py-4 sm:flex-row sm:items-center sm:justify-between sm:px-6">
           <button type="button" onClick={() => setActiveView("home")} className="text-left">
@@ -891,6 +911,7 @@ function App() {
             <p className="mt-1 text-sm text-slate-500">{dateRange}</p>
           </button>
           <div className="flex flex-wrap items-center gap-2">
+            {verifiedEmail && selectedTripId && <button type="button" aria-pressed={dataSaverMode} onClick={() => setDataSaverMode((enabled) => !enabled)} className={`rounded-lg border px-3 py-2 text-sm font-semibold ${dataSaverMode ? "border-emerald-800 bg-emerald-50 text-emerald-900" : "border-slate-300 bg-white text-slate-700"}`} title="Lite mode loads the main itinerary without supplementary worksheets">{dataSaverMode ? "Lite mode: On" : "Lite mode: Off"}</button>}
             {verifiedEmail && <span className="text-sm font-semibold text-slate-700">Welcome, {welcomeName}</span>}
             {verifiedEmail && selectedTripId && activeView !== "home" && (
               <button type="button" onClick={goBack} className="rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm font-semibold hover:bg-slate-50">← Back</button>
@@ -980,7 +1001,7 @@ function App() {
               </div>
             )}
 
-            {selectedTripId && isLoadingItinerary && <div className="rounded-xl border border-slate-200 bg-white p-5 text-sm text-slate-600" role="status">Loading your trip details…</div>}
+            {selectedTripId && isLoadingItinerary && <div className="overflow-hidden rounded-2xl border border-slate-200 bg-white p-5 text-sm text-slate-600" role="status" aria-live="polite"><p className="font-semibold text-slate-800">Getting your journey ready…</p><div className="relative mt-4 h-12 overflow-hidden rounded-xl bg-sky-50"><div className="absolute inset-x-0 bottom-2 border-t-2 border-dashed border-sky-200" /><span className="travel-loading-vehicle absolute bottom-1 text-2xl" style={{ animation: "travelLoadingMove 3.2s linear infinite, travelLoadingFloat .7s ease-in-out infinite alternate" }}>🚐</span><span className="travel-loading-vehicle absolute right-4 top-1 text-xl" style={{ animation: "travelLoadingFloat 1.1s ease-in-out infinite" }}>✈️</span></div><p className="mt-3 text-xs text-slate-500">Loading the trip plan…</p></div>}
 
             {!isLoadingItinerary && !itineraryError && activeView === "home" && (
               <div className="space-y-6">
@@ -1126,7 +1147,7 @@ function App() {
                   <div>
                     <p className="text-xs font-bold uppercase tracking-[0.16em] text-emerald-800">Daily itinerary</p>
                     <h2 className="mt-1 text-xs font-medium text-slate-500">Swipe or tap a day</h2>
-                    <p className="mt-1 text-sm text-slate-500">{tripDays.length} travel days · details read live from Google Sheets</p>
+                    <p className="mt-1 text-sm text-slate-500">{tripDays.length} travel days · {dataSaverMode ? "main itinerary only (Lite mode)" : "itinerary and supplementary notes"}</p>
                   </div>
                   <button type="button" onClick={() => setActiveView("home")} className="rounded-lg border border-slate-300 px-3 py-2 text-sm font-semibold hover:bg-slate-50">← Dashboard</button>
                 </div>
@@ -1138,10 +1159,10 @@ function App() {
                       {tripDays.map((day, index) => {
                         const selected = index === safeDayIndex;
                         return (
-                          <button key={day.key} type="button" aria-pressed={selected} onClick={() => setActiveDayIndex(index)} className={`min-w-[100px] shrink-0 rounded-xl border p-3 text-left transition ${selected ? "border-emerald-700 bg-emerald-50 ring-1 ring-emerald-700" : "border-slate-200 bg-white hover:border-emerald-300"}`}>
-                            <span className={`block text-xs font-bold ${selected ? "text-emerald-800" : "text-slate-500"}`}>{day.weekday}</span>
+                          <button key={day.key} type="button" aria-pressed={selected} onClick={() => setActiveDayIndex(index)} className={`min-w-[100px] shrink-0 rounded-xl border p-3 text-left transition ${day.dateObject && dateIsSameDay(day.dateObject, today) ? "border-amber-400 bg-amber-50 ring-1 ring-amber-300" : selected ? "border-emerald-700 bg-emerald-50 ring-1 ring-emerald-700" : "border-slate-200 bg-white hover:border-emerald-300"}`}>
+                            <span className={`block text-xs font-bold ${day.dateObject && dateIsSameDay(day.dateObject, today) ? "text-amber-800" : selected ? "text-emerald-800" : "text-slate-500"}`}>{day.weekday}</span>
                             <span className="mt-1 block font-semibold">{day.date}</span>
-                            <span className="mt-1 block text-xs text-slate-500">Day {index + 1}</span>
+                            <span className="mt-1 block text-xs text-slate-500">{day.dateObject && dateIsSameDay(day.dateObject, today) ? "★ TODAY" : `Day ${index + 1}`}</span>
                           </button>
                         );
                       })}
@@ -1153,7 +1174,7 @@ function App() {
                       <section key={selectedDay.key} style={{ animation: "itinerarySlideIn 200ms ease-out" }} className="overflow-hidden rounded-2xl border border-slate-200 transition-all duration-300">
                         <div className="flex flex-wrap items-center justify-between gap-3 bg-slate-50 px-4 py-4 sm:px-5">
                           <div>
-                            <p className="text-xs font-bold uppercase tracking-[0.15em] text-emerald-800">{selectedDay.weekday} · Day {safeDayIndex + 1}</p>
+                            <p className={`text-xs font-bold uppercase tracking-[0.15em] ${selectedDay.dateObject && dateIsSameDay(selectedDay.dateObject, today) ? "text-amber-800" : "text-emerald-800"}`}>{selectedDay.weekday} · Day {safeDayIndex + 1}{selectedDay.dateObject && dateIsSameDay(selectedDay.dateObject, today) ? " · TODAY" : ""}</p>
                             <h3 className="mt-1 text-xl font-bold">{selectedDay.date}</h3>
                           </div>
                           <div className="flex gap-2">
@@ -1494,13 +1515,13 @@ function App() {
                   <div className="grid gap-3 sm:grid-cols-3">
                     <div className="rounded-xl border border-slate-200 p-4"><p className="text-xs font-semibold uppercase text-slate-500">Pre-trip estimate / paid</p><p className="mt-2 text-xl font-bold">{formatExpenseTotal(preTripExpenses.filter((expense) => expense.share_type !== "personal"))}</p><p className="mt-1 text-xs text-slate-500">Planned bookings and advance payments</p></div>
                     <div className="rounded-xl border border-slate-200 p-4"><p className="text-xs font-semibold uppercase text-slate-500">Actual shared spending</p><p className="mt-2 text-xl font-bold">{formatExpenseTotal(actualTripExpenses.filter((expense) => expense.share_type !== "personal"))}</p><p className="mt-1 text-xs text-slate-500">During the trip, split 50:50</p></div>
-                    <div className="rounded-xl border border-slate-200 p-4"><p className="text-xs font-semibold uppercase text-slate-500">Personal spending</p><p className="mt-2 text-xl font-bold">{formatExpenseTotal(expenses.filter((expense) => expense.share_type === "personal"))}</p><p className="mt-1 text-xs text-slate-500">Not included in the shared split</p></div>
+                    <div className="rounded-xl border border-slate-200 p-4"><p className="text-xs font-semibold uppercase text-slate-500">Personal spending</p><p className="mt-2 text-xl font-bold">{formatExpenseTotal(paidOrActualExpenses.filter((expense) => expense.share_type === "personal"))}</p><p className="mt-1 text-xs text-slate-500">Not included in the shared split</p></div>
                   </div>
                   <div className="grid grid-cols-3 gap-2" role="tablist" aria-label="Expense sections">
                     {([['pre-trip','Pre-trip'],['actual-trip','Actual trip'],['personal','Personal']] as const).map(([tab,label]) => <button key={tab} type="button" role="tab" aria-selected={expenseTab === tab} onClick={() => { setExpenseTab(tab); setExpenseShareType(tab === "personal" ? "personal" : "shared"); if (tab === "pre-trip") setExpenseType("pre-trip"); else if (tab === "actual-trip") setExpenseType("actual-trip"); }} className={`rounded-xl border px-3 py-3 text-sm font-semibold ${expenseTab === tab ? "border-emerald-800 bg-emerald-800 text-white" : "border-slate-300 bg-white text-slate-700"}`}>{label}</button>)}
                   </div>
-                  {expenseTab === "pre-trip" && <section className="rounded-xl border border-slate-200 p-4"><h3 className="font-semibold">Pre-trip category summary</h3><div className="mt-3 grid gap-2 sm:grid-cols-2">{["Camping site", "Hotel stay", "Activity", "Other"].map((category) => { const matches = preTripExpenses.filter((expense) => expense.share_type !== "personal" && (category === "Camping site" ? /camp|campsite|holiday park/i.test(expense.category + " " + expense.description) : category === "Hotel stay" ? /hotel|accommodation|motel|lodge/i.test(expense.category + " " + expense.description) : category === "Activity" ? /activity|ticket|tour|attraction|booking/i.test(expense.category + " " + expense.description) : !/camp|campsite|holiday park|hotel|accommodation|motel|lodge|activity|ticket|tour|attraction|booking/i.test(expense.category + " " + expense.description))); return <div key={category} className="flex items-center justify-between rounded-lg bg-slate-50 p-3"><span className="text-sm font-medium">{category}</span><span className="text-sm font-bold">{formatExpenseTotal(matches)}</span></div>; })}</div></section>}
-                  {expenseTab === "personal" && <section className="rounded-xl border border-slate-200 p-4"><h3 className="font-semibold">Trip expense summary</h3><div className="mt-3 grid gap-2 sm:grid-cols-3"><div className="rounded-lg bg-slate-50 p-3"><p className="text-xs text-slate-500">Shared expenses · 50:50</p><p className="mt-1 font-bold">{formatExpenseTotal(expenses.filter((expense) => expense.share_type !== "personal"))}</p></div><div className="rounded-lg bg-slate-50 p-3"><p className="text-xs text-slate-500">Personal expenses</p><p className="mt-1 font-bold">{formatExpenseTotal(expenses.filter((expense) => expense.share_type === "personal"))}</p></div><div className="rounded-lg bg-emerald-50 p-3"><p className="text-xs text-emerald-800">Total recorded trip expenses</p><p className="mt-1 font-bold">{formatExpenseTotal(expenses.filter((expense) => expense.source !== "FINAL EXPENSES" || expense.payment_status === "Paid"))}</p></div></div><p className="mt-2 text-xs text-slate-500">The total excludes unpaid estimates from FINAL EXPENSES; currencies are shown separately and are not converted.</p></section>}
+                  {expenseTab === "pre-trip" && <section className="rounded-xl border border-slate-200 p-4"><h3 className="font-semibold">Pre-trip category summary</h3><div className="mt-3 grid gap-2 sm:grid-cols-2">{["Camping site", "Hotel stay", "Activity", "Other"].map((category) => { const matches = paidPreTripExpenses.filter((expense) => expense.share_type !== "personal" && (category === "Camping site" ? /camp|campsite|holiday park/i.test(expense.category + " " + expense.description) : category === "Hotel stay" ? /hotel|accommodation|motel|lodge/i.test(expense.category + " " + expense.description) : category === "Activity" ? /activity|ticket|tour|attraction|booking/i.test(expense.category + " " + expense.description) : !/camp|campsite|holiday park|hotel|accommodation|motel|lodge|activity|ticket|tour|attraction|booking/i.test(expense.category + " " + expense.description))); const categoryColor = category === "Camping site" ? "bg-sky-50 border-sky-200 text-sky-900" : category === "Hotel stay" ? "bg-violet-50 border-violet-200 text-violet-900" : category === "Activity" ? "bg-amber-50 border-amber-200 text-amber-900" : "bg-emerald-50 border-emerald-200 text-emerald-900"; return <div key={category} className={`flex items-center justify-between rounded-lg border p-3 ${categoryColor}`}><span className="text-sm font-medium">{category}</span><span className="text-sm font-bold">{formatExpenseTotal(matches)}</span></div>; })}</div></section>}
+                  {expenseTab === "personal" && <section className="rounded-xl border border-slate-200 p-4"><h3 className="font-semibold">Trip expense summary</h3><p className="mt-1 text-xs text-slate-500">Paid pre-trip costs and actual trip costs only. Shared items are divided 50:50; each person's own personal costs are added to their share. Unpaid estimates are excluded.</p><div className="mt-3 grid gap-3 sm:grid-cols-2">{(["Ralph", "June"] as const).map((person) => { const personTotal = (type?: "pre-trip" | "actual-trip") => { const totals: Record<string, number> = {}; paidOrActualExpenses.filter((expense) => (!type || expense.expense_type === type)).forEach((expense) => { const currency = expense.currency || "NZD"; if (expense.share_type === "personal") { if (expense.paid_by !== person) return; totals[currency] = (totals[currency] || 0) + Number(expense.amount || 0); } else { totals[currency] = (totals[currency] || 0) + Number(expense.amount || 0) / 2; } }); return Object.entries(totals).length ? Object.entries(totals).map(([currency, total]) => formatMoney(total, currency)).join(" · ") : formatMoney(0, "NZD"); }; return <div key={person} className="rounded-xl border border-slate-200 p-3"><h4 className="font-semibold">{person} · estimated personal share</h4><div className="mt-2 flex justify-between gap-2 text-sm"><span className="text-slate-500">Paid pre-trip</span><strong>{personTotal("pre-trip")}</strong></div><div className="mt-1 flex justify-between gap-2 text-sm"><span className="text-slate-500">Actual trip</span><strong>{personTotal("actual-trip")}</strong></div><div className="mt-2 flex justify-between gap-2 border-t border-slate-100 pt-2 text-sm"><span className="font-semibold">Total</span><strong>{personTotal()}</strong></div></div>; })}</div><div className="mt-4 grid gap-2 sm:grid-cols-3"><div className="rounded-lg bg-slate-50 p-3"><p className="text-xs text-slate-500">Shared expenses · 50:50</p><p className="mt-1 font-bold">{formatExpenseTotal(paidOrActualExpenses.filter((expense) => expense.share_type !== "personal"))}</p></div><div className="rounded-lg bg-slate-50 p-3"><p className="text-xs text-slate-500">Personal expenses</p><p className="mt-1 font-bold">{formatExpenseTotal(expenses.filter((expense) => expense.share_type === "personal"))}</p></div><div className="rounded-lg bg-emerald-50 p-3"><p className="text-xs text-emerald-800">Total recorded trip expenses</p><p className="mt-1 font-bold">{formatExpenseTotal(paidOrActualExpenses)}</p></div></div><p className="mt-2 text-xs text-slate-500">The total excludes unpaid estimates from FINAL EXPENSES; currencies are shown separately and are not converted.</p></section>}
                   <form onSubmit={(event) => void saveExpense(event)} className="rounded-xl border border-slate-200 p-4">
                     <h3 className="font-semibold">Add {expenseTab === "pre-trip" ? "pre-trip expense" : expenseTab === "actual-trip" ? "actual trip expense" : "personal expense"}</h3>
                     <div className="mt-4 grid gap-3 sm:grid-cols-2">
@@ -1523,9 +1544,9 @@ function App() {
                     <label className="mt-4 block text-sm font-medium">Trip date</label><select value={memoryDate} onChange={(event) => setMemoryDate(event.target.value)} required className="mt-1 w-full rounded-lg border border-slate-300 px-3 py-2 text-sm">{!tripDays.some((day) => normalizeTripDate(day.date) === normalizeTripDate(memoryDate)) && <option value={memoryDate}>Today · {memoryDate}</option>}{tripDays.map((day) => <option key={day.key} value={day.date}>{day.date}</option>)}</select>
                     <label className="mt-3 block text-sm font-medium">Attraction / place</label><div className="mt-1 flex gap-2"><input value={memoryAttraction} onChange={(event) => setMemoryAttraction(event.target.value)} required maxLength={160} placeholder="e.g. Lake Tekapo" className="min-w-0 flex-1 rounded-lg border border-slate-300 px-3 py-2 text-sm" /><button type="button" onClick={() => void detectMemoryPlace()} disabled={isDetectingPlace} className="shrink-0 rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm font-semibold disabled:opacity-50">{isDetectingPlace ? "Locating…" : "📍 Use GPS"}</button></div>
                     <label className="mt-3 block text-sm font-medium">Memory</label><textarea value={memoryContent} onChange={(event) => setMemoryContent(event.target.value)} required maxLength={5000} rows={4} placeholder="What would you like to remember about this place?" className="mt-1 w-full rounded-lg border border-slate-300 px-3 py-2 text-sm" />
-                    <label className="mt-3 block text-sm font-medium">Photos</label><input type="file" accept="image/*" multiple onChange={(event) => setMemoryPhotoFiles(Array.from(event.target.files ?? []))} className="mt-1 block w-full rounded-lg border border-slate-300 p-2 text-sm file:mr-3 file:rounded-md file:border-0 file:bg-emerald-50 file:px-3 file:py-2 file:font-semibold file:text-emerald-800" />
+                    <label className="mt-3 block text-sm font-medium">Photos</label><div className="mt-2 grid gap-2 sm:grid-cols-2"><label className="cursor-pointer rounded-lg border border-slate-300 bg-white px-3 py-3 text-center text-sm font-semibold text-slate-700 hover:bg-slate-50">🖼️ Choose from gallery<input type="file" accept="image/*" multiple onChange={(event) => setMemoryPhotoFiles((current) => [...current, ...Array.from(event.target.files ?? [])].slice(0, 4))} className="sr-only" /></label><label className="cursor-pointer rounded-lg border border-emerald-300 bg-emerald-50 px-3 py-3 text-center text-sm font-semibold text-emerald-900 hover:bg-emerald-100">📷 Take a picture<input type="file" accept="image/*" capture="environment" onChange={(event) => setMemoryPhotoFiles((current) => [...current, ...Array.from(event.target.files ?? [])].slice(0, 4))} className="sr-only" /></label></div>
                     {memoryPhotoFiles.length > 0 && <div className="mt-2 flex flex-wrap gap-2">{memoryPhotoFiles.map((file, index) => <span key={`${file.name}-${index}`} className="rounded-lg bg-slate-100 px-2 py-1 text-xs text-slate-700">📷 {file.name}</span>)}</div>}
-                    <p className="mt-1 text-xs text-slate-500">Up to 4 photos, 4 MB each. First-time photo upload may require reconnecting Google Sheets to approve Drive file access.</p>
+                    <p className="mt-1 text-xs text-slate-500">Up to 4 photos, 4 MB each. If Drive access is not yet authorized, the app will ask you to reconnect once.</p>
                     <button type="submit" className="mt-3 rounded-lg bg-emerald-800 px-4 py-2.5 text-sm font-semibold text-white">Preview memory</button>
                   </form>
                   {memoryPreviewOpen && <section className="rounded-xl border border-emerald-300 bg-emerald-50/50 p-4"><p className="text-xs font-bold uppercase tracking-wide text-emerald-800">Preview — not saved yet</p><h3 className="mt-2 font-semibold">{memoryAttraction}</h3><p className="mt-1 text-xs text-slate-500">{memoryDate}</p><p className="mt-3 whitespace-pre-wrap text-sm leading-6">{memoryContent}</p><div className="mt-4 flex flex-wrap gap-2"><button type="button" onClick={() => void saveMemory()} disabled={isSavingMemory} className="rounded-lg bg-emerald-800 px-4 py-2.5 text-sm font-semibold text-white disabled:opacity-50">{isSavingMemory ? "Saving…" : "Confirm & save"}</button><button type="button" onClick={() => setMemoryPreviewOpen(false)} className="rounded-lg border border-slate-300 bg-white px-4 py-2.5 text-sm font-semibold">Keep editing</button></div></section>}
@@ -1588,7 +1609,7 @@ function App() {
               { view: "memories" as ViewName, icon: "♡", label: "Memories" },
               { view: "map" as ViewName, icon: "⌖", label: "Map" },
             ].map((item) => (
-              <button key={item.view} type="button" onClick={() => setActiveView(item.view)} className={`flex flex-col items-center gap-1 rounded-xl px-1 py-2 text-xs font-medium transition ${activeView === item.view ? "bg-emerald-50 text-emerald-900" : "text-slate-500 hover:bg-slate-50"}`} aria-current={activeView === item.view ? "page" : undefined}>
+              <button key={item.view} type="button" onClick={() => item.view === "itinerary" ? navigateToItinerary() : setActiveView(item.view)} className={`flex flex-col items-center gap-1 rounded-xl px-1 py-2 text-xs font-medium transition ${activeView === item.view ? "bg-emerald-50 text-emerald-900" : "text-slate-500 hover:bg-slate-50"}`} aria-current={activeView === item.view ? "page" : undefined}>
                 <span className="text-xl leading-none" aria-hidden="true">{item.icon}</span>
                 <span>{item.label}</span>
               </button>
