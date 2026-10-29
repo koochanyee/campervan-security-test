@@ -67,6 +67,8 @@ type TripExpense = {
   expense_type: "pre-trip" | "actual-trip";
   notes?: string;
   source?: string;
+  split_share?: number;
+  payment_status?: "Paid" | "Estimate" | string;
 };
 
 type ChecklistItem = {
@@ -238,8 +240,8 @@ function App() {
   const [expenses, setExpenses] = useState<TripExpense[]>([]);
   const [expenseMessage, setExpenseMessage] = useState("");
   const [expenseSaving, setExpenseSaving] = useState(false);
-  const [expenseType, setExpenseType] = useState<"pre-trip" | "actual-trip">("pre-trip");
   const [expenseDate, setExpenseDate] = useState(() => new Date().toISOString().slice(0, 10));
+  const [expenseType, setExpenseType] = useState<"pre-trip" | "actual-trip">(() => new Date().toISOString().slice(0, 10) >= "2026-11-07" ? "actual-trip" : "pre-trip");
   const [expenseDescription, setExpenseDescription] = useState("");
   const [expenseCategory, setExpenseCategory] = useState("Other");
   const [expenseAmount, setExpenseAmount] = useState("");
@@ -493,7 +495,7 @@ function App() {
     }
     void loadExpensesAndChecklist();
     return () => { cancelled = true; };
-  }, [verifiedEmail, selectedTripId]);
+  }, [verifiedEmail, selectedTripId, activeView, refreshKey]);
 
   const saveExpense = async (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
@@ -1457,7 +1459,7 @@ function App() {
                   <form onSubmit={(event) => void saveExpense(event)} className="rounded-xl border border-slate-200 p-4">
                     <h3 className="font-semibold">Add {expenseType === "pre-trip" ? "pre-trip expense" : "actual trip expense"}</h3>
                     <div className="mt-4 grid gap-3 sm:grid-cols-2">
-                      <label className="text-sm font-medium">Date<input type="date" required value={expenseDate} onChange={(event) => setExpenseDate(event.target.value)} className="mt-1 block w-full rounded-lg border border-slate-300 px-3 py-2 font-normal" /></label>
+                      <label className="text-sm font-medium">Date<input type="date" required value={expenseDate} onChange={(event) => { const value = event.target.value; setExpenseDate(value); setExpenseType(value >= "2026-11-07" ? "actual-trip" : "pre-trip"); }} className="mt-1 block w-full rounded-lg border border-slate-300 px-3 py-2 font-normal" /></label>
                       <label className="text-sm font-medium">Paid by<select value={expensePaidBy} onChange={(event) => setExpensePaidBy(event.target.value)} className="mt-1 block w-full rounded-lg border border-slate-300 px-3 py-2 font-normal"><option>Ralph</option><option>June</option><option>Shared</option></select></label>
                       <label className="text-sm font-medium sm:col-span-2">Description<input required maxLength={200} value={expenseDescription} onChange={(event) => setExpenseDescription(event.target.value)} placeholder="e.g. Campervan deposit" className="mt-1 block w-full rounded-lg border border-slate-300 px-3 py-2 font-normal" /></label>
                       <label className="text-sm font-medium">Category<select value={expenseCategory} onChange={(event) => setExpenseCategory(event.target.value)} className="mt-1 block w-full rounded-lg border border-slate-300 px-3 py-2 font-normal">{["Flights", "Campervan", "Accommodation", "Insurance", "Bookings & activities", "Fuel", "Groceries", "Meals", "Parking & transport", "Shopping", "Other"].map((category) => <option key={category}>{category}</option>)}</select></label>
@@ -1467,7 +1469,7 @@ function App() {
                     <button type="submit" disabled={expenseSaving} className="mt-4 rounded-lg bg-emerald-800 px-4 py-2.5 text-sm font-semibold text-white disabled:opacity-50">{expenseSaving ? "Saving…" : "Save expense"}</button>
                     {expenseMessage && <p className="mt-3 text-sm text-slate-600" aria-live="polite">{expenseMessage}</p>}
                   </form>
-                  <section><h3 className="font-semibold">Expense records</h3>{expenses.length ? <div className="mt-3 space-y-3">{[...expenses].sort((a,b) => (b.date || "").localeCompare(a.date || "")).map((expense) => <article key={expense.expense_id} className="rounded-xl border border-slate-200 p-4"><div className="flex flex-wrap items-start justify-between gap-3"><div className="min-w-0"><p className="font-semibold">{expense.description}</p><p className="mt-1 text-xs text-slate-500">{expense.date || "Planned / booked"} · {expense.category} · Paid by {expense.paid_by}</p><span className="mt-2 inline-block rounded-full bg-slate-100 px-2 py-1 text-xs text-slate-600">{expense.expense_type === "pre-trip" ? "Pre-trip" : "Actual trip"}{expense.source === "FINAL EXPENSES" ? " · From planning sheet" : ""}</span>{expense.notes && <p className="mt-2 whitespace-pre-wrap text-sm text-slate-600">{expense.notes}</p>}</div><p className="shrink-0 font-bold">{formatMoney(Number(expense.amount), expense.currency)}</p></div></article>)}</div> : <p className="mt-2 rounded-xl bg-slate-50 p-4 text-sm text-slate-600">No expenses returned from Google Sheets yet.</p>}</section>
+                  <section><h3 className="font-semibold">Expense records</h3>{expenses.length ? <div className="mt-3 space-y-3">{[...expenses].sort((a,b) => (b.date || "").localeCompare(a.date || "")).map((expense) => <article key={expense.expense_id} className="rounded-xl border border-slate-200 p-4"><div className="flex flex-wrap items-start justify-between gap-3"><div className="min-w-0"><p className="font-semibold">{expense.description}</p><p className="mt-1 text-xs text-slate-500">{expense.date || "Planned / booked"} · {expense.category} · Paid by {expense.paid_by}</p><div className="mt-2 flex flex-wrap gap-2"><span className="inline-block rounded-full bg-slate-100 px-2 py-1 text-xs text-slate-600">{expense.expense_type === "pre-trip" ? "Pre-trip" : "Actual trip"}{expense.source === "FINAL EXPENSES" ? " · From planning sheet" : ""}</span>{expense.payment_status && <span className={`inline-block rounded-full px-2 py-1 text-xs ${expense.payment_status === "Paid" ? "bg-emerald-100 text-emerald-800" : "bg-amber-100 text-amber-800"}`}>{expense.payment_status}</span>}</div>{typeof expense.split_share === "number" && <p className="mt-2 text-xs text-slate-600">50:50 share: {formatMoney(expense.split_share, expense.currency)}</p>}{expense.notes && <p className="mt-2 whitespace-pre-wrap text-sm text-slate-600">{expense.notes}</p>}</div><p className="shrink-0 font-bold">{formatMoney(Number(expense.amount), expense.currency)}</p></div></article>)}</div> : <p className="mt-2 rounded-xl bg-slate-50 p-4 text-sm text-slate-600">No expenses returned from Google Sheets yet.</p>}</section>
                 </div> : activeView === "map" ? <div className="mt-5 space-y-4"><p className="max-w-xl text-sm leading-6 text-slate-600">Open a day's route in Google Maps for driving directions. Flight days open a location search instead of driving directions.</p>{tripDays.map((day, index) => { const routeEntry = getEntriesForDay(day).find((entry) => /^(route|route\s*\/.*|route\s*and.*)$/i.test(entry.label.trim())) || getEntriesForDay(day).find((entry) => /route/i.test(entry.label)); const routeText = routeEntry?.value.trim() || ""; return <article key={day.key} className="rounded-xl border border-slate-200 p-4"><div className="flex items-start justify-between gap-3"><div><p className="text-xs font-semibold uppercase tracking-wide text-emerald-800">Day {index + 1} · {day.date}</p><h3 className="mt-1 font-semibold">{routeText || "Route not entered"}</h3></div><span aria-hidden="true" className="text-2xl">🛣️</span></div>{routeText ? <a href={googleMapsUrl(routeText)} target="_blank" rel="noreferrer" className="mt-3 inline-flex rounded-lg bg-emerald-800 px-4 py-2.5 text-sm font-semibold text-white hover:bg-emerald-900">{/\b(KUL|SIN)\b|flight|airport transfer/i.test(routeText) ? "Open locations in Google Maps ↗" : "Open driving route in Google Maps ↗"}</a> : <p className="mt-2 text-sm text-slate-500">Add route details to this day's itinerary to enable directions.</p>}</article>; })}<p className="text-xs text-slate-500">Google Maps opens separately. Route accuracy depends on the place names in your itinerary.</p></div> : <div className="mt-5 space-y-5">
                   <form onSubmit={(event) => { event.preventDefault(); setMemoryPreviewOpen(true); setMemoryMessage(""); }} className="rounded-xl border border-slate-200 p-4">
                     <h3 className="font-semibold">Add a shared memory</h3><p className="mt-1 text-sm text-slate-500">Review the preview before saving. Memories are shared with both approved travellers.</p>
