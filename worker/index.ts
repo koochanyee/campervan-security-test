@@ -369,7 +369,7 @@ interface TripConfig {
 const TRIP_REGISTRY_KEY = "trip-registry:shared:v1";
 const SOUTH_ISLAND_SHEET_ID = "1L_GUByHbUMIORDakIRutHUwK9pNMYPAsm1H1fe6RMB0";
 const TRIP_MEMORY_FOLDER_ID = "1mvq9t6mrtMnQk1Ug3DN2dl8S7cEDI-97";
-const EXPENSE_HEADERS = ["expense_id", "date", "description", "category", "amount", "currency", "paid_by", "expense_type", "notes", "created_at"];
+const EXPENSE_HEADERS = ["expense_id", "date", "description", "category", "amount", "currency", "paid_by", "expense_type", "notes", "created_at", "share_type", "latitude", "longitude", "location"];
 
 async function getTripRegistry(env: Env): Promise<TripConfig[]> {
   const saved = await env.OAUTH_TOKEN_STORE.get(TRIP_REGISTRY_KEY);
@@ -466,7 +466,7 @@ async function readSheetRows(accessToken: string, sheetId: string, tabName: stri
 }
 
 
-async function uploadSharedMemoryPhoto(accessToken: string, photo: { name?: unknown; mime_type?: unknown; data_base64?: unknown }, shareEmail: string): Promise<string> {
+async function uploadSharedMemoryPhoto(accessToken: string, photo: { name?: unknown; mime_type?: unknown; data_base64?: unknown }, shareEmail: string): Promise<{ id: string; url: string }> {
   const name = typeof photo.name === "string" ? photo.name.replace(/[^a-zA-Z0-9._-]/g, "_").slice(0, 120) : "travel-memory.jpg";
   const mimeType = typeof photo.mime_type === "string" && /^image\/(jpeg|png|webp|gif|heic|heif)$/.test(photo.mime_type) ? photo.mime_type : "";
   const encoded = typeof photo.data_base64 === "string" ? photo.data_base64.replace(/^data:image\/[^;]+;base64,/, "") : "";
@@ -487,7 +487,7 @@ async function uploadSharedMemoryPhoto(accessToken: string, photo: { name?: unkn
     if (upload.status === 404) throw new Error(`The configured trip-photo folder could not be found or accessed (${TRIP_MEMORY_FOLDER_ID}). ${detail}`);
     throw new Error(`Google Drive could not upload the selected photo (HTTP ${upload.status}). ${detail}`);
   }
-  const file = await upload.json() as { id?: string };
+  const file = await upload.json() as { id?: string; webViewLink?: string };
   if (!file.id) throw new Error("Google Drive did not return a photo ID.");
   const permission = await fetch(`https://www.googleapis.com/drive/v3/files/${encodeURIComponent(file.id)}/permissions?sendNotificationEmail=false`, {
     method: "POST", headers: { Authorization: `Bearer ${accessToken}`, "Content-Type": "application/json" },
@@ -499,7 +499,7 @@ async function uploadSharedMemoryPhoto(accessToken: string, photo: { name?: unkn
     if (permission.status === 403 || permission.status === 401) throw new Error(`Google Drive photo sharing was rejected (HTTP ${permission.status}). Reconnect and approve Google Drive access. ${detail}`);
     throw new Error(`The photo uploaded but could not be shared (HTTP ${permission.status}). ${detail}`);
   }
-  return file.id;
+  return { id: file.id, url: file.webViewLink || `https://drive.google.com/uc?export=view&id=${encodeURIComponent(file.id)}` };
 }
 
 export default {
@@ -1003,7 +1003,18 @@ export default {
         if (!trip) return jsonResponse({ success: false, error: "Select a valid trip first." }, 404);
         const token = await googleAccessToken(session, env);
         const tab = "TRIP EXPENSES";
-        if (request.method === "POST") await ensureSheetTab(token, trip.sheetId, tab, EXPENSE_HEADERS);
+        if (request.method === "POST") {
+          await ensureSheetTab(token, trip.sheetId, tab, EXPENSE_HEADERS);
+          const extraHeaderRange = `${quoteSheetTab(tab)}!K1:N1`;
+          const extraHeaderRead = await fetch(sheetsValuesUrl(trip.sheetId, extraHeaderRange), { headers: { Authorization: `Bearer ${token}` } });
+          if (extraHeaderRead.ok) {
+            const extraHeaderData = await extraHeaderRead.json() as { values?: unknown[][] };
+            if (!(extraHeaderData.values?.[0] || []).some((cell) => String(cell ?? "").trim())) {
+              const extraHeaderWrite = await fetch(`${sheetsValuesUrl(trip.sheetId, extraHeaderRange)}?valueInputOption=RAW`, { method: "PUT", headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" }, body: JSON.stringify({ values: [["share_type", "latitude", "longitude", "location"]] }) });
+              if (!extraHeaderWrite.ok) throw new Error("Could not add the new expense metadata headers in columns K:N.");
+            }
+          }
+        }
 
         if (request.method === "GET") {
           const loggedExpenses: Array<Record<string, unknown>> = [];
@@ -1014,7 +1025,7 @@ export default {
             const idx = (name: string) => header.indexOf(name);
             const idIdx = idx("expense_id"), dateIdx = idx("date"), descIdx = idx("description");
             const amountIdx = idx("amount"), currencyIdx = idx("currency"), paidByIdx = idx("paid_by");
-            const categoryIdx = idx("category"), notesIdx = idx("notes");
+            const categoryIdx = idx("category"), notesIdx = idx("notes"), shareTypeIdx = idx("share_type"), latitudeIdx = idx("latitude"), longitudeIdx = idx("longitude"), locationIdx = idx("location");
             rows.slice(1).forEach((row) => {
               const expenseId = idIdx >= 0 ? String(row[idIdx] || "").trim() : "";
               const description = descIdx >= 0 ? String(row[descIdx] || "").trim() : "";
@@ -1036,6 +1047,11 @@ export default {
                 // Date is the source of truth for the trip boundary: before 7 Nov is
                 // pre-trip; 7 Nov onward is actual-trip, even if an old row has a stale type.
                 expense_type: inferredType,
+                share_type: shareTypeIdx >= 0 && String(row[shareTypeIdx] || "").toLowerCase() === "personal" ? "personal" : "shared",
+                split_share: shareTypeIdx >= 0 && String(row[shareTypeIdx] || "").toLowerCase() === "personal" ? amount : amount / 2,
+                latitude: latitudeIdx >= 0 ? String(row[latitudeIdx] || "") : "",
+                longitude: longitudeIdx >= 0 ? String(row[longitudeIdx] || "") : "",
+                location: locationIdx >= 0 ? String(row[locationIdx] || "") : "",
                 notes: notesIdx >= 0 ? String(row[notesIdx] || "") : "",
                 source: "TRIP EXPENSES",
               });
@@ -1077,6 +1093,7 @@ export default {
                 currency: "MYR",
                 paid_by: paidBy,
                 expense_type: "pre-trip",
+                share_type: "shared",
                 payment_status: ["TRUE", "✓", "☑", "1"].includes(paidFlag) ? "Paid" : "Estimate",
                 notes,
                 source: "FINAL EXPENSES",
@@ -1095,11 +1112,15 @@ export default {
         const currency = typeof body.currency === "string" ? body.currency.trim().toUpperCase() : "NZD";
         const paidBy = typeof body.paid_by === "string" ? body.paid_by.trim() : "";
         const expenseType = date >= "2026-11-07" ? "actual-trip" : "pre-trip";
+        const shareType = body.share_type === "personal" ? "personal" : body.share_type === "shared" ? "shared" : "shared";
+        const latitude = typeof body.latitude === "string" ? body.latitude.trim() : "";
+        const longitude = typeof body.longitude === "string" ? body.longitude.trim() : "";
+        const location = typeof body.location === "string" ? body.location.trim() : "";
         const notes = typeof body.notes === "string" ? body.notes.trim() : "";
-        if (!expenseId || expenseId.length > 100 || !date || !description || description.length > 250 || !Number.isFinite(amount) || amount <= 0 || !["pre-trip", "actual-trip"].includes(String(expenseType)) || !["Ralph", "June", "Shared"].includes(paidBy) || !/^[A-Z]{3}$/.test(currency) || category.length > 100 || notes.length > 2000) return jsonResponse({ success: false, error: "Invalid expense details." }, 400);
+        if (!expenseId || expenseId.length > 100 || !date || !description || description.length > 250 || !Number.isFinite(amount) || amount <= 0 || !["pre-trip", "actual-trip"].includes(String(expenseType)) || !["Ralph", "June", "Shared"].includes(paidBy) || !/^[A-Z]{3}$/.test(currency) || category.length > 100 || notes.length > 2000 || latitude.length > 30 || longitude.length > 30 || location.length > 500) return jsonResponse({ success: false, error: "Invalid expense details." }, 400);
         if (rows.slice(1).some((row) => row[0] === expenseId)) return jsonResponse({ success: true, duplicate: true, message: "Expense already saved." });
-        const appendUrl = `${sheetsValuesUrl(trip.sheetId, `${quoteSheetTab(tab)}!A:J`)}:append?valueInputOption=RAW&insertDataOption=INSERT_ROWS`;
-        const append = await fetch(appendUrl, { method: "POST", headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" }, body: JSON.stringify({ values: [[expenseId, date, description, category, amount, currency, paidBy, expenseType, notes, new Date().toISOString()]] }) });
+        const appendUrl = `${sheetsValuesUrl(trip.sheetId, `${quoteSheetTab(tab)}!A:N`)}:append?valueInputOption=RAW&insertDataOption=INSERT_ROWS`;
+        const append = await fetch(appendUrl, { method: "POST", headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" }, body: JSON.stringify({ values: [[expenseId, date, description, category, amount, currency, paidBy, expenseType, notes, new Date().toISOString(), shareType, latitude, longitude, location]] }) });
         if (!append.ok) {
           const detail = (await append.text().catch(() => "")).slice(0, 400);
           return jsonResponse({ success: false, error: `Could not save the expense to Google Sheets (HTTP ${append.status}). ${detail}` }, 502);
@@ -2026,9 +2047,10 @@ export default {
         }
         if (encodedTotal > 14_000_000) return jsonResponse({ success: false, error: "Total photo size must be under 10 MB per memory." }, 400);
         const otherTraveller = session.email.toLowerCase() === "koochanyee@gmail.com" ? "wookahwai@gmail.com" : "koochanyee@gmail.com";
-        const photoIds: string[] = [];
-        for (const photo of photos) photoIds.push(await uploadSharedMemoryPhoto(tokenData.access_token, photo, otherTraveller));
-        const photoIdsValue = photoIds.length ? JSON.stringify(photoIds) : "";
+        const photoFiles: Array<{ id: string; url: string }> = [];
+        for (const photo of photos) photoFiles.push(await uploadSharedMemoryPhoto(tokenData.access_token, photo, otherTraveller));
+        // Store both Drive file IDs and URLs so photos can be located from the sheet later.
+        const photoIdsValue = photoFiles.length ? JSON.stringify(photoFiles) : "";
         const createdAt = new Date().toISOString();
         const appendUrl =
           `${sheetUrl}:append?valueInputOption=RAW&insertDataOption=INSERT_ROWS`;
