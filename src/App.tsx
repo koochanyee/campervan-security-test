@@ -28,6 +28,7 @@ type ApiResponse = {
   item?: ChecklistItem;
   trips?: TripConfigSummary[];
   trip?: TripConfigSummary;
+  photo?: { id: string; url: string; date?: string } | null;
 };
 
 type TripConfigSummary = { id: string; name: string; itineraryTab?: string };
@@ -186,6 +187,12 @@ function App() {
   const [tripTabDraft, setTripTabDraft] = useState("FINAL ITINERARY");
   const [tripMessage, setTripMessage] = useState("");
   const [tripSaving, setTripSaving] = useState(false);
+  const [highlightPhoto, setHighlightPhoto] = useState<{ id: string; url: string; date?: string } | null>(null);
+  const [highlightPhotoSaving, setHighlightPhotoSaving] = useState(false);
+  const [highlightPhotoMessage, setHighlightPhotoMessage] = useState("");
+  const [nearbyPlacesUrl, setNearbyPlacesUrl] = useState("");
+  const [nearbyPlaces, setNearbyPlaces] = useState<Array<{ id: string; name: string; kind: string; lat: number; lon: number }>>([]);
+  const [nearbyPlacesMessage, setNearbyPlacesMessage] = useState("");
   const [showHighlightPhoto, setShowHighlightPhoto] = useState(() => {
     try { return typeof window === "undefined" || window.localStorage.getItem("campervan-show-highlight-photo") !== "false"; }
     catch { return true; }
@@ -257,6 +264,7 @@ function App() {
   const [expenses, setExpenses] = useState<TripExpense[]>([]);
   const [expenseMessage, setExpenseMessage] = useState("");
   const [expenseSaving, setExpenseSaving] = useState(false);
+  const [editingExpenseId, setEditingExpenseId] = useState("");
   const [expenseDate, setExpenseDate] = useState(() => new Date().toISOString().slice(0, 10));
   const [expenseType, setExpenseType] = useState<"pre-trip" | "actual-trip">(() => new Date().toISOString().slice(0, 10) >= "2026-11-07" ? "actual-trip" : "pre-trip");
   const [expenseTab, setExpenseTab] = useState<"pre-trip" | "actual-trip" | "personal">("pre-trip");
@@ -537,7 +545,7 @@ function App() {
     setExpenseSaving(true);
     setExpenseMessage("");
     const record: TripExpense = {
-      expense_id: typeof crypto !== "undefined" && "randomUUID" in crypto ? crypto.randomUUID() : `${Date.now()}`,
+      expense_id: editingExpenseId || (typeof crypto !== "undefined" && "randomUUID" in crypto ? crypto.randomUUID() : `${Date.now()}`),
       date: expenseDate,
       description: expenseDescription.trim(),
       category: expenseCategory,
@@ -555,7 +563,7 @@ function App() {
       const response = await fetch(`/api/expenses?tripId=${encodeURIComponent(selectedTripId)}`, {
         method: "POST", credentials: "same-origin",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ ...record, tripId: selectedTripId }),
+        body: JSON.stringify({ ...record, action: editingExpenseId ? "edit" : "create", tripId: selectedTripId }),
       });
       const result = await response.json() as ApiResponse;
       if (!response.ok || !result.success) throw new Error(result.error || "Could not save the expense.");
@@ -564,10 +572,83 @@ function App() {
       if (refreshed.ok && refreshedResult.success) setExpenses(Array.isArray(refreshedResult.expenses) ? refreshedResult.expenses : [...expenses, record]);
       setExpenseDescription(""); setExpenseAmount(""); setExpenseNotes("");
       setExpenseLatitude(""); setExpenseLongitude(""); setExpenseLocation("");
-      setExpenseMessage(expenseShareType === "personal" ? "Personal expense saved to the trip sheet." : "Shared expense saved to the trip sheet. Split share: 50:50.");
+      setEditingExpenseId("");
+      setExpenseMessage(editingExpenseId ? "Expense updated in Google Sheets." : expenseShareType === "personal" ? "Personal expense saved to the trip sheet." : "Shared expense saved to the trip sheet. Split share: 50:50.");
     } catch (error) {
       setExpenseMessage(error instanceof Error ? error.message : "Could not save the expense.");
     } finally { setExpenseSaving(false); }
+  };
+
+  const beginEditExpense = (expense: TripExpense) => {
+    if (expense.source !== "TRIP EXPENSES") return;
+    setEditingExpenseId(expense.expense_id);
+    setExpenseDate(expense.date || new Date().toISOString().slice(0, 10));
+    setExpenseType(expense.expense_type);
+    setExpenseTab(expense.share_type === "personal" ? "personal" : expense.expense_type);
+    setExpenseShareType(expense.share_type || "shared");
+    setExpenseLatitude(expense.latitude || "");
+    setExpenseLongitude(expense.longitude || "");
+    setExpenseLocation(expense.location || "");
+    setExpenseDescription(expense.description);
+    setExpenseCategory(expense.category || "Other");
+    setExpenseAmount(String(expense.amount));
+    setExpenseCurrency(expense.currency || "NZD");
+    setExpensePaidBy(expense.paid_by || "Ralph");
+    setExpenseNotes(expense.notes || "");
+    setExpenseMessage("Editing this app-entered expense. Save changes to update the existing row.");
+    window.scrollTo({ top: 0, behavior: "smooth" });
+  };
+
+  const markExpenseLegacy = async (expense: TripExpense) => {
+    if (expense.source !== "TRIP EXPENSES") return;
+    if (!window.confirm(`Mark “${expense.description}” as legacy? The Google Sheet row will be kept, but the expense will disappear from the app.`)) return;
+    setExpenseSaving(true); setExpenseMessage("");
+    try {
+      const response = await fetch(`/api/expenses?tripId=${encodeURIComponent(selectedTripId)}`, { method: "POST", credentials: "same-origin", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ action: "legacy", expense_id: expense.expense_id, tripId: selectedTripId }) });
+      const result = await response.json() as ApiResponse;
+      if (!response.ok || !result.success) throw new Error(result.error || "Could not mark this expense as legacy.");
+      const refreshed = await fetch(`/api/expenses?tripId=${encodeURIComponent(selectedTripId)}`, { credentials: "same-origin", cache: "no-store" });
+      const refreshedResult = await refreshed.json() as ApiResponse;
+      if (refreshed.ok && refreshedResult.success) setExpenses(Array.isArray(refreshedResult.expenses) ? refreshedResult.expenses : []);
+      setExpenseMessage("Expense marked as legacy. The Google Sheet row remains for history.");
+      if (editingExpenseId === expense.expense_id) setEditingExpenseId("");
+    } catch (error) { setExpenseMessage(error instanceof Error ? error.message : "Could not mark this expense as legacy."); }
+    finally { setExpenseSaving(false); }
+  };
+
+  const uploadHighlightPhoto = async (file: File) => {
+    if (!selectedDay) { setHighlightPhotoMessage("Select an itinerary date first."); return; }
+    if (!file.type.startsWith("image/")) { setHighlightPhotoMessage("Please select an image file."); return; }
+    if (file.size > 4 * 1024 * 1024) { setHighlightPhotoMessage("Choose an image 4 MB or smaller."); return; }
+    setHighlightPhotoSaving(true); setHighlightPhotoMessage("");
+    try {
+      const dataUrl = await new Promise<string>((resolve, reject) => { const reader = new FileReader(); reader.onload = () => resolve(String(reader.result || "")); reader.onerror = () => reject(new Error(`Could not read ${file.name}.`)); reader.readAsDataURL(file); });
+      const response = await fetch(`/api/highlight-photo?tripId=${encodeURIComponent(selectedTripId)}`, { method: "POST", credentials: "same-origin", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ tripId: selectedTripId, date: selectedDay.date, photo: { name: file.name, mime_type: file.type, data_base64: dataUrl.split(",")[1] || "" } }) });
+      const result = await response.json() as ApiResponse;
+      if (!response.ok || !result.success) throw new Error(result.error || "Could not upload the Today Highlight photo.");
+      setHighlightPhoto(result.photo as { id: string; url: string; date?: string });
+      setHighlightPhotoMessage("Photo saved to the shared trip folder for this date.");
+    } catch (error) { setHighlightPhotoMessage(error instanceof Error ? error.message : "Could not upload the Today Highlight photo."); }
+    finally { setHighlightPhotoSaving(false); }
+  };
+
+  const findNearbyAttractions = () => {
+    setNearbyPlacesMessage("Requesting your location…"); setNearbyPlacesUrl(""); setNearbyPlaces([]);
+    if (!navigator.geolocation) { setNearbyPlacesMessage("GPS is not supported by this browser. Open Google Maps and search for attractions nearby."); return; }
+    navigator.geolocation.getCurrentPosition((position) => {
+      const { latitude, longitude } = position.coords;
+      setNearbyPlacesUrl(`https://www.google.com/maps/search/attractions/@${latitude},${longitude},14z`);
+      setNearbyPlacesMessage("Searching for nearby attractions…");
+      const query = `[out:json][timeout:18];(node(around:10000,${latitude},${longitude})["tourism"~"attraction|museum|viewpoint|zoo|gallery|theme_park"];way(around:10000,${latitude},${longitude})["tourism"~"attraction|museum|viewpoint|zoo|gallery|theme_park"];relation(around:10000,${latitude},${longitude})["tourism"~"attraction|museum|viewpoint|zoo|gallery|theme_park"];);out center tags 20;`;
+      void fetch("https://overpass-api.de/api/interpreter", { method: "POST", headers: { "Content-Type": "application/x-www-form-urlencoded;charset=UTF-8" }, body: new URLSearchParams({ data: query }).toString() })
+        .then(async (response) => { if (!response.ok) throw new Error("Nearby search service is temporarily unavailable."); return await response.json() as { elements?: Array<{ id: number; type: string; lat?: number; lon?: number; center?: { lat: number; lon: number }; tags?: Record<string, string> }> }; })
+        .then((result) => {
+          const places = (result.elements || []).map((item) => ({ id: `${item.type}-${item.id}`, name: item.tags?.name || item.tags?.["name:en"] || "Unnamed attraction", kind: item.tags?.tourism || item.tags?.historic || "Attraction", lat: item.lat ?? item.center?.lat ?? latitude, lon: item.lon ?? item.center?.lon ?? longitude })).filter((item) => item.name !== "Unnamed attraction").slice(0, 12);
+          setNearbyPlaces(places);
+          setNearbyPlacesMessage(places.length ? `Found ${places.length} nearby places within about 10 km.` : "No named attractions found nearby. Use Google Maps for a broader search.");
+        })
+        .catch((error) => setNearbyPlacesMessage(error instanceof Error ? `${error.message} Use Google Maps for nearby results.` : "Nearby search failed. Use Google Maps for nearby results."));
+    }, (error) => setNearbyPlacesMessage(error.message || "Location permission was denied. Enable location access and try again."), { enableHighAccuracy: false, timeout: 10000, maximumAge: 120000 });
   };
 
   const detectExpenseLocation = () => {
@@ -610,7 +691,7 @@ function App() {
       });
       const result = await response.json() as ApiResponse;
       if (!response.ok || !result.success) throw new Error(result.error || "Could not sync checklist status.");
-      setChecklistMessage("Checklist synced to Google Sheets.");
+      setChecklistMessage(typeof result.message === "string" ? result.message : "Checklist synced to Google Sheets.");
     } catch (error) {
       setChecklistItems((current) => current.map((entry) => entry.item_id === item.item_id ? item : entry));
       setChecklistMessage(error instanceof Error ? error.message : "Could not sync checklist status.");
@@ -697,6 +778,15 @@ function App() {
 
   const safeDayIndex = tripDays.length > 0 ? Math.min(activeDayIndex, tripDays.length - 1) : 0;
   const selectedDay = tripDays[safeDayIndex];
+
+  useEffect(() => {
+    if (!selectedTripId || !selectedDay?.date) { setHighlightPhoto(null); return; }
+    let cancelled = false;
+    fetch(`/api/highlight-photo?tripId=${encodeURIComponent(selectedTripId)}&date=${encodeURIComponent(selectedDay.date)}`, { credentials: "same-origin", cache: "no-store" })
+      .then(async (response) => { const result = await response.json() as ApiResponse; if (!response.ok || !result.success) throw new Error(result.error || "Could not load the highlight photo."); if (!cancelled) setHighlightPhoto(result.photo as { id: string; url: string; date?: string } | null); })
+      .catch(() => { if (!cancelled) setHighlightPhoto(null); });
+    return () => { cancelled = true; };
+  }, [selectedTripId, selectedDay?.date]);
   const today = new Date();
   const liveDayIndex = tripDays.findIndex((day) => day.dateObject && dateIsSameDay(day.dateObject, today));
   const dashboardDayIndex = liveDayIndex >= 0 ? liveDayIndex : safeDayIndex;
@@ -1189,7 +1279,7 @@ function App() {
                             <section
                               className={`relative overflow-hidden rounded-2xl border border-slate-300 p-4 shadow-sm sm:p-5 ${showHighlightPhoto ? "text-white" : "border-emerald-200 bg-gradient-to-br from-emerald-50 to-white text-slate-900"}`}
                               style={showHighlightPhoto ? {
-                                backgroundImage: "linear-gradient(110deg, rgba(8, 24, 38, 0.88), rgba(8, 24, 38, 0.62)), url(https://images.unsplash.com/photo-1469521669194-babb45599def?auto=format&fit=crop&w=1600&q=85)",
+                                backgroundImage: `linear-gradient(110deg, rgba(8, 24, 38, 0.78), rgba(8, 24, 38, 0.48)), url(${highlightPhoto?.url || "https://images.unsplash.com/photo-1469521669194-babb45599def?auto=format&fit=crop&w=1600&q=85"})`,
                                 backgroundSize: "cover",
                                 backgroundPosition: "center",
                               } : undefined}
@@ -1200,6 +1290,12 @@ function App() {
                                   {showHighlightPhoto ? "Photo background: On" : "Photo background: Off"}
                                 </button>
                               </div>
+                              <div className="mt-3 flex flex-wrap gap-2">
+                                <label className={`cursor-pointer rounded-lg border px-3 py-2 text-sm font-semibold ${showHighlightPhoto ? "border-white/50 bg-black/25 text-white" : "border-slate-300 bg-white text-slate-700"}`}>🖼️ Add photo<input type="file" accept="image/*" onChange={(event) => { const file = event.currentTarget.files?.[0]; if (file) void uploadHighlightPhoto(file); event.currentTarget.value = ""; }} className="sr-only" /></label>
+                                <label className={`cursor-pointer rounded-lg border px-3 py-2 text-sm font-semibold ${showHighlightPhoto ? "border-white/50 bg-black/25 text-white" : "border-slate-300 bg-white text-slate-700"}`}>📸 Take picture<input type="file" accept="image/*" capture="environment" onChange={(event) => { const file = event.currentTarget.files?.[0]; if (file) void uploadHighlightPhoto(file); event.currentTarget.value = ""; }} className="sr-only" /></label>
+                                {highlightPhotoSaving && <span className="self-center text-xs">Uploading photo…</span>}
+                              </div>
+                              {highlightPhotoMessage && <p className={`mt-2 text-xs ${showHighlightPhoto ? "text-white" : "text-slate-600"}`} aria-live="polite">{highlightPhotoMessage}</p>}
                               <div className="mt-4 space-y-4">
                                 <div><p className="font-semibold">🛣️ Route</p>{categorized.route.filter((entry) => /route|destination|distance|departure|arrival|transport/i.test(entry.label)).length ? categorized.route.filter((entry) => /route|destination|distance|departure|arrival|transport/i.test(entry.label)).map((entry) => <p key={entry.key} className="mt-1 whitespace-pre-wrap text-sm leading-6">{entry.value}</p>) : <p className={`mt-1 text-sm ${showHighlightPhoto ? "text-white/80" : "text-slate-500"}`}>No route details entered for this day.</p>}</div>
                                 <div><p className="font-semibold">🚐 Driving note</p>{categorized.route.filter((entry) => /drive|driving|travel time/i.test(entry.label)).length ? categorized.route.filter((entry) => /drive|driving|travel time/i.test(entry.label)).map((entry) => <p key={entry.key} className="mt-1 whitespace-pre-wrap text-sm leading-6">{entry.value}</p>) : <p className={`mt-1 text-sm ${showHighlightPhoto ? "text-white/80" : "text-slate-500"}`}>No separate driving note entered.</p>}</div>
@@ -1387,7 +1483,7 @@ function App() {
                         </div>
                         <div className="grid gap-3 border-t border-slate-100 bg-white p-4 sm:grid-cols-3">
                           <InfoPanel icon="🛣️" title="Route & destinations" entries={categorized.route} empty="Route details are not labelled in the sheet yet." />
-                          <InfoPanel icon="📍" title="Places to visit" entries={categorized.places} empty="Place details are not labelled in the sheet yet." />
+                          <div className="rounded-xl border border-slate-200 bg-white p-4"><h3 className="font-semibold">📍 Places to visit</h3>{categorized.places.length ? <div className="mt-2 space-y-2">{categorized.places.map((entry) => <p key={entry.key} className="whitespace-pre-wrap text-sm leading-6 text-slate-700">{entry.value}</p>)}</div> : <p className="mt-2 text-sm text-slate-500">No places are labelled in the itinerary sheet yet. Find attractions near your current GPS location.</p>}<button type="button" onClick={findNearbyAttractions} className="mt-3 min-h-11 rounded-lg border border-emerald-300 bg-emerald-50 px-3 py-2 text-sm font-semibold text-emerald-900">{nearbyPlacesMessage === "Requesting your location…" ? "Locating…" : "Find nearby attractions 📍"}</button>{nearbyPlaces.length > 0 && <ul className="mt-3 space-y-2">{nearbyPlaces.map((place) => <li key={place.id} className="rounded-lg border border-slate-100 bg-slate-50 p-3"><a href={`https://www.google.com/maps/search/?api=1&query=${encodeURIComponent(`${place.lat},${place.lon}`)}`} target="_blank" rel="noreferrer" className="font-semibold text-emerald-800 underline">{place.name} ↗</a><p className="mt-1 text-xs capitalize text-slate-500">{place.kind.replace(/_/g, " ")} · Open in Google Maps</p></li>)}</ul>}{nearbyPlacesUrl && <a href={nearbyPlacesUrl} target="_blank" rel="noreferrer" className="mt-2 block text-sm font-semibold text-emerald-800 underline">View broader nearby search in Google Maps ↗</a>}{nearbyPlacesMessage && <p className="mt-2 text-xs text-slate-500">{nearbyPlacesMessage}</p>}</div>
                           <InfoPanel icon="🏕️" title="Stay & bookings" entries={categorized.stay} empty="Stay details are not labelled in the sheet yet." />
                         </div>
                         <div className="border-t border-slate-100 bg-slate-50 p-4">
@@ -1438,8 +1534,8 @@ function App() {
                             </div>
                             {(item.quantity || item.due_date || item.notes) && <p className="mt-1 whitespace-pre-wrap text-sm leading-5 text-slate-500">{[item.quantity ? `Qty: ${item.quantity}` : "", item.due_date ? `Due: ${item.due_date}` : "", item.notes || ""].filter(Boolean).join(" · ")}</p>}
                             <div className="mt-3 flex flex-wrap gap-2">
-                              <button type="button" disabled={checklistSavingId === item.item_id} onClick={() => void setChecklistStatus(item, status === "✓" ? "" : "✓")} className={`rounded-lg border px-3 py-2 text-sm font-semibold disabled:opacity-50 ${status === "✓" ? "border-emerald-800 bg-emerald-800 text-white" : "border-slate-300 bg-white text-slate-700"}`}>{status === "✓" ? "✓ Done" : "□ Mark done"}</button>
-                              <button type="button" disabled={checklistSavingId === item.item_id} onClick={() => void setChecklistStatus(item, status === "x" ? "" : "x")} className={`rounded-lg border px-3 py-2 text-sm font-semibold disabled:opacity-50 ${status === "x" ? "border-slate-500 bg-slate-600 text-white" : "border-slate-300 bg-white text-slate-600"}`}>{status === "x" ? "x Ignored" : "Not applicable"}</button>
+                              <button type="button" disabled={checklistSavingId === item.item_id} onClick={() => void setChecklistStatus(item, status === "✓" ? "" : "✓")} className={`min-h-12 min-w-[132px] rounded-lg border px-4 py-3 text-base font-semibold md:min-h-14 md:min-w-[156px] md:px-5 md:py-3.5 md:text-lg disabled:opacity-50 ${status === "✓" ? "border-emerald-800 bg-emerald-800 text-white" : "border-slate-300 bg-white text-slate-700"}`}>{status === "✓" ? "✓ Done" : "□ Mark done"}</button>
+                              <button type="button" disabled={checklistSavingId === item.item_id} onClick={() => void setChecklistStatus(item, status === "x" ? "" : "x")} className={`min-h-12 min-w-[132px] rounded-lg border px-4 py-3 text-base font-semibold md:min-h-14 md:min-w-[156px] md:px-5 md:py-3.5 md:text-lg disabled:opacity-50 ${status === "x" ? "border-slate-500 bg-slate-600 text-white" : "border-slate-300 bg-white text-slate-600"}`}>{status === "x" ? "x Ignored" : "Not applicable"}</button>
                               {checklistSavingId === item.item_id && <span className="self-center text-xs text-slate-500">Syncing…</span>}
                             </div>
                           </article>
@@ -1513,8 +1609,8 @@ function App() {
                 <h2 className="mt-4 text-2xl font-bold">{activeView === "expenses" ? "Trip expenses" : activeView === "memories" ? "Travel memories" : "Trip map"}</h2>
                 {activeView === "expenses" ? <div className="mt-5 space-y-5">
                   <div className="grid gap-3 sm:grid-cols-3">
-                    <div className="rounded-xl border border-slate-200 p-4"><p className="text-xs font-semibold uppercase text-slate-500">Pre-trip estimate / paid</p><p className="mt-2 text-xl font-bold">{formatExpenseTotal(preTripExpenses.filter((expense) => expense.share_type !== "personal"))}</p><p className="mt-1 text-xs text-slate-500">Planned bookings and advance payments</p></div>
-                    <div className="rounded-xl border border-slate-200 p-4"><p className="text-xs font-semibold uppercase text-slate-500">Actual shared spending</p><p className="mt-2 text-xl font-bold">{formatExpenseTotal(actualTripExpenses.filter((expense) => expense.share_type !== "personal"))}</p><p className="mt-1 text-xs text-slate-500">During the trip, split 50:50</p></div>
+                    <div className="rounded-xl border border-slate-200 p-4"><p className="text-xs font-semibold uppercase text-slate-500">Paid pre-trip expenses</p><p className="mt-2 text-xl font-bold">{formatExpenseTotal(paidPreTripExpenses.filter((expense) => expense.share_type !== "personal"))}</p><p className="mt-1 text-xs text-slate-500">Unpaid estimates excluded</p></div>
+                    <div className="rounded-xl border border-slate-200 p-4"><p className="text-xs font-semibold uppercase text-slate-500">Actual shared spending</p><p className="mt-2 text-xl font-bold">{formatExpenseTotal(paidOrActualExpenses.filter((expense) => expense.expense_type === "actual-trip" && expense.share_type !== "personal"))}</p><p className="mt-1 text-xs text-slate-500">During the trip, split 50:50</p></div>
                     <div className="rounded-xl border border-slate-200 p-4"><p className="text-xs font-semibold uppercase text-slate-500">Personal spending</p><p className="mt-2 text-xl font-bold">{formatExpenseTotal(paidOrActualExpenses.filter((expense) => expense.share_type === "personal"))}</p><p className="mt-1 text-xs text-slate-500">Not included in the shared split</p></div>
                   </div>
                   <div className="grid grid-cols-3 gap-2" role="tablist" aria-label="Expense sections">
@@ -1523,7 +1619,7 @@ function App() {
                   {expenseTab === "pre-trip" && <section className="rounded-xl border border-slate-200 p-4"><h3 className="font-semibold">Pre-trip category summary</h3><div className="mt-3 grid gap-2 sm:grid-cols-2">{["Camping site", "Hotel stay", "Activity", "Other"].map((category) => { const matches = paidPreTripExpenses.filter((expense) => expense.share_type !== "personal" && (category === "Camping site" ? /camp|campsite|holiday park/i.test(expense.category + " " + expense.description) : category === "Hotel stay" ? /hotel|accommodation|motel|lodge/i.test(expense.category + " " + expense.description) : category === "Activity" ? /activity|ticket|tour|attraction|booking/i.test(expense.category + " " + expense.description) : !/camp|campsite|holiday park|hotel|accommodation|motel|lodge|activity|ticket|tour|attraction|booking/i.test(expense.category + " " + expense.description))); const categoryColor = category === "Camping site" ? "bg-sky-50 border-sky-200 text-sky-900" : category === "Hotel stay" ? "bg-violet-50 border-violet-200 text-violet-900" : category === "Activity" ? "bg-amber-50 border-amber-200 text-amber-900" : "bg-emerald-50 border-emerald-200 text-emerald-900"; return <div key={category} className={`flex items-center justify-between rounded-lg border p-3 ${categoryColor}`}><span className="text-sm font-medium">{category}</span><span className="text-sm font-bold">{formatExpenseTotal(matches)}</span></div>; })}</div></section>}
                   {expenseTab === "personal" && <section className="rounded-xl border border-slate-200 p-4"><h3 className="font-semibold">Trip expense summary</h3><p className="mt-1 text-xs text-slate-500">Paid pre-trip costs and actual trip costs only. Shared items are divided 50:50; each person's own personal costs are added to their share. Unpaid estimates are excluded.</p><div className="mt-3 grid gap-3 sm:grid-cols-2">{(["Ralph", "June"] as const).map((person) => { const personTotal = (type?: "pre-trip" | "actual-trip") => { const totals: Record<string, number> = {}; paidOrActualExpenses.filter((expense) => (!type || expense.expense_type === type)).forEach((expense) => { const currency = expense.currency || "NZD"; if (expense.share_type === "personal") { if (expense.paid_by !== person) return; totals[currency] = (totals[currency] || 0) + Number(expense.amount || 0); } else { totals[currency] = (totals[currency] || 0) + Number(expense.amount || 0) / 2; } }); return Object.entries(totals).length ? Object.entries(totals).map(([currency, total]) => formatMoney(total, currency)).join(" · ") : formatMoney(0, "NZD"); }; return <div key={person} className="rounded-xl border border-slate-200 p-3"><h4 className="font-semibold">{person} · estimated personal share</h4><div className="mt-2 flex justify-between gap-2 text-sm"><span className="text-slate-500">Paid pre-trip</span><strong>{personTotal("pre-trip")}</strong></div><div className="mt-1 flex justify-between gap-2 text-sm"><span className="text-slate-500">Actual trip</span><strong>{personTotal("actual-trip")}</strong></div><div className="mt-2 flex justify-between gap-2 border-t border-slate-100 pt-2 text-sm"><span className="font-semibold">Total</span><strong>{personTotal()}</strong></div></div>; })}</div><div className="mt-4 grid gap-2 sm:grid-cols-3"><div className="rounded-lg bg-slate-50 p-3"><p className="text-xs text-slate-500">Shared expenses · 50:50</p><p className="mt-1 font-bold">{formatExpenseTotal(paidOrActualExpenses.filter((expense) => expense.share_type !== "personal"))}</p></div><div className="rounded-lg bg-slate-50 p-3"><p className="text-xs text-slate-500">Personal expenses</p><p className="mt-1 font-bold">{formatExpenseTotal(expenses.filter((expense) => expense.share_type === "personal"))}</p></div><div className="rounded-lg bg-emerald-50 p-3"><p className="text-xs text-emerald-800">Total recorded trip expenses</p><p className="mt-1 font-bold">{formatExpenseTotal(paidOrActualExpenses)}</p></div></div><p className="mt-2 text-xs text-slate-500">The total excludes unpaid estimates from FINAL EXPENSES; currencies are shown separately and are not converted.</p></section>}
                   <form onSubmit={(event) => void saveExpense(event)} className="rounded-xl border border-slate-200 p-4">
-                    <h3 className="font-semibold">Add {expenseTab === "pre-trip" ? "pre-trip expense" : expenseTab === "actual-trip" ? "actual trip expense" : "personal expense"}</h3>
+                    <h3 className="font-semibold">{editingExpenseId ? "Edit expense record" : `Add ${expenseTab === "pre-trip" ? "pre-trip expense" : expenseTab === "actual-trip" ? "actual trip expense" : "personal expense"}`}</h3>
                     <div className="mt-4 grid gap-3 sm:grid-cols-2">
                       <label className="text-sm font-medium">Date<input type="date" required value={expenseDate} onChange={(event) => { const value = event.target.value; setExpenseDate(value); setExpenseType(value >= "2026-11-07" ? "actual-trip" : "pre-trip"); }} className="mt-1 block w-full rounded-lg border border-slate-300 px-3 py-2 font-normal" /></label>
                       <label className="text-sm font-medium">Expense sharing<select value={expenseShareType} onChange={(event) => setExpenseShareType(event.target.value as "shared" | "personal")} className="mt-1 block w-full rounded-lg border border-slate-300 px-3 py-2 font-normal"><option value="shared">Shared · split 50:50</option><option value="personal">Personal · not split</option></select></label>
@@ -1534,10 +1630,10 @@ function App() {
                       <div className="sm:col-span-2"><div className="flex flex-wrap items-center justify-between gap-2"><span className="text-sm font-medium">Location (GPS)</span><button type="button" onClick={detectExpenseLocation} disabled={isDetectingExpenseLocation} className="rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm font-semibold disabled:opacity-50">{isDetectingExpenseLocation ? "Locating…" : "📍 Use GPS"}</button></div><input readOnly value={expenseLocation} placeholder="Optional — attach current location" className="mt-2 block w-full rounded-lg border border-slate-300 bg-slate-50 px-3 py-2 text-sm" /></div>
                       <label className="text-sm font-medium sm:col-span-2">Notes (optional)<textarea rows={2} maxLength={1000} value={expenseNotes} onChange={(event) => setExpenseNotes(event.target.value)} className="mt-1 block w-full rounded-lg border border-slate-300 px-3 py-2 font-normal" /></label>
                     </div>
-                    <button type="submit" disabled={expenseSaving} className="mt-4 rounded-lg bg-emerald-800 px-4 py-2.5 text-sm font-semibold text-white disabled:opacity-50">{expenseSaving ? "Saving…" : "Save expense"}</button>
+                    <button type="submit" disabled={expenseSaving} className="mt-4 rounded-lg bg-emerald-800 px-4 py-2.5 text-sm font-semibold text-white disabled:opacity-50">{expenseSaving ? "Saving…" : editingExpenseId ? "Save changes" : "Save expense"}</button>{editingExpenseId && <button type="button" onClick={() => { setEditingExpenseId(""); setExpenseMessage("Edit cancelled."); }} className="mt-4 ml-2 rounded-lg border border-slate-300 px-4 py-2.5 text-sm font-semibold">Cancel edit</button>}
                     {expenseMessage && <p className="mt-3 text-sm text-slate-600" aria-live="polite">{expenseMessage}</p>}
                   </form>
-                  {(() => { const visibleExpenses = expenses.filter((expense) => expenseTab === "personal" ? expense.share_type === "personal" : expense.share_type !== "personal" && expense.expense_type === expenseTab); return <section><h3 className="font-semibold">{expenseTab === "pre-trip" ? "Pre-trip expenses" : expenseTab === "actual-trip" ? "Actual trip expenses" : "Personal expenses"}</h3>{visibleExpenses.length ? <div className="mt-3 space-y-3">{[...visibleExpenses].sort((a,b) => (b.date || "").localeCompare(a.date || "")).map((expense) => <article key={expense.expense_id} className="rounded-xl border border-slate-200 p-4"><div className="flex flex-wrap items-start justify-between gap-3"><div className="min-w-0"><p className="font-semibold">{expense.description}</p><p className="mt-1 text-xs text-slate-500">{expense.date || "Planned / booked"} · {expense.category} · Paid by {expense.paid_by}</p><div className="mt-2 flex flex-wrap gap-2"><span className="inline-block rounded-full bg-slate-100 px-2 py-1 text-xs text-slate-600">{expense.expense_type === "pre-trip" ? "Pre-trip" : "Actual trip"}{expense.source === "FINAL EXPENSES" ? " · From planning sheet" : ""}</span><span className="inline-block rounded-full bg-blue-50 px-2 py-1 text-xs text-blue-800">{expense.share_type === "personal" ? "Personal" : "Shared · 50:50"}</span>{expense.payment_status && <span className={`inline-block rounded-full px-2 py-1 text-xs ${expense.payment_status === "Paid" ? "bg-emerald-100 text-emerald-800" : "bg-amber-100 text-amber-800"}`}>{expense.payment_status}</span>}</div>{typeof expense.split_share === "number" && <p className="mt-2 text-xs text-slate-600">50:50 share: {formatMoney(expense.split_share, expense.currency)}</p>}{expense.location && <a className="mt-2 block text-xs font-semibold text-emerald-800 underline" href={`https://www.google.com/maps?q=${encodeURIComponent(expense.latitude && expense.longitude ? `${expense.latitude},${expense.longitude}` : expense.location)}`} target="_blank" rel="noreferrer">📍 {expense.location} · Open map</a>}{expense.notes && <p className="mt-2 whitespace-pre-wrap text-sm text-slate-600">{expense.notes}</p>}</div><p className="shrink-0 font-bold">{formatMoney(Number(expense.amount), expense.currency)}</p></div></article>)}</div> : <p className="mt-2 rounded-xl bg-slate-50 p-4 text-sm text-slate-600">No {expenseTab === "personal" ? "personal" : expenseTab === "pre-trip" ? "pre-trip" : "actual trip"} expenses found.</p>}</section>; })()}
+                  {(() => { const visibleExpenses = expenses.filter((expense) => expenseTab === "personal" ? expense.share_type === "personal" : expense.share_type !== "personal" && expense.expense_type === expenseTab); return <section><h3 className="font-semibold">{expenseTab === "pre-trip" ? "Pre-trip expenses" : expenseTab === "actual-trip" ? "Actual trip expenses" : "Personal expenses"}</h3>{visibleExpenses.length ? <div className="mt-3 space-y-3">{[...visibleExpenses].sort((a,b) => (b.date || "").localeCompare(a.date || "")).map((expense) => <article key={expense.expense_id} className="rounded-xl border border-slate-200 p-4"><div className="flex flex-wrap items-start justify-between gap-3"><div className="min-w-0"><p className="font-semibold">{expense.description}</p><p className="mt-1 text-xs text-slate-500">{expense.date || "Planned / booked"} · {expense.category} · Paid by {expense.paid_by}</p><div className="mt-2 flex flex-wrap gap-2"><span className="inline-block rounded-full bg-slate-100 px-2 py-1 text-xs text-slate-600">{expense.expense_type === "pre-trip" ? "Pre-trip" : "Actual trip"}{expense.source === "FINAL EXPENSES" ? " · From planning sheet" : ""}</span><span className="inline-block rounded-full bg-blue-50 px-2 py-1 text-xs text-blue-800">{expense.share_type === "personal" ? "Personal" : "Shared · 50:50"}</span>{expense.payment_status && <span className={`inline-block rounded-full px-2 py-1 text-xs ${expense.payment_status === "Paid" ? "bg-emerald-100 text-emerald-800" : "bg-amber-100 text-amber-800"}`}>{expense.payment_status}</span>}</div>{typeof expense.split_share === "number" && <p className="mt-2 text-xs text-slate-600">50:50 share: {formatMoney(expense.split_share, expense.currency)}</p>}{expense.location && <a className="mt-2 block text-xs font-semibold text-emerald-800 underline" href={`https://www.google.com/maps?q=${encodeURIComponent(expense.latitude && expense.longitude ? `${expense.latitude},${expense.longitude}` : expense.location)}`} target="_blank" rel="noreferrer">📍 {expense.location} · Open map</a>}{expense.notes && <p className="mt-2 whitespace-pre-wrap text-sm text-slate-600">{expense.notes}</p>}</div><div className="shrink-0 text-right"><p className="font-bold">{formatMoney(Number(expense.amount), expense.currency)}</p>{expense.source === "TRIP EXPENSES" && <div className="mt-3 flex flex-wrap justify-end gap-2"><button type="button" onClick={() => beginEditExpense(expense)} className="min-h-10 rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm font-semibold text-slate-700">Edit</button><button type="button" disabled={expenseSaving} onClick={() => void markExpenseLegacy(expense)} className="min-h-10 rounded-lg border border-rose-200 bg-rose-50 px-3 py-2 text-sm font-semibold text-rose-800 disabled:opacity-50">Remove</button></div>}</div></div></article>)}</div> : <p className="mt-2 rounded-xl bg-slate-50 p-4 text-sm text-slate-600">No {expenseTab === "personal" ? "personal" : expenseTab === "pre-trip" ? "pre-trip" : "actual trip"} expenses found.</p>}</section>; })()}
                 </div> : activeView === "map" ? <div className="mt-5 space-y-4"><p className="max-w-xl text-sm leading-6 text-slate-600">Open a day's route in Google Maps for driving directions. Flight days open a location search instead of driving directions.</p>{tripDays.map((day, index) => { const routeEntry = getEntriesForDay(day).find((entry) => /^(route|route\s*\/.*|route\s*and.*)$/i.test(entry.label.trim())) || getEntriesForDay(day).find((entry) => /route/i.test(entry.label)); const routeText = routeEntry?.value.trim() || ""; return <article key={day.key} className="rounded-xl border border-slate-200 p-4"><div className="flex items-start justify-between gap-3"><div><p className="text-xs font-semibold uppercase tracking-wide text-emerald-800">Day {index + 1} · {day.date}</p><h3 className="mt-1 font-semibold">{routeText || "Route not entered"}</h3></div><span aria-hidden="true" className="text-2xl">🛣️</span></div>{routeText ? <a href={googleMapsUrl(routeText)} target="_blank" rel="noreferrer" className="mt-3 inline-flex rounded-lg bg-emerald-800 px-4 py-2.5 text-sm font-semibold text-white hover:bg-emerald-900">{/\b(KUL|SIN)\b|flight|airport transfer/i.test(routeText) ? "Open locations in Google Maps ↗" : "Open driving route in Google Maps ↗"}</a> : <p className="mt-2 text-sm text-slate-500">Add route details to this day's itinerary to enable directions.</p>}</article>; })}<p className="text-xs text-slate-500">Google Maps opens separately. Route accuracy depends on the place names in your itinerary.</p></div> : <div className="mt-5 space-y-5">
                   <form onSubmit={(event) => { event.preventDefault(); setMemoryPreviewOpen(true); setMemoryMessage(""); }} className="rounded-xl border border-slate-200 p-4">
                     <h3 className="font-semibold">Add a shared memory</h3><p className="mt-1 text-sm text-slate-500">Review the preview before saving. Memories are shared with both approved travellers.</p>
