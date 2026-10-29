@@ -78,7 +78,7 @@ type ChecklistItem = {
   quantity?: string;
   notes?: string;
   due_date?: string;
-  checklist_type?: "packing" | "todo";
+  checklist_type?: "packing" | "todo" | "grocery";
   must_have?: boolean;
 };
 
@@ -158,8 +158,16 @@ function App() {
   const [showDriveAccessModal, setShowDriveAccessModal] = useState(false);
   const [refreshKey, setRefreshKey] = useState(0);
   const [activeDayIndex, setActiveDayIndex] = useState(0);
-  const [activeView, setActiveViewState] = useState<ViewName>("home");
-  const [selectedTripId, setSelectedTripId] = useState("");
+  const [activeView, setActiveViewState] = useState<ViewName>(() => {
+    try {
+      const saved = window.sessionStorage.getItem("campervan-active-view");
+      return saved && ["home", "checklist", "companion", "itinerary", "expenses", "memories", "map"].includes(saved) ? saved as ViewName : "home";
+    } catch { return "home"; }
+  });
+  const [selectedTripId, setSelectedTripId] = useState(() => {
+    try { return window.sessionStorage.getItem("campervan-selected-trip") || ""; }
+    catch { return ""; }
+  });
   const [viewHistory, setViewHistory] = useState<ViewName[]>([]);
   const [showAddTripInfo, setShowAddTripInfo] = useState(false);
   const [trips, setTrips] = useState<TripConfigSummary[]>([]);
@@ -239,10 +247,19 @@ function App() {
   const [expensePaidBy, setExpensePaidBy] = useState("Ralph");
   const [expenseNotes, setExpenseNotes] = useState("");
   const [memories, setMemories] = useState<TripMemory[]>([]);
-  const [memoryAttraction, setMemoryAttraction] = useState("");
-  const [memoryContent, setMemoryContent] = useState("");
+  const [memoryAttraction, setMemoryAttraction] = useState(() => {
+    try { return window.sessionStorage.getItem("campervan-memory-attraction") || ""; }
+    catch { return ""; }
+  });
+  const [memoryContent, setMemoryContent] = useState(() => {
+    try { return window.sessionStorage.getItem("campervan-memory-content") || ""; }
+    catch { return ""; }
+  });
   const [memoryDate, setMemoryDate] = useState(() => formatMemoryDate(new Date()));
-  const [memoryPreviewOpen, setMemoryPreviewOpen] = useState(false);
+  const [memoryPreviewOpen, setMemoryPreviewOpen] = useState(() => {
+    try { return window.sessionStorage.getItem("campervan-memory-preview") === "true"; }
+    catch { return false; }
+  });
   const [isSavingMemory, setIsSavingMemory] = useState(false);
   const [memoryMessage, setMemoryMessage] = useState("");
   const [locationDrafts, setLocationDrafts] = useState<Record<string, string>>({});
@@ -252,6 +269,34 @@ function App() {
   const [memoryPhotoFiles, setMemoryPhotoFiles] = useState<File[]>([]);
   const [isDetectingPlace, setIsDetectingPlace] = useState(false);
   const [touchStart, setTouchStart] = useState<{ x: number; y: number } | null>(null);
+
+  // Preserve the selected trip and internal page across refresh and Google OAuth redirects.
+  useEffect(() => {
+    try {
+      if (selectedTripId) window.sessionStorage.setItem("campervan-selected-trip", selectedTripId);
+      else window.sessionStorage.removeItem("campervan-selected-trip");
+    } catch { /* Session persistence is best-effort. */ }
+  }, [selectedTripId]);
+  useEffect(() => {
+    try { window.sessionStorage.setItem("campervan-active-view", activeView); }
+    catch { /* Session persistence is best-effort. */ }
+  }, [activeView]);
+  useEffect(() => {
+    try {
+      window.sessionStorage.setItem("campervan-memory-attraction", memoryAttraction);
+      window.sessionStorage.setItem("campervan-memory-content", memoryContent);
+      window.sessionStorage.setItem("campervan-memory-preview", String(memoryPreviewOpen));
+    } catch { /* Draft persistence is best-effort. */ }
+  }, [memoryAttraction, memoryContent, memoryPreviewOpen]);
+  useEffect(() => {
+    try {
+      if (window.sessionStorage.getItem("campervan-drive-reconnect-pending") === "1") {
+        window.sessionStorage.removeItem("campervan-drive-reconnect-pending");
+        setShowDriveAccessModal(false);
+        setMemoryMessage("Google access was refreshed. Please select the photo again, then tap Confirm & save. Your memory text has been kept.");
+      }
+    } catch { /* Ignore unavailable session storage. */ }
+  }, []);
 
   useEffect(() => {
     let cancelled = false;
@@ -420,27 +465,30 @@ function App() {
     if (!verifiedEmail || !selectedTripId) return;
     let cancelled = false;
     async function loadExpensesAndChecklist() {
-      try {
-        const [expenseResponse, checklistResponse] = await Promise.all([
-          fetch(`/api/expenses?tripId=${encodeURIComponent(selectedTripId)}`, { credentials: "same-origin", cache: "no-store" }),
-          fetch(`/api/checklist?tripId=${encodeURIComponent(selectedTripId)}`, { credentials: "same-origin", cache: "no-store" }),
-        ]);
-        const expenseResult = await expenseResponse.json() as ApiResponse;
-        const checklistResult = await checklistResponse.json() as ApiResponse;
-        if (!expenseResponse.ok || !expenseResult.success) throw new Error(expenseResult.error || "Could not load expenses.");
-        if (!checklistResponse.ok || !checklistResult.success) throw new Error(checklistResult.error || "Could not load the shared checklist.");
-        if (!cancelled) {
-          setExpenses(Array.isArray(expenseResult.expenses) ? expenseResult.expenses : []);
-          setChecklistItems(Array.isArray(checklistResult.checklistItems) ? checklistResult.checklistItems : Array.isArray(checklistResult.items) ? checklistResult.items : []);
-          setExpenseMessage("");
-          setChecklistMessage("");
-        }
-      } catch (error) {
-        if (!cancelled) {
-          const message = error instanceof Error ? error.message : "Could not load shared trip records.";
-          setExpenseMessage(message);
-          setChecklistMessage(message);
-        }
+      const [expenseLoad, checklistLoad] = await Promise.allSettled([
+        fetch(`/api/expenses?tripId=${encodeURIComponent(selectedTripId)}`, { credentials: "same-origin", cache: "no-store" })
+          .then(async (response) => ({ response, result: await response.json() as ApiResponse })),
+        fetch(`/api/checklist?tripId=${encodeURIComponent(selectedTripId)}`, { credentials: "same-origin", cache: "no-store" })
+          .then(async (response) => ({ response, result: await response.json() as ApiResponse })),
+      ]);
+      if (cancelled) return;
+      if (expenseLoad.status === "fulfilled" && expenseLoad.value.response.ok && expenseLoad.value.result.success) {
+        setExpenses(Array.isArray(expenseLoad.value.result.expenses) ? expenseLoad.value.result.expenses : []);
+        setExpenseMessage("");
+      } else {
+        const message = expenseLoad.status === "rejected"
+          ? (expenseLoad.reason instanceof Error ? expenseLoad.reason.message : "Could not load expenses.")
+          : expenseLoad.value.result.error || `Could not load expenses (HTTP ${expenseLoad.value.response.status}).`;
+        setExpenseMessage(message);
+      }
+      if (checklistLoad.status === "fulfilled" && checklistLoad.value.response.ok && checklistLoad.value.result.success) {
+        setChecklistItems(Array.isArray(checklistLoad.value.result.checklistItems) ? checklistLoad.value.result.checklistItems : Array.isArray(checklistLoad.value.result.items) ? checklistLoad.value.result.items : []);
+        setChecklistMessage("");
+      } else {
+        const message = checklistLoad.status === "rejected"
+          ? (checklistLoad.reason instanceof Error ? checklistLoad.reason.message : "Could not load the shared checklist.")
+          : checklistLoad.value.result.error || `Could not load the shared checklist (HTTP ${checklistLoad.value.response.status}).`;
+        setChecklistMessage(message);
       }
     }
     void loadExpensesAndChecklist();
@@ -547,6 +595,11 @@ function App() {
       setMemoryAttraction("");
       setMemoryContent("");
       setMemoryPhotoFiles([]);
+      try {
+        window.sessionStorage.removeItem("campervan-memory-attraction");
+        window.sessionStorage.removeItem("campervan-memory-content");
+        window.sessionStorage.removeItem("campervan-memory-preview");
+      } catch { /* Ignore unavailable session storage. */ }
       setMemoryPreviewOpen(false);
       setMemoryMessage("Memory saved and shared with your travel companion.");
     } catch (error) {
@@ -1462,7 +1515,7 @@ function App() {
             </div>
             <div className="mt-5 flex flex-col-reverse gap-2 sm:flex-row sm:justify-end">
               <button type="button" onClick={() => setShowDriveAccessModal(false)} className="rounded-xl border border-slate-300 px-4 py-2.5 text-sm font-semibold">Not now</button>
-              <button type="button" onClick={() => window.location.assign("/api/sheets/connect")} className="rounded-xl bg-emerald-800 px-4 py-2.5 text-sm font-semibold text-white hover:bg-emerald-900">Reconnect Google / Drive</button>
+              <button type="button" onClick={() => { try { window.sessionStorage.setItem("campervan-selected-trip", selectedTripId); window.sessionStorage.setItem("campervan-active-view", activeView); window.sessionStorage.setItem("campervan-memory-attraction", memoryAttraction); window.sessionStorage.setItem("campervan-memory-content", memoryContent); window.sessionStorage.setItem("campervan-memory-preview", String(memoryPreviewOpen)); window.sessionStorage.setItem("campervan-drive-reconnect-pending", "1"); } catch { /* Continue to OAuth even if storage is unavailable. */ } window.location.assign("/api/sheets/connect"); }} className="rounded-xl bg-emerald-800 px-4 py-2.5 text-sm font-semibold text-white hover:bg-emerald-900">Reconnect Google / Drive</button>
             </div>
           </section>
         </div>
