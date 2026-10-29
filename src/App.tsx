@@ -805,8 +805,6 @@ function App() {
   const selectedChecklistItems = checklistItems.filter((item) => item.category === selectedChecklistCategory);
   const currentChecklistField = verifiedEmail.toLowerCase() === "koochanyee@gmail.com" ? "ralph_status" : "june_status";
   const checklistCompletedCount = checklistItems.filter((item) => item[currentChecklistField] === "✓").length;
-  const preTripExpenses = expenses.filter((expense) => expense.expense_type === "pre-trip");
-  const actualTripExpenses = expenses.filter((expense) => expense.expense_type === "actual-trip");
   const paidOrActualExpenses = expenses.filter((expense) => expense.source !== "FINAL EXPENSES" || expense.payment_status === "Paid");
   const paidPreTripExpenses = paidOrActualExpenses.filter((expense) => expense.expense_type === "pre-trip");
   const formatMoney = (amount: number, currency: string) => `${currency || "NZD"} ${Number(amount || 0).toFixed(2)}`;
