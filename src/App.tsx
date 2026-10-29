@@ -487,426 +487,6 @@ function App() {
       setExpenseMessage(error instanceof Error ? error.message : "Could not save the expense.");
     } finally { setExpenseSaving(false); }
   };
-} catch (error) {
-        console.error("Session restoration failed:", error);
-      }
-    }
-    void restoreSession();
-    return () => { cancelled = true; };
-  }, []);
-
-  useEffect(() => {
-    const clientId = import.meta.env.VITE_GOOGLE_CLIENT_ID as string | undefined;
-    if (!clientId) {
-      setAuthMessage("Google sign-in configuration is missing.");
-      return;
-    }
-
-    let attempts = 0;
-    let timer: ReturnType<typeof setInterval> | undefined;
-    const setupGoogleSignIn = () => {
-      if (!window.google?.accounts.id) {
-        attempts += 1;
-        if (attempts >= 20 && timer) clearInterval(timer);
-        return;
-      }
-      if (timer) clearInterval(timer);
-      const button = document.getElementById("google-sign-in-button");
-      if (!button) return;
-      button.replaceChildren();
-      window.google.accounts.id.initialize({
-        client_id: clientId,
-        callback: async (response) => {
-          setAuthMessage("Verifying Google account…");
-          setIsVerifying(true);
-          try {
-            const result = await fetch("/api/auth/google", {
-              method: "POST",
-              credentials: "same-origin",
-              headers: { "Content-Type": "application/json" },
-              body: JSON.stringify({ credential: response.credential }),
-            });
-            const data = (await result.json()) as ApiResponse;
-            if (!result.ok || !data.success || !data.user?.email) {
-              throw new Error(data.error || "Google verification failed.");
-            }
-            setVerifiedEmail(data.user.email);
-            setAuthMessage("Google identity verified. Loading trip selection…");
-          } catch (error) {
-            setAuthMessage(error instanceof Error ? error.message : "Google verification failed. Please try again.");
-          } finally {
-            setIsVerifying(false);
-          }
-        },
-      });
-      window.google.accounts.id.renderButton(button, { theme: "outline", size: "large", text: "signin_with" });
-    };
-
-    setupGoogleSignIn();
-    if (!window.google?.accounts.id) timer = setInterval(setupGoogleSignIn, 500);
-    return () => { if (timer) clearInterval(timer); };
-  }, []);
-
-  useEffect(() => {
-    if (!verifiedEmail) return;
-    let cancelled = false;
-    async function loadTrips() {
-      try {
-        const response = await fetch("/api/trips", { credentials: "same-origin", cache: "no-store" });
-        const result = await response.json() as ApiResponse;
-        if (!response.ok || !result.success) throw new Error(result.error || "Could not load trips.");
-        if (!cancelled) setTrips(Array.isArray(result.trips) ? result.trips : []);
-      } catch (error) {
-        if (!cancelled) setTripMessage(error instanceof Error ? error.message : "Could not load trips.");
-      }
-    }
-    void loadTrips();
-    return () => { cancelled = true; };
-  }, [verifiedEmail]);
-
-  const addTrip = async (event: FormEvent<HTMLFormElement>) => {
-    event.preventDefault();
-    setTripSaving(true); setTripMessage("");
-    try {
-      const response = await fetch("/api/trips", { method: "POST", credentials: "same-origin", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ name: tripNameDraft.trim(), sheetId: tripSheetIdDraft.trim(), itineraryTab: tripTabDraft.trim() || "FINAL ITINERARY" }) });
-      const result = await response.json() as ApiResponse;
-      if (!response.ok || !result.success || !result.trip) throw new Error(result.error || "Could not add this trip.");
-      setTrips((current) => [...current, result.trip as TripConfigSummary]);
-      setTripNameDraft(""); setTripSheetIdDraft(""); setTripTabDraft("FINAL ITINERARY"); setShowAddTripInfo(false);
-      setTripMessage("Trip connected successfully.");
-    } catch (error) { setTripMessage(error instanceof Error ? error.message : "Could not add this trip."); }
-    finally { setTripSaving(false); }
-  };
-
-  useEffect(() => {
-    if (!verifiedEmail || !selectedTripId) return;
-    let cancelled = false;
-    async function loadItinerary() {
-      setIsLoadingItinerary(true);
-      setItineraryError("");
-      setNeedsSheetsConnection(false);
-      try {
-        const response = await fetch(`/api/itinerary?tripId=${encodeURIComponent(selectedTripId)}`, {
-          method: "GET",
-          credentials: "same-origin",
-          cache: "no-store",
-        });
-        const result = (await response.json()) as ApiResponse;
-        if (!response.ok || !result.success) {
-          if (!cancelled) {
-            setItineraryRows([]);
-            setNeedsSheetsConnection(response.status === 403 || Boolean(result.connectUrl));
-            setItineraryError(result.error || `Could not load itinerary (HTTP ${response.status}).`);
-          }
-          return;
-        }
-        if (!cancelled) {
-          const rows = Array.isArray(result.data) ? result.data : [];
-          setItineraryRows(rows);
-          setSupplementaryTabs(result.supplementaryTabs ?? {});
-          setActiveDayIndex(0);
-          setItineraryError("");
-          setNeedsSheetsConnection(false);
-          setAuthMessage("Signed in. Itinerary loaded from Google Sheets.");
-        }
-      } catch (error) {
-        if (!cancelled) setItineraryError(error instanceof Error ? error.message : "Could not load itinerary.");
-      } finally {
-        if (!cancelled) setIsLoadingItinerary(false);
-      }
-    }
-    void loadItinerary();
-    return () => { cancelled = true; };
-  }, [verifiedEmail, selectedTripId, refreshKey]);
-
-  useEffect(() => {
-    if (!verifiedEmail || !selectedTripId) return;
-    let cancelled = false;
-    async function loadMemories() {
-      try {
-        const response = await fetch(`/api/memories?tripId=${encodeURIComponent(selectedTripId)}`, {
-          method: "GET", credentials: "same-origin", cache: "no-store",
-        });
-        const result = (await response.json()) as ApiResponse;
-        if (!response.ok || !result.success) throw new Error(result.error || "Could not load travel memories.");
-        if (!cancelled) setMemories(Array.isArray(result.memories) ? result.memories : []);
-      } catch (error) {
-        if (!cancelled) setMemoryMessage(error instanceof Error ? error.message : "Could not load travel memories.");
-      }
-    }
-    void loadMemories();
-    return () => { cancelled = true; };
-  }, [verifiedEmail, selectedTripId]);
-
-  useEffect(() => {
-    if (!verifiedEmail || !selectedTripId) return;
-    let cancelled = false;
-    async function loadExpensesAndChecklist() {
-      try {
-        const [expenseResponse, checklistResponse] = await Promise.all([
-          fetch(`/api/expenses?tripId=${encodeURIComponent(selectedTripId)}`, { credentials: "same-origin", cache: "no-store" }),
-          fetch(`/api/checklist?tripId=${encodeURIComponent(selectedTripId)}`, { credentials: "same-origin", cache: "no-store" }),
-        ]);
-        const expenseResult = await expenseResponse.json() as ApiResponse;
-        const checklistResult = await checklistResponse.json() as ApiResponse;
-        if (!expenseResponse.ok || !expenseResult.success) throw new Error(expenseResult.error || "Could not load expenses.");
-        if (!checklistResponse.ok || !checklistResult.success) throw new Error(checklistResult.error || "Could not load the shared checklist.");
-        if (!cancelled) {
-          setExpenses(Array.isArray(expenseResult.expenses) ? expenseResult.expenses : []);
-          setChecklistItems(Array.isArray(checklistResult.checklistItems) ? checklistResult.checklistItems : Array.isArray(checklistResult.items) ? checklistResult.items : []);
-          setExpenseMessage("");
-          setChecklistMessage("");
-        }
-      } catch (error) {
-        if (!cancelled) {
-          const message = error instanceof Error ? error.message : "Could not load shared trip records.";
-          setExpenseMessage(message);
-          setChecklistMessage(message);
-        }
-      }
-    }
-    void loadExpensesAndChecklist();
-    return () => { cancelled = true; };
-  }, [verifiedEmail, selectedTripId]);
-
-  const saveExpense = async (event: FormEvent<HTMLFormElement>) => {
-    event.preventDefault();
-    const amount = Number(expenseAmount);
-    if (!expenseDate || !expenseDescription.trim() || !Number.isFinite(amount) || amount <= 0) {
-      setExpenseMessage("Enter a date, description and amount greater than zero.");
-      return;
-    }
-    setExpenseSaving(true);
-    setExpenseMessage("");
-    const record: TripExpense = {
-      expense_id: typeof crypto !== "undefined" && "randomUUID" in crypto ? crypto.randomUUID() : `${Date.now()}`,
-      date: expenseDate,
-      description: expenseDescription.trim(),
-      category: expenseCategory,
-      amount,
-      currency: expenseCurrency,
-      paid_by: expensePaidBy,
-      expense_type: expenseType,
-      notes: expenseNotes.trim(),
-    };
-    try {
-      const response = await fetch(`/api/expenses?tripId=${encodeURIComponent(selectedTripId)}`, {
-        method: "POST", credentials: "same-origin",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ ...record, tripId: selectedTripId }),
-      });
-      const result = await response.json() as ApiResponse;
-      if (!response.ok || !result.success) throw new Error(result.error || "Could not save the expense.");
-      const refreshed = await fetch(`/api/expenses?tripId=${encodeURIComponent(selectedTripId)}`, { credentials: "same-origin", cache: "no-store" });
-      const refreshedResult = await refreshed.json() as ApiResponse;
-      if (refreshed.ok && refreshedResult.success) setExpenses(Array.isArray(refreshedResult.expenses) ? refreshedResult.expenses : [...expenses, record]);
-      setExpenseDescription(""); setExpenseAmount(""); setExpenseNotes("");
-      setExpenseMessage("Expense saved to the shared trip sheet.");
-    } catch (error) {
-      setExpenseMessage(error instanceof Error ? error.message : "Could not save the expense.");
-    } finally { setExpenseSaving(false); }
-  };
-     if (!window.google?.accounts.id) {
-        attempts += 1;
-        if (attempts >= 20 && timer) clearInterval(timer);
-        return;
-      }
-      if (timer) clearInterval(timer);
-      const button = document.getElementById("google-sign-in-button");
-      if (!button) return;
-      button.replaceChildren();
-      window.google.accounts.id.initialize({
-        client_id: clientId,
-        callback: async (response) => {
-          setAuthMessage("Verifying Google account…");
-          setIsVerifying(true);
-          try {
-            const result = await fetch("/api/auth/google", {
-              method: "POST",
-              credentials: "same-origin",
-              headers: { "Content-Type": "application/json" },
-              body: JSON.stringify({ credential: response.credential }),
-            });
-            const data = (await result.json()) as ApiResponse;
-            if (!result.ok || !data.success || !data.user?.email) {
-              throw new Error(data.error || "Google verification failed.");
-            }
-            setVerifiedEmail(data.user.email);
-            setAuthMessage("Google identity verified. Loading trip selection…");
-          } catch (error) {
-            setAuthMessage(error instanceof Error ? error.message : "Google verification failed. Please try again.");
-          } finally {
-            setIsVerifying(false);
-          }
-        },
-      });
-      window.google.accounts.id.renderButton(button, { theme: "outline", size: "large", text: "signin_with" });
-    };
-
-    setupGoogleSignIn();
-    if (!window.google?.accounts.id) timer = setInterval(setupGoogleSignIn, 500);
-    return () => { if (timer) clearInterval(timer); };
-  }, []);
-
-  useEffect(() => {
-    if (!verifiedEmail) return;
-    let cancelled = false;
-    async function loadTrips() {
-      try {
-        const response = await fetch("/api/trips", { credentials: "same-origin", cache: "no-store" });
-        const result = await response.json() as ApiResponse;
-        if (!response.ok || !result.success) throw new Error(result.error || "Could not load trips.");
-        if (!cancelled) setTrips(Array.isArray(result.trips) ? result.trips : []);
-      } catch (error) {
-        if (!cancelled) setTripMessage(error instanceof Error ? error.message : "Could not load trips.");
-      }
-    }
-    void loadTrips();
-    return () => { cancelled = true; };
-  }, [verifiedEmail]);
-
-  const addTrip = async (event: FormEvent<HTMLFormElement>) => {
-    event.preventDefault();
-    setTripSaving(true); setTripMessage("");
-    try {
-      const response = await fetch("/api/trips", { method: "POST", credentials: "same-origin", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ name: tripNameDraft.trim(), sheetId: tripSheetIdDraft.trim(), itineraryTab: tripTabDraft.trim() || "FINAL ITINERARY" }) });
-      const result = await response.json() as ApiResponse;
-      if (!response.ok || !result.success || !result.trip) throw new Error(result.error || "Could not add this trip.");
-      setTrips((current) => [...current, result.trip as TripConfigSummary]);
-      setTripNameDraft(""); setTripSheetIdDraft(""); setTripTabDraft("FINAL ITINERARY"); setShowAddTripInfo(false);
-      setTripMessage("Trip connected successfully.");
-    } catch (error) { setTripMessage(error instanceof Error ? error.message : "Could not add this trip."); }
-    finally { setTripSaving(false); }
-  };
-
-  useEffect(() => {
-    if (!verifiedEmail || !selectedTripId) return;
-    let cancelled = false;
-    async function loadItinerary() {
-      setIsLoadingItinerary(true);
-      setItineraryError("");
-      setNeedsSheetsConnection(false);
-      try {
-        const response = await fetch(`/api/itinerary?tripId=${encodeURIComponent(selectedTripId)}`, {
-          method: "GET",
-          credentials: "same-origin",
-          cache: "no-store",
-        });
-        const result = (await response.json()) as ApiResponse;
-        if (!response.ok || !result.success) {
-          if (!cancelled) {
-            setItineraryRows([]);
-            setNeedsSheetsConnection(response.status === 403 || Boolean(result.connectUrl));
-            setItineraryError(result.error || `Could not load itinerary (HTTP ${response.status}).`);
-          }
-          return;
-        }
-        if (!cancelled) {
-          const rows = Array.isArray(result.data) ? result.data : [];
-          setItineraryRows(rows);
-          setSupplementaryTabs(result.supplementaryTabs ?? {});
-          setActiveDayIndex(0);
-          setItineraryError("");
-          setNeedsSheetsConnection(false);
-          setAuthMessage("Signed in. Itinerary loaded from Google Sheets.");
-        }
-      } catch (error) {
-        if (!cancelled) setItineraryError(error instanceof Error ? error.message : "Could not load itinerary.");
-      } finally {
-        if (!cancelled) setIsLoadingItinerary(false);
-      }
-    }
-    void loadItinerary();
-    return () => { cancelled = true; };
-  }, [verifiedEmail, selectedTripId, refreshKey]);
-
-  useEffect(() => {
-    if (!verifiedEmail || !selectedTripId) return;
-    let cancelled = false;
-    async function loadMemories() {
-      try {
-        const response = await fetch(`/api/memories?tripId=${encodeURIComponent(selectedTripId)}`, {
-          method: "GET", credentials: "same-origin", cache: "no-store",
-        });
-        const result = (await response.json()) as ApiResponse;
-        if (!response.ok || !result.success) throw new Error(result.error || "Could not load travel memories.");
-        if (!cancelled) setMemories(Array.isArray(result.memories) ? result.memories : []);
-      } catch (error) {
-        if (!cancelled) setMemoryMessage(error instanceof Error ? error.message : "Could not load travel memories.");
-      }
-    }
-    void loadMemories();
-    return () => { cancelled = true; };
-  }, [verifiedEmail, selectedTripId]);
-
-  useEffect(() => {
-    if (!verifiedEmail || !selectedTripId) return;
-    let cancelled = false;
-    async function loadExpensesAndChecklist() {
-      try {
-        const [expenseResponse, checklistResponse] = await Promise.all([
-          fetch(`/api/expenses?tripId=${encodeURIComponent(selectedTripId)}`, { credentials: "same-origin", cache: "no-store" }),
-          fetch(`/api/checklist?tripId=${encodeURIComponent(selectedTripId)}`, { credentials: "same-origin", cache: "no-store" }),
-        ]);
-        const expenseResult = await expenseResponse.json() as ApiResponse;
-        const checklistResult = await checklistResponse.json() as ApiResponse;
-        if (!expenseResponse.ok || !expenseResult.success) throw new Error(expenseResult.error || "Could not load expenses.");
-        if (!checklistResponse.ok || !checklistResult.success) throw new Error(checklistResult.error || "Could not load the shared checklist.");
-        if (!cancelled) {
-          setExpenses(Array.isArray(expenseResult.expenses) ? expenseResult.expenses : []);
-          setChecklistItems(Array.isArray(checklistResult.checklistItems) ? checklistResult.checklistItems : Array.isArray(checklistResult.items) ? checklistResult.items : []);
-          setExpenseMessage("");
-          setChecklistMessage("");
-        }
-      } catch (error) {
-        if (!cancelled) {
-          const message = error instanceof Error ? error.message : "Could not load shared trip records.";
-          setExpenseMessage(message);
-          setChecklistMessage(message);
-        }
-      }
-    }
-    void loadExpensesAndChecklist();
-    return () => { cancelled = true; };
-  }, [verifiedEmail, selectedTripId]);
-
-  const saveExpense = async (event: FormEvent<HTMLFormElement>) => {
-    event.preventDefault();
-    const amount = Number(expenseAmount);
-    if (!expenseDate || !expenseDescription.trim() || !Number.isFinite(amount) || amount <= 0) {
-      setExpenseMessage("Enter a date, description and amount greater than zero.");
-      return;
-    }
-    setExpenseSaving(true);
-    setExpenseMessage("");
-    const record: TripExpense = {
-      expense_id: typeof crypto !== "undefined" && "randomUUID" in crypto ? crypto.randomUUID() : `${Date.now()}`,
-      date: expenseDate,
-      description: expenseDescription.trim(),
-      category: expenseCategory,
-      amount,
-      currency: expenseCurrency,
-      paid_by: expensePaidBy,
-      expense_type: expenseType,
-      notes: expenseNotes.trim(),
-    };
-    try {
-      const response = await fetch(`/api/expenses?tripId=${encodeURIComponent(selectedTripId)}`, {
-        method: "POST", credentials: "same-origin",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ ...record, tripId: selectedTripId }),
-      });
-      const result = await response.json() as ApiResponse;
-      if (!response.ok || !result.success) throw new Error(result.error || "Could not save the expense.");
-      const refreshed = await fetch(`/api/expenses?tripId=${encodeURIComponent(selectedTripId)}`, { credentials: "same-origin", cache: "no-store" });
-      const refreshedResult = await refreshed.json() as ApiResponse;
-      if (refreshed.ok && refreshedResult.success) setExpenses(Array.isArray(refreshedResult.expenses) ? refreshedResult.expenses : [...expenses, record]);
-      setExpenseDescription(""); setExpenseAmount(""); setExpenseNotes("");
-      setExpenseMessage("Expense saved to the shared trip sheet.");
-    } catch (error) {
-      setExpenseMessage(error instanceof Error ? error.message : "Could not save the expense.");
-    } finally { setExpenseSaving(false); }
-  };
 
   const setChecklistStatus = async (item: ChecklistItem, status: "" | "✓" | "x") => {
     const currentName = verifiedEmail.toLowerCase() === "koochanyee@gmail.com" ? "Ralph" : "June";
@@ -1221,7 +801,12 @@ function App() {
             {verifiedEmail && selectedTripId && activeView === "home" && (
               <button type="button" onClick={returnToTripSelection} className="rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm font-semibold hover:bg-slate-50">Trip selection</button>
             )}
-            {verifiedEmail && selectedTripId && <button type="button" onClick={() => needsSheetsConnection ? window.location.assign("/api/sheets/connect") : setRefreshKey((n) => n + 1)} disabled={isLoadingItinerary} className="rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm font-semibold hover:bg-slate-50 disabled:opacity-50">{needsSheetsConnection ? "Reconnect Google Sheets" : "Refresh itinerary"}</button>}
+            {verifiedEmail && selectedTripId && (
+              <>
+                <button type="button" onClick={() => setRefreshKey((n) => n + 1)} disabled={isLoadingItinerary} className="rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm font-semibold hover:bg-slate-50 disabled:opacity-50">Refresh itinerary</button>
+                <button type="button" onClick={() => window.location.assign("/api/sheets/connect")} className="rounded-lg border border-emerald-800 bg-white px-3 py-2 text-sm font-semibold text-emerald-900 hover:bg-emerald-50">Reconnect Google / Drive access</button>
+              </>
+            )}
           </div>
         </div>
       </header>
@@ -1487,12 +1072,24 @@ function App() {
                           <p className="px-5 py-8 text-sm text-slate-500">No itinerary details have been entered for this day yet.</p>
                         ) : (
                           <div className="space-y-4 p-4 sm:p-5">
-                            <section className="rounded-2xl border border-emerald-200 bg-gradient-to-br from-emerald-50 to-white p-4 shadow-sm sm:p-5">
-                              <h4 className="text-lg font-bold">⭐ Today Highlight</h4>
+                            <section
+                              className={`relative overflow-hidden rounded-2xl border border-slate-300 p-4 shadow-sm sm:p-5 ${showHighlightPhoto ? "text-white" : "border-emerald-200 bg-gradient-to-br from-emerald-50 to-white text-slate-900"}`}
+                              style={showHighlightPhoto ? {
+                                backgroundImage: "linear-gradient(110deg, rgba(8, 24, 38, 0.88), rgba(8, 24, 38, 0.62)), url(https://images.unsplash.com/photo-1469521669194-babb45599def?auto=format&fit=crop&w=1600&q=85)",
+                                backgroundSize: "cover",
+                                backgroundPosition: "center",
+                              } : undefined}
+                            >
+                              <div className="flex flex-wrap items-center justify-between gap-2">
+                                <h4 className="text-lg font-bold">⭐ Today Highlight</h4>
+                                <button type="button" onClick={() => setShowHighlightPhoto((enabled) => !enabled)} aria-pressed={showHighlightPhoto} className={`rounded-full border px-3 py-1.5 text-xs font-semibold transition ${showHighlightPhoto ? "border-white/60 bg-black/25 text-white hover:bg-black/40" : "border-slate-300 bg-white text-slate-700 hover:bg-slate-50"}`}>
+                                  {showHighlightPhoto ? "Photo background: On" : "Photo background: Off"}
+                                </button>
+                              </div>
                               <div className="mt-4 space-y-4">
-                                <div><p className="font-semibold">🛣️ Route</p>{categorized.route.filter((entry) => /route|destination|distance|departure|arrival|transport/i.test(entry.label)).length ? categorized.route.filter((entry) => /route|destination|distance|departure|arrival|transport/i.test(entry.label)).map((entry) => <p key={entry.key} className="mt-1 whitespace-pre-wrap text-sm leading-6">{entry.value}</p>) : <p className="mt-1 text-sm text-slate-500">No route details entered for this day.</p>}</div>
-                                <div><p className="font-semibold">🚐 Driving note</p>{categorized.route.filter((entry) => /drive|driving|travel time/i.test(entry.label)).length ? categorized.route.filter((entry) => /drive|driving|travel time/i.test(entry.label)).map((entry) => <p key={entry.key} className="mt-1 whitespace-pre-wrap text-sm leading-6">{entry.value}</p>) : <p className="mt-1 text-sm text-slate-500">No separate driving note entered.</p>}</div>
-                                <div><p className="font-semibold">⚡ Activity</p>{dashboardPreviewDays.find((item) => item.day.key === selectedDay.key)?.highlights.length ? <ul className="mt-1 list-disc space-y-1 pl-5 text-sm leading-6">{dashboardPreviewDays.find((item) => item.day.key === selectedDay.key)!.highlights.map((item, i) => <li key={`${i}-${item}`}>{item}</li>)}</ul> : <p className="mt-1 text-sm text-slate-500">Activity highlights will appear here from the itinerary.</p>}</div>
+                                <div><p className="font-semibold">🛣️ Route</p>{categorized.route.filter((entry) => /route|destination|distance|departure|arrival|transport/i.test(entry.label)).length ? categorized.route.filter((entry) => /route|destination|distance|departure|arrival|transport/i.test(entry.label)).map((entry) => <p key={entry.key} className="mt-1 whitespace-pre-wrap text-sm leading-6">{entry.value}</p>) : <p className={`mt-1 text-sm ${showHighlightPhoto ? "text-white/80" : "text-slate-500"}`}>No route details entered for this day.</p>}</div>
+                                <div><p className="font-semibold">🚐 Driving note</p>{categorized.route.filter((entry) => /drive|driving|travel time/i.test(entry.label)).length ? categorized.route.filter((entry) => /drive|driving|travel time/i.test(entry.label)).map((entry) => <p key={entry.key} className="mt-1 whitespace-pre-wrap text-sm leading-6">{entry.value}</p>) : <p className={`mt-1 text-sm ${showHighlightPhoto ? "text-white/80" : "text-slate-500"}`}>No separate driving note entered.</p>}</div>
+                                <div><p className="font-semibold">⚡ Activity</p>{dashboardPreviewDays.find((item) => item.day.key === selectedDay.key)?.highlights.length ? <ul className="mt-1 list-disc space-y-1 pl-5 text-sm leading-6">{dashboardPreviewDays.find((item) => item.day.key === selectedDay.key)!.highlights.map((item, i) => <li key={`${i}-${item}`}>{item}</li>)}</ul> : <p className={`mt-1 text-sm ${showHighlightPhoto ? "text-white/80" : "text-slate-500"}`}>Activity highlights will appear here from the itinerary.</p>}</div>
                               </div>
                             </section>
                             <section className="space-y-3">
@@ -1637,7 +1234,7 @@ function App() {
 
                                         {layering.icons && layering.icons.length > 0 && (
                                           <p className="text-4xl" aria-label="Suggested clothing">
-                                            {layering.icons.map((icon) => /fleece|wool|yarn|🧶|🧵|🧣/i.test(icon) ? "🧥" : icon).join(" ")}
+                                            {layering.icons.map((icon) => /fleece|wool|yarn|🧶|🧵/i.test(icon) ? "🧶" : icon).join(" ")}
                                           </p>
                                         )}
 
@@ -1721,7 +1318,10 @@ function App() {
                         const status = String(item[currentChecklistField] ?? "");
                         return (
                           <article key={item.item_id} className={`rounded-xl border p-4 transition ${status === "x" ? "border-slate-200 bg-slate-50 opacity-75" : status === "✓" ? "border-emerald-200 bg-emerald-50/40" : "border-slate-200 bg-white"}`}>
-                            <p className={`font-medium ${status === "x" ? "text-slate-500 line-through" : "text-slate-800"}`}>{item.item}</p>
+                            <div className="flex flex-wrap items-center gap-2">
+                              <p className={`font-medium ${status === "x" ? "text-slate-500 line-through" : "text-slate-800"}`}>{item.item}</p>
+                              {item.checklist_type === "packing" && item.must_have && <span className="inline-flex items-center rounded-full border border-rose-200 bg-rose-50 px-2 py-0.5 text-xs font-bold text-rose-700">✔️ Must have</span>}
+                            </div>
                             {(item.quantity || item.due_date || item.notes) && <p className="mt-1 whitespace-pre-wrap text-sm leading-5 text-slate-500">{[item.quantity ? `Qty: ${item.quantity}` : "", item.due_date ? `Due: ${item.due_date}` : "", item.notes || ""].filter(Boolean).join(" · ")}</p>}
                             <div className="mt-3 flex flex-wrap gap-2">
                               <button type="button" disabled={checklistSavingId === item.item_id} onClick={() => void setChecklistStatus(item, status === "✓" ? "" : "✓")} className={`rounded-lg border px-3 py-2 text-sm font-semibold disabled:opacity-50 ${status === "✓" ? "border-emerald-800 bg-emerald-800 text-white" : "border-slate-300 bg-white text-slate-700"}`}>{status === "✓" ? "✓ Done" : "□ Mark done"}</button>
