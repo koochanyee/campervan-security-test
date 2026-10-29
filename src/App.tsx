@@ -156,6 +156,7 @@ function App() {
   const [isLoadingItinerary, setIsLoadingItinerary] = useState(false);
   const [itineraryError, setItineraryError] = useState("");
   const [needsSheetsConnection, setNeedsSheetsConnection] = useState(false);
+  const [showDriveAccessModal, setShowDriveAccessModal] = useState(false);
   const [refreshKey, setRefreshKey] = useState(0);
   const [activeDayIndex, setActiveDayIndex] = useState(0);
   const [activeView, setActiveViewState] = useState<ViewName>("home");
@@ -553,7 +554,11 @@ function App() {
       setMemoryPreviewOpen(false);
       setMemoryMessage("Memory saved and shared with your travel companion.");
     } catch (error) {
-      setMemoryMessage(error instanceof Error ? error.message : "Could not save this memory.");
+      const message = error instanceof Error ? error.message : "Could not save this memory.";
+      setMemoryMessage(message);
+      if (memoryPhotoFiles.length > 0 && /drive|permission|authorization|scope|access/i.test(message)) {
+        setShowDriveAccessModal(true);
+      }
     } finally {
       setIsSavingMemory(false);
     }
@@ -781,7 +786,7 @@ function App() {
   const selectedTrip = trips.find((trip) => trip.id === selectedTripId);
 
   return (
-    <div className="min-h-screen bg-[#f4f6f4] pb-24 text-slate-900">
+    <div className="min-h-screen bg-[#f4f6f4] pb-40 text-slate-900">
       <style>{`@keyframes itinerarySlideIn { from { opacity: .65; transform: translateX(10px); } to { opacity: 1; transform: translateX(0); } }`}</style>
       <header className="border-b border-slate-200 bg-white">
         <div className="mx-auto flex max-w-6xl flex-col gap-3 px-4 py-4 sm:flex-row sm:items-center sm:justify-between sm:px-6">
@@ -800,12 +805,6 @@ function App() {
             )}
             {verifiedEmail && selectedTripId && activeView === "home" && (
               <button type="button" onClick={returnToTripSelection} className="rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm font-semibold hover:bg-slate-50">Trip selection</button>
-            )}
-            {verifiedEmail && selectedTripId && (
-              <>
-                <button type="button" onClick={() => setRefreshKey((n) => n + 1)} disabled={isLoadingItinerary} className="rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm font-semibold hover:bg-slate-50 disabled:opacity-50">Refresh itinerary</button>
-                <button type="button" onClick={() => window.location.assign("/api/sheets/connect")} className="rounded-lg border border-emerald-800 bg-white px-3 py-2 text-sm font-semibold text-emerald-900 hover:bg-emerald-50">Reconnect Google / Drive access</button>
-              </>
             )}
           </div>
         </div>
@@ -882,7 +881,6 @@ function App() {
                 <p className="mt-1 text-sm text-amber-800">{itineraryError}</p>
                 <div className="mt-3 flex flex-wrap gap-2">
                   <button type="button" onClick={() => setRefreshKey((n) => n + 1)} className="rounded-lg bg-amber-900 px-3 py-2 text-sm font-semibold text-white">Try again</button>
-                  {needsSheetsConnection && <button type="button" onClick={() => window.location.assign("/api/sheets/connect")} className="rounded-lg border border-amber-900 px-3 py-2 text-sm font-semibold text-amber-950">Connect Google Sheets</button>}
                 </div>
               </div>
             )}
@@ -1455,8 +1453,34 @@ function App() {
         </div>
       )}
 
-      {verifiedEmail && (
-        <nav className="fixed inset-x-0 bottom-0 z-20 border-t border-slate-200 bg-white/95 px-2 pb-[env(safe-area-inset-bottom)] backdrop-blur">
+      {showDriveAccessModal && verifiedEmail && selectedTripId && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-950/55 p-4" role="dialog" aria-modal="true" aria-labelledby="drive-access-title">
+          <section className="w-full max-w-md rounded-2xl bg-white p-5 shadow-2xl sm:p-6">
+            <div className="flex items-start gap-3">
+              <div className="flex h-11 w-11 shrink-0 items-center justify-center rounded-full bg-amber-100 text-xl" aria-hidden="true">🔐</div>
+              <div className="min-w-0 flex-1">
+                <h2 id="drive-access-title" className="text-lg font-bold">Google Drive access needed</h2>
+                <p className="mt-2 text-sm leading-6 text-slate-600">Google Drive permission is needed to upload memory photos. Reconnect your Google account and approve the requested Drive access. You can cancel and continue without uploading photos.</p>
+              </div>
+              <button type="button" aria-label="Close Drive access message" onClick={() => setShowDriveAccessModal(false)} className="rounded-lg px-2 py-1 text-lg text-slate-500 hover:bg-slate-100">✕</button>
+            </div>
+            <div className="mt-5 flex flex-col-reverse gap-2 sm:flex-row sm:justify-end">
+              <button type="button" onClick={() => setShowDriveAccessModal(false)} className="rounded-xl border border-slate-300 px-4 py-2.5 text-sm font-semibold">Not now</button>
+              <button type="button" onClick={() => window.location.assign("/api/sheets/connect")} className="rounded-xl bg-emerald-800 px-4 py-2.5 text-sm font-semibold text-white hover:bg-emerald-900">Reconnect Google / Drive</button>
+            </div>
+          </section>
+        </div>
+      )}
+
+      {verifiedEmail && selectedTripId && (
+        <nav className="fixed inset-x-0 bottom-0 z-30 border-t border-slate-200 bg-white/95 px-3 pb-[env(safe-area-inset-bottom)] shadow-[0_-4px_16px_rgba(15,23,42,0.06)] backdrop-blur">
+          <div className="mx-auto flex max-w-6xl items-center justify-between gap-3 border-b border-slate-100 py-2">
+            <p className="min-w-0 truncate text-xs font-semibold text-slate-600 sm:text-sm">Shared travel companion @ 2026</p>
+            <div className="flex shrink-0 items-center gap-2">
+              <button type="button" onClick={() => { window.scrollTo({ top: 0, behavior: "smooth" }); }} aria-label="Back to top" title="Back to top" className="group flex h-9 w-9 items-center justify-center rounded-full bg-emerald-800 text-lg font-bold text-white shadow-sm transition duration-150 hover:scale-110 hover:bg-emerald-700 hover:shadow-md focus-visible:scale-110 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-emerald-500 focus-visible:ring-offset-2 active:scale-105">▲</button>
+              <button type="button" onClick={() => setRefreshKey((n) => n + 1)} disabled={isLoadingItinerary} className="rounded-lg border border-slate-300 bg-white px-3 py-2 text-xs font-semibold text-slate-800 transition hover:bg-slate-50 disabled:opacity-50 sm:text-sm">{isLoadingItinerary ? "Refreshing…" : "Refresh itinerary"}</button>
+            </div>
+          </div>
           <div className="mx-auto grid max-w-3xl grid-cols-6 gap-1 py-2">
             {[
               { view: "home" as ViewName, icon: "⌂", label: "Home" },
