@@ -466,7 +466,7 @@ async function readSheetRows(accessToken: string, sheetId: string, tabName: stri
 }
 
 
-async function uploadSharedMemoryPhoto(accessToken: string, photo: { name?: unknown; mime_type?: unknown; data_base64?: unknown }, shareEmail: string): Promise<{ id: string; url: string }> {
+async function uploadSharedMemoryPhoto(accessToken: string, photo: { name?: unknown; mime_type?: unknown; data_base64?: unknown }): Promise<{ id: string; url: string }> {
   const name = typeof photo.name === "string" ? photo.name.replace(/[^a-zA-Z0-9._-]/g, "_").slice(0, 120) : "travel-memory.jpg";
   const mimeType = typeof photo.mime_type === "string" && /^image\/(jpeg|png|webp|gif|heic|heif)$/.test(photo.mime_type) ? photo.mime_type : "";
   const encoded = typeof photo.data_base64 === "string" ? photo.data_base64.replace(/^data:image\/[^;]+;base64,/, "") : "";
@@ -483,22 +483,18 @@ async function uploadSharedMemoryPhoto(accessToken: string, photo: { name?: unkn
   });
   if (!upload.ok) {
     const detail = (await upload.text().catch(() => "")).slice(0, 400);
-    if (upload.status === 403 || upload.status === 401) throw new Error(`Google Drive rejected photo upload (HTTP ${upload.status}). Reconnect and approve Google Drive access. ${detail}`);
+    if (upload.status === 401 || /insufficient authentication scopes/i.test(detail)) {
+      throw new Error(`Google Drive authorization is missing the required upload scope (HTTP ${upload.status}). Reconnect Google access once to approve Drive permissions. ${detail}`);
+    }
+    if (upload.status === 403) throw new Error(`Google Drive denied access to the photo folder. Check that the connected Google account can add files to folder ${TRIP_MEMORY_FOLDER_ID}. ${detail}`);
     if (upload.status === 404) throw new Error(`The configured trip-photo folder could not be found or accessed (${TRIP_MEMORY_FOLDER_ID}). ${detail}`);
     throw new Error(`Google Drive could not upload the selected photo (HTTP ${upload.status}). ${detail}`);
   }
   const file = await upload.json() as { id?: string; webViewLink?: string };
   if (!file.id) throw new Error("Google Drive did not return a photo ID.");
-  const permission = await fetch(`https://www.googleapis.com/drive/v3/files/${encodeURIComponent(file.id)}/permissions?sendNotificationEmail=false`, {
-    method: "POST", headers: { Authorization: `Bearer ${accessToken}`, "Content-Type": "application/json" },
-    body: JSON.stringify({ type: "user", role: "reader", emailAddress: shareEmail }),
-  });
-  if (!permission.ok) {
-    try { await fetch(`https://www.googleapis.com/drive/v3/files/${encodeURIComponent(file.id)}`, { method: "DELETE", headers: { Authorization: `Bearer ${accessToken}` } }); } catch { /* best-effort cleanup */ }
-    const detail = "Google Drive did not allow the app to grant the other traveller access.";
-    if (permission.status === 403 || permission.status === 401) throw new Error(`Google Drive photo sharing was rejected (HTTP ${permission.status}). Reconnect and approve Google Drive access. ${detail}`);
-    throw new Error(`The photo uploaded but could not be shared (HTTP ${permission.status}). ${detail}`);
-  }
+  // Files inherit access from the destination folder. Avoid a second per-file
+  // permission call, which can fail under Workspace sharing policies and used
+  // to trigger the reconnect loop (and delete the successfully uploaded photo).
   return { id: file.id, url: file.webViewLink || `https://drive.google.com/uc?export=view&id=${encodeURIComponent(file.id)}` };
 }
 
@@ -1391,10 +1387,12 @@ export default {
             return item;
           });
         
-        // Read supplementary worksheet tabs for practical tips and layering notes.
+        // Lite mode returns the main itinerary only to reduce mobile data usage.
+        // Normal mode retains the existing supplementary worksheet behavior.
         const supplementaryTabs: Record<string, string[][]> = {};
         let supplementaryError: string | undefined;
 
+        if (url.searchParams.get("lite") !== "1") {
         try {
           const metadataUrl =
             `https://sheets.googleapis.com/v4/spreadsheets/` +
@@ -1472,6 +1470,7 @@ export default {
           );
           supplementaryError =
             "Some supplementary worksheet details could not be loaded.";
+        }
         }
 
         return jsonResponse(
@@ -2046,9 +2045,8 @@ export default {
           if (!encoded || encoded.length > 5_600_000) return jsonResponse({ success: false, error: "Each photo must be 4 MB or smaller." }, 400);
         }
         if (encodedTotal > 14_000_000) return jsonResponse({ success: false, error: "Total photo size must be under 10 MB per memory." }, 400);
-        const otherTraveller = session.email.toLowerCase() === "koochanyee@gmail.com" ? "wookahwai@gmail.com" : "koochanyee@gmail.com";
         const photoFiles: Array<{ id: string; url: string }> = [];
-        for (const photo of photos) photoFiles.push(await uploadSharedMemoryPhoto(tokenData.access_token, photo, otherTraveller));
+        for (const photo of photos) photoFiles.push(await uploadSharedMemoryPhoto(tokenData.access_token, photo));
         // Store both Drive file IDs and URLs so photos can be located from the sheet later.
         const photoIdsValue = photoFiles.length ? JSON.stringify(photoFiles) : "";
         const createdAt = new Date().toISOString();
