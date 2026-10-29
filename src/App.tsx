@@ -155,7 +155,6 @@ function App() {
   const [supplementaryTabs, setSupplementaryTabs] = useState<Record<string, string[][]>>({});
   const [isLoadingItinerary, setIsLoadingItinerary] = useState(false);
   const [itineraryError, setItineraryError] = useState("");
-  const [needsSheetsConnection, setNeedsSheetsConnection] = useState(false);
   const [showDriveAccessModal, setShowDriveAccessModal] = useState(false);
   const [refreshKey, setRefreshKey] = useState(0);
   const [activeDayIndex, setActiveDayIndex] = useState(0);
@@ -366,7 +365,6 @@ function App() {
     async function loadItinerary() {
       setIsLoadingItinerary(true);
       setItineraryError("");
-      setNeedsSheetsConnection(false);
       try {
         const response = await fetch(`/api/itinerary?tripId=${encodeURIComponent(selectedTripId)}`, {
           method: "GET",
@@ -377,7 +375,6 @@ function App() {
         if (!response.ok || !result.success) {
           if (!cancelled) {
             setItineraryRows([]);
-            setNeedsSheetsConnection(response.status === 403 || Boolean(result.connectUrl));
             setItineraryError(result.error || `Could not load itinerary (HTTP ${response.status}).`);
           }
           return;
@@ -388,8 +385,7 @@ function App() {
           setSupplementaryTabs(result.supplementaryTabs ?? {});
           setActiveDayIndex(0);
           setItineraryError("");
-          setNeedsSheetsConnection(false);
-          setAuthMessage("Signed in. Itinerary loaded from Google Sheets.");
+              setAuthMessage("Signed in. Itinerary loaded from Google Sheets.");
         }
       } catch (error) {
         if (!cancelled) setItineraryError(error instanceof Error ? error.message : "Could not load itinerary.");
