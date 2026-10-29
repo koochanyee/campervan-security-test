@@ -370,7 +370,6 @@ const TRIP_REGISTRY_KEY = "trip-registry:shared:v1";
 const SOUTH_ISLAND_SHEET_ID = "1L_GUByHbUMIORDakIRutHUwK9pNMYPAsm1H1fe6RMB0";
 const TRIP_MEMORY_FOLDER_ID = "1mvq9t6mrtMnQk1Ug3DN2dl8S7cEDI-97";
 const EXPENSE_HEADERS = ["expense_id", "date", "description", "category", "amount", "currency", "paid_by", "expense_type", "notes", "created_at"];
-const CHECKLIST_HEADERS = ["item_id", "category", "item", "ralph_status", "june_status"];
 
 async function getTripRegistry(env: Env): Promise<TripConfig[]> {
   const saved = await env.OAUTH_TOKEN_STORE.get(TRIP_REGISTRY_KEY);
