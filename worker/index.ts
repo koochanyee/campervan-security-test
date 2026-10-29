@@ -367,6 +367,8 @@ interface TripConfig {
 }
 
 const TRIP_REGISTRY_KEY = "trip-registry:shared:v1";
+const SOUTH_ISLAND_SHEET_ID = "1L_GUByHbUMIORDakIRutHUwK9pNMYPAsm1H1fe6RMB0";
+const TRIP_MEMORY_FOLDER_ID = "1mvq9t6mrtMnQk1Ug3DN2dl8S7cEDI-97";
 const EXPENSE_HEADERS = ["expense_id", "date", "description", "category", "amount", "currency", "paid_by", "expense_type", "notes", "created_at"];
 const CHECKLIST_HEADERS = ["item_id", "category", "item", "ralph_status", "june_status"];
 
@@ -376,8 +378,14 @@ async function getTripRegistry(env: Env): Promise<TripConfig[]> {
   if (saved) {
     try { trips = JSON.parse(saved) as TripConfig[]; } catch { trips = []; }
   }
-  if (!trips.some((trip) => trip.id === "nz-south-island") && env.GOOGLE_SHEET_ID) {
-    trips.unshift({ id: "nz-south-island", name: "New Zealand — South Island", sheetId: env.GOOGLE_SHEET_ID, itineraryTab: env.GOOGLE_SHEET_TAB || "FINAL ITINERARY" });
+  const southIsland = trips.find((trip) => trip.id === "nz-south-island");
+  if (southIsland) {
+    // This is the workbook explicitly confirmed by the user. Avoid stale KV trip IDs
+    // silently sending itinerary/checklist/expenses to a different spreadsheet.
+    southIsland.sheetId = SOUTH_ISLAND_SHEET_ID;
+    southIsland.itineraryTab = "FINAL ITINERARY";
+  } else {
+    trips.unshift({ id: "nz-south-island", name: "New Zealand — South Island", sheetId: SOUTH_ISLAND_SHEET_ID, itineraryTab: "FINAL ITINERARY" });
   }
   return trips;
 }
@@ -422,7 +430,10 @@ async function ensureSheetTab(accessToken: string, sheetId: string, tabName: str
       method: "POST", headers: { Authorization: `Bearer ${accessToken}`, "Content-Type": "application/json" },
       body: JSON.stringify({ requests: [{ addSheet: { properties: { title: tabName } } }] }),
     });
-    if (!addResponse.ok) throw new Error(`Could not create the ${tabName} tab in Google Sheets.`);
+    if (!addResponse.ok) {
+      const detail = await addResponse.text().catch(() => "");
+      throw new Error(`Could not create the ${tabName} tab in Google Sheets (HTTP ${addResponse.status}). ${detail.slice(0, 500)}`);
+    }
   }
   const range = `${quoteSheetTab(tabName)}!A1:${String.fromCharCode(64 + headers.length)}1`;
   const readResponse = await fetch(sheetsValuesUrl(sheetId, range), { headers: { Authorization: `Bearer ${accessToken}` } });
@@ -441,7 +452,11 @@ async function findExistingTab(accessToken: string, sheetId: string, candidates:
   if (!response.ok) return fallback;
   const data = await response.json() as { sheets?: Array<{ properties?: { title?: string } }> };
   const names = (data.sheets || []).map((sheet) => sheet.properties?.title || "");
-  return candidates.find((candidate) => names.includes(candidate)) || fallback;
+  const exact = candidates.find((candidate) => names.includes(candidate));
+  if (exact) return exact;
+  const normalizeTab = (value: string) => value.toLowerCase().replace(/[^a-z0-9]/g, "");
+  const normalizedMatch = names.find((name) => candidates.some((candidate) => normalizeTab(name) === normalizeTab(candidate)));
+  return normalizedMatch || fallback;
 }
 
 async function readSheetRows(accessToken: string, sheetId: string, tabName: string): Promise<string[][]> {
@@ -462,14 +477,16 @@ async function uploadSharedMemoryPhoto(accessToken: string, photo: { name?: unkn
   const bytes = new Uint8Array(binary.length);
   for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
   const form = new FormData();
-  form.append("metadata", new Blob([JSON.stringify({ name, mimeType, description: "Shared campervan travel memory" })], { type: "application/json" }));
+  form.append("metadata", new Blob([JSON.stringify({ name, mimeType, parents: [TRIP_MEMORY_FOLDER_ID], description: "Shared campervan travel memory" })], { type: "application/json" }));
   form.append("file", new Blob([bytes], { type: mimeType }), name);
   const upload = await fetch("https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart&fields=id,name,mimeType,webViewLink", {
     method: "POST", headers: { Authorization: `Bearer ${accessToken}` }, body: form,
   });
   if (!upload.ok) {
-    if (upload.status === 403 || upload.status === 401) throw new Error("Photo upload needs Google Drive permission. Choose Reconnect Google Sheets, approve Drive file access, then try again.");
-    throw new Error("Google Drive could not upload the selected photo.");
+    const detail = (await upload.text().catch(() => "")).slice(0, 400);
+    if (upload.status === 403 || upload.status === 401) throw new Error(`Google Drive rejected photo upload (HTTP ${upload.status}). Reconnect and approve Google Drive access. ${detail}`);
+    if (upload.status === 404) throw new Error(`The configured trip-photo folder could not be found or accessed (${TRIP_MEMORY_FOLDER_ID}). ${detail}`);
+    throw new Error(`Google Drive could not upload the selected photo (HTTP ${upload.status}). ${detail}`);
   }
   const file = await upload.json() as { id?: string };
   if (!file.id) throw new Error("Google Drive did not return a photo ID.");
@@ -479,8 +496,9 @@ async function uploadSharedMemoryPhoto(accessToken: string, photo: { name?: unkn
   });
   if (!permission.ok) {
     try { await fetch(`https://www.googleapis.com/drive/v3/files/${encodeURIComponent(file.id)}`, { method: "DELETE", headers: { Authorization: `Bearer ${accessToken}` } }); } catch { /* best-effort cleanup */ }
-    if (permission.status === 403 || permission.status === 401) throw new Error("Google Drive photo sharing is not authorised. Reconnect Google Sheets and approve Drive file access.");
-    throw new Error("The photo uploaded, but it could not be shared with the other traveller.");
+    const detail = "Google Drive did not allow the app to grant the other traveller access.";
+    if (permission.status === 403 || permission.status === 401) throw new Error(`Google Drive photo sharing was rejected (HTTP ${permission.status}). Reconnect and approve Google Drive access. ${detail}`);
+    throw new Error(`The photo uploaded but could not be shared (HTTP ${permission.status}). ${detail}`);
   }
   return file.id;
 }
@@ -735,7 +753,7 @@ export default {
         googleUrl.searchParams.set("response_type", "code");
         googleUrl.searchParams.set(
           "scope",
-          "https://www.googleapis.com/auth/spreadsheets https://www.googleapis.com/auth/drive.file",
+          "https://www.googleapis.com/auth/spreadsheets https://www.googleapis.com/auth/drive",
         );
         googleUrl.searchParams.set("access_type", "offline");
         googleUrl.searchParams.set("prompt", "consent");
@@ -973,8 +991,8 @@ export default {
       } catch (error) { return jsonResponse({ success: false, error: error instanceof Error ? error.message : "Could not manage trips." }, 500); }
     }
 
-    // Shared trip expenses. Import the existing FINAL EXPENSES planning table,
-    // then append new records to TRIP EXPENSES without modifying the planning table.
+    // Shared trip expenses. Read FINAL EXPENSES as-is; create TRIP EXPENSES only
+    // when the user saves a new app expense, never as a prerequisite for loading.
     if (url.pathname === "/api/expenses" && (request.method === "GET" || request.method === "POST")) {
       const session = await readSession(request, env);
       if (!session) return jsonResponse({ success: false, error: "Authentication required." }, 401);
@@ -986,50 +1004,52 @@ export default {
         if (!trip) return jsonResponse({ success: false, error: "Select a valid trip first." }, 404);
         const token = await googleAccessToken(session, env);
         const tab = "TRIP EXPENSES";
-        await ensureSheetTab(token, trip.sheetId, tab, EXPENSE_HEADERS);
-        const rows = await readSheetRows(token, trip.sheetId, tab);
+        if (request.method === "POST") await ensureSheetTab(token, trip.sheetId, tab, EXPENSE_HEADERS);
+        let loggedExpenses: Array<Record<string, unknown>> = [];
         if (request.method === "GET") {
-          const header = (rows[0] || []).map((cell) => cell.trim().toLowerCase());
-          const idx = (name: string) => header.indexOf(name);
-          const loggedExpenses = rows.slice(1).filter((row) => row[idx("expense_id")]?.trim()).map((row) => ({
-            expense_id: row[idx("expense_id")] || "", date: row[idx("date")] || "", description: row[idx("description")] || "", category: row[idx("category")] || "Other",
-            amount: Number(row[idx("amount")] || 0), currency: row[idx("currency")] || "NZD", paid_by: row[idx("paid_by")] || "Ralph", expense_type: row[idx("expense_type")] || "actual-trip", notes: row[idx("notes")] || "", source: "TRIP EXPENSES",
-          }));
+          const existingTab = await findExistingTab(token, trip.sheetId, [tab], "");
+          if (existingTab) {
+            const rows = await readSheetRows(token, trip.sheetId, existingTab);
+            const header = (rows[0] || []).map((cell) => cell.trim().toLowerCase());
+            const idx = (name: string) => header.indexOf(name);
+            loggedExpenses = rows.slice(1).filter((row) => idx("expense_id") >= 0 && row[idx("expense_id")]?.trim()).map((row) => ({
+              expense_id: row[idx("expense_id")] || "", date: row[idx("date")] || "", description: row[idx("description")] || "", category: row[idx("category")] || "Other",
+              amount: Number(row[idx("amount")] || 0), currency: row[idx("currency")] || "NZD", paid_by: row[idx("paid_by")] || "Ralph", expense_type: row[idx("expense_type")] || "actual-trip", notes: row[idx("notes")] || "", source: "TRIP EXPENSES",
+            }));
+          }
           let plannedExpenses: Array<Record<string, unknown>> = [];
           try {
-            const planningTab = await findExistingTab(token, trip.sheetId, ["FINAL EXPENSES", "Final Expenses"], "FINAL EXPENSES");
-            const planningRows = await readSheetRows(token, trip.sheetId, planningTab);
-            let group = "Pre-trip";
-            plannedExpenses = planningRows.slice(3).flatMap((row, index) => {
-              const sheetRow = index + 4;
-              const description = String(row[0] || "").trim();
-              const amountText = String(row[1] || "").replace(/,/g, "").replace(/[^0-9.-]/g, "");
-              const amount = Number(amountText);
-              if (description && (!Number.isFinite(amount) || amount <= 0)) { group = description; return []; }
-              if (!description || !Number.isFinite(amount) || amount <= 0) return [];
-              const charges = [
-                row[5] ? `Sep charged: MYR ${row[5]}` : "",
-                row[6] ? `Oct charged: MYR ${row[6]}` : "",
-                row[7] ? `Nov charged: MYR ${row[7]}` : "",
-                row[8] !== undefined && row[8] !== "" ? `Balance: MYR ${row[8]}` : "",
-                row[9] ? String(row[9]) : "",
-              ].filter(Boolean);
-              return [{
-                expense_id: `planned-final-expenses-row-${sheetRow}`,
-                date: "",
-                description,
-                category: group,
-                amount,
-                currency: "MYR",
-                paid_by: String(row[3] || "Shared"),
-                expense_type: "pre-trip",
-                notes: [row[4] === "TRUE" ? "Booked: Yes" : row[4] === "FALSE" ? "Booked: No" : "", ...charges].filter(Boolean).join(" · "),
-                source: "FINAL EXPENSES",
-              }];
-            });
-          } catch { /* A trip may not have a FINAL EXPENSES tab; logged expenses still load. */ }
+            const planningTab = await findExistingTab(token, trip.sheetId, ["FINAL EXPENSES", "Final Expenses"], "");
+            if (planningTab) {
+              const planningRows = await readSheetRows(token, trip.sheetId, planningTab);
+              let group = "Pre-trip";
+              plannedExpenses = planningRows.slice(3, 27).flatMap((row, index) => {
+                const sheetRow = index + 4;
+                const description = String(row[0] || "").trim();
+                const amountText = String(row[1] || "").replace(/,/g, "").replace(/[^0-9.-]/g, "");
+                const amount = Number(amountText);
+                if (description && (!Number.isFinite(amount) || amount <= 0)) { group = description; return []; }
+                if (!description || !Number.isFinite(amount) || amount <= 0) return [];
+                const charges = [
+                  row[5] ? `Sep charged: MYR ${row[5]}` : "",
+                  row[6] ? `Oct charged: MYR ${row[6]}` : "",
+                  row[7] ? `Nov charged: MYR ${row[7]}` : "",
+                  row[8] !== undefined && row[8] !== "" ? `Balance: MYR ${row[8]}` : "",
+                  row[9] ? String(row[9]) : "",
+                ].filter(Boolean);
+                return [{
+                  expense_id: `planned-final-expenses-row-${sheetRow}`, date: "", description, category: group, amount,
+                  currency: "MYR", paid_by: String(row[3] || "Shared"), expense_type: "pre-trip",
+                  notes: [row[4] === "TRUE" ? "Booked: Yes" : row[4] === "FALSE" ? "Booked: No" : "", ...charges].filter(Boolean).join(" · "), source: "FINAL EXPENSES",
+                }];
+              });
+            }
+          } catch (error) {
+            console.error("Could not read FINAL EXPENSES:", error instanceof Error ? error.message : String(error));
+          }
           return jsonResponse({ success: true, expenses: [...plannedExpenses, ...loggedExpenses], tripId: trip.id });
         }
+        const rows = await readSheetRows(token, trip.sheetId, tab);
         const expenseId = typeof body.expense_id === "string" ? body.expense_id.trim() : "";
         const date = typeof body.date === "string" ? body.date.trim() : "";
         const description = typeof body.description === "string" ? body.description.trim() : "";
@@ -1048,9 +1068,8 @@ export default {
       } catch (error) { return jsonResponse({ success: false, error: error instanceof Error ? error.message : "Could not access trip expenses." }, 500); }
     }
 
-    // Read the existing workbook layout for "Thing to do n bring". The workbook has
-    // packing items in A:E and dated to-do items in G:I. Ralph/June status columns
-    // are added in J:M so their selections never overwrite each other or the source checkboxes.
+    // Shared checklists: read the two existing source tabs without adding or changing
+    // columns. Individual Ralph/June completion states live in KV, not in the workbook.
     if (url.pathname === "/api/checklist" && (request.method === "GET" || request.method === "POST")) {
       const session = await readSession(request, env);
       if (!session) return jsonResponse({ success: false, error: "Authentication required." }, 401);
@@ -1061,96 +1080,58 @@ export default {
         const trip = await resolveTrip(request, env, typeof body.tripId === "string" ? body.tripId : undefined);
         if (!trip) return jsonResponse({ success: false, error: "Select a valid trip first." }, 404);
         const token = await googleAccessToken(session, env);
-        const tab = await findExistingTab(token, trip.sheetId, ["Thing to do n bring", "Things to do n bring", "Thing to do & bring", "Things to do & bring", "THINGS TO DO N BRING", "THINGS TO DO & BRING"], "Thing to do n bring");
-        let rows: string[][];
-        try {
-          rows = await readSheetRows(token, trip.sheetId, tab);
-        } catch {
-          await ensureSheetTab(token, trip.sheetId, tab, CHECKLIST_HEADERS);
-          rows = await readSheetRows(token, trip.sheetId, tab);
-        }
-        const norm = (value: string) => value.toLowerCase().replace(/[^a-z0-9]/g, "");
-        const first = rows[0] || [];
-        const legacyLayout = norm(first[0] || "") === "category" && norm(first[1] || "") === "item";
-        if (legacyLayout) {
-          const expectedStatusHeaders = ["Ralph pack status", "June pack status", "Ralph to-do status", "June to-do status"];
-          const existingJtoM = [9, 10, 11, 12].map((col) => String(first[col] || "").trim());
-          if (existingJtoM.some(Boolean) && !expectedStatusHeaders.every((value, i) => norm(existingJtoM[i]) === norm(value))) {
-            return jsonResponse({ success: false, error: "Columns J:M in the checklist tab are already in use. Please keep them clear or move the new per-person status columns before syncing." }, 409);
-          }
-          const statusesWereMissing = !expectedStatusHeaders.some((value) => first.some((cell) => norm(String(cell || "")) === norm(value)));
-          if (statusesWereMissing) {
-            const headerWrite = await fetch(`${sheetsValuesUrl(trip.sheetId, `${quoteSheetTab(tab)}!J1:M1`)}?valueInputOption=RAW`, { method: "PUT", headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" }, body: JSON.stringify({ values: [expectedStatusHeaders] }) });
-            if (!headerWrite.ok) return jsonResponse({ success: false, error: "Could not add Ralph/June checklist status columns." }, 502);
-            const meaningfulRows = rows.slice(1).map((row, index) => ({ row, sheetRow: index + 2 })).filter(({ row }) => String(row[1] || "").trim() || String(row[8] || "").trim());
-            if (meaningfulRows.length) {
-              const lastRow = meaningfulRows[meaningfulRows.length - 1].sheetRow;
-              const initial = rows.slice(1, lastRow).map((row) => {
-                const packChecked = ["TRUE", "✓", "☑", "1"].includes(String(row[3] || "").trim().toUpperCase());
-                const todoChecked = ["TRUE", "✓", "☑", "1"].includes(String(row[6] || "").trim().toUpperCase());
-                return [packChecked ? "✓" : "", packChecked ? "✓" : "", todoChecked ? "✓" : "", todoChecked ? "✓" : ""];
-              });
-              const statusWrite = await fetch(`${sheetsValuesUrl(trip.sheetId, `${quoteSheetTab(tab)}!J2:M${lastRow}`)}?valueInputOption=RAW`, { method: "PUT", headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" }, body: JSON.stringify({ values: initial }) });
-              if (!statusWrite.ok) return jsonResponse({ success: false, error: "Could not initialise individual checklist statuses." }, 502);
-            }
-            rows = await readSheetRows(token, trip.sheetId, tab);
-          }
-          const statusCols = [9, 10, 11, 12];
-          const ralphIndex = session.email.toLowerCase() === "koochanyee@gmail.com" ? 0 : session.email.toLowerCase() === "wookahwai@gmail.com" ? 1 : -1;
-          if (ralphIndex < 0) return jsonResponse({ success: false, error: "This account is not assigned a checklist profile." }, 403);
-          if (request.method === "GET") {
-            const result: Array<Record<string, unknown>> = [];
-            let currentCategory = "Other";
-            rows.slice(1).forEach((row, index) => {
-              const sheetRow = index + 2;
-              const categoryCell = String(row[0] || "").trim();
-              if (categoryCell) currentCategory = categoryCell;
-              const packItem = String(row[1] || "").trim();
-              if (packItem) result.push({ item_id: `pack-${sheetRow}`, category: currentCategory, item: packItem, quantity: String(row[2] || "").trim(), notes: String(row[4] || "").trim(), checklist_type: "packing", ralph_status: String(row[statusCols[0]] || "").trim(), june_status: String(row[statusCols[1]] || "").trim() });
-              const todoItem = String(row[8] || "").trim();
-              if (todoItem) result.push({ item_id: `todo-${sheetRow}`, category: "Things to do", item: todoItem, due_date: String(row[7] || "").trim(), checklist_type: "todo", ralph_status: String(row[statusCols[2]] || "").trim(), june_status: String(row[statusCols[3]] || "").trim() });
-            });
-            return jsonResponse({ success: true, checklistItems: result, tripId: trip.id });
-          }
+        const statusKey = `checklist-status:${trip.id}`;
+        let statuses: Record<string, { ralph_status?: string; june_status?: string }> = {};
+        const savedStatuses = await env.OAUTH_TOKEN_STORE.get(statusKey);
+        if (savedStatuses) { try { statuses = JSON.parse(savedStatuses) as typeof statuses; } catch { statuses = {}; } }
+        const profile = session.email.toLowerCase() === "koochanyee@gmail.com" ? "ralph_status" : session.email.toLowerCase() === "wookahwai@gmail.com" ? "june_status" : "";
+        if (!profile) return jsonResponse({ success: false, error: "This account is not assigned a checklist profile." }, 403);
+        if (request.method === "POST") {
           const itemId = typeof body.item_id === "string" ? body.item_id.trim() : "";
           const status = typeof body.status === "string" ? body.status : "";
-          if (!/^(pack|todo)-\d+$/.test(itemId) || !["", "✓", "x"].includes(status)) return jsonResponse({ success: false, error: "Invalid checklist item or status." }, 400);
-          const sheetRow = Number(itemId.split("-")[1]);
-          const row = rows[sheetRow - 1] || [];
-          const isTodo = itemId.startsWith("todo-");
-          if (!String(row[isTodo ? 8 : 1] || "").trim()) return jsonResponse({ success: false, error: "Checklist item not found." }, 404);
-          const statusCol = isTodo ? (ralphIndex === 0 ? 11 : 12) : (ralphIndex === 0 ? 9 : 10);
-          const colLetter = String.fromCharCode(65 + statusCol);
-          const writeUrl = `${sheetsValuesUrl(trip.sheetId, `${quoteSheetTab(tab)}!${colLetter}${sheetRow}`)}?valueInputOption=RAW`;
-          const write = await fetch(writeUrl, { method: "PUT", headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" }, body: JSON.stringify({ values: [[status]] }) });
-          if (!write.ok) return jsonResponse({ success: false, error: "Could not sync checklist status to Google Sheets." }, 502);
+          if (!/^(pack|todo|grocery-malaysia|grocery-pns|grocery-list)-\d+$/.test(itemId) || !["", "✓", "x"].includes(status)) return jsonResponse({ success: false, error: "Invalid checklist item or status." }, 400);
+          statuses[itemId] = { ...(statuses[itemId] || {}), [profile]: status };
+          await env.OAUTH_TOKEN_STORE.put(statusKey, JSON.stringify(statuses));
           return jsonResponse({ success: true, item_id: itemId, status, tripId: trip.id });
         }
-
-        // Compatibility path for a newer, normalised checklist sheet.
-        await ensureSheetTab(token, trip.sheetId, tab, CHECKLIST_HEADERS);
-        rows = await readSheetRows(token, trip.sheetId, tab);
-        const headers = (rows[0] || []).map((cell) => norm(cell));
-        const col = (...names: string[]) => headers.findIndex((header) => names.some((name) => header === norm(name)));
-        const idCol = col("item_id", "itemid", "id", "checklist_id"), categoryCol = col("category", "group"), itemCol = col("item", "task", "description", "checklist_item"), ralphCol = col("ralph_status", "ralph", "ralph_checkbox"), juneCol = col("june_status", "june", "june_checkbox");
-        if ([idCol, categoryCol, itemCol, ralphCol, juneCol].some((value) => value < 0)) return jsonResponse({ success: false, error: "Checklist tab needs item ID, category, item, Ralph status and June status columns." }, 409);
-        if (request.method === "GET") {
-          const checklistItems = rows.slice(1).filter((row) => row[idCol]?.trim() && row[itemCol]?.trim()).map((row) => ({ item_id: row[idCol], category: row[categoryCol] || "Other", item: row[itemCol], ralph_status: row[ralphCol] || "", june_status: row[juneCol] || "" }));
-          return jsonResponse({ success: true, checklistItems, tripId: trip.id });
+        const result: Array<Record<string, unknown>> = [];
+        const mainTab = await findExistingTab(token, trip.sheetId, ["Thing to do n bring", "Things to do n bring", "Thing to do & bring", "Things to do & bring", "THINGS TO DO N BRING", "THINGS TO DO & BRING"], "");
+        if (!mainTab) return jsonResponse({ success: false, error: "Could not find the existing pre-trip checklist tab ‘Thing to do n bring’ in the selected workbook." }, 404);
+        const rows = await readSheetRows(token, trip.sheetId, mainTab);
+        const norm = (value: string) => value.toLowerCase().replace(/[^a-z0-9]/g, "");
+        const first = rows[0] || [];
+        if (norm(first[0] || "") !== "category" || norm(first[1] || "") !== "item") return jsonResponse({ success: false, error: `The tab “${mainTab}” was found, but its first row did not match the expected Category / Item headers.` }, 409);
+        let currentCategory = "Other";
+        rows.slice(1).forEach((row, index) => {
+          const sheetRow = index + 2;
+          const categoryCell = String(row[0] || "").trim();
+          if (categoryCell) currentCategory = categoryCell;
+          const packItem = String(row[1] || "").trim();
+          const mustHave = ["TRUE", "✓", "☑", "1"].includes(String(row[3] || "").trim().toUpperCase());
+          if (packItem) result.push({ item_id: `pack-${sheetRow}`, category: currentCategory, item: packItem, quantity: String(row[2] || "").trim(), notes: String(row[4] || "").trim(), must_have: mustHave, checklist_type: "packing", ralph_status: statuses[`pack-${sheetRow}`]?.ralph_status || "", june_status: statuses[`pack-${sheetRow}`]?.june_status || "" });
+          const todoItem = String(row[8] || "").trim();
+          if (todoItem) result.push({ item_id: `todo-${sheetRow}`, category: "Things to do", item: todoItem, due_date: String(row[7] || "").trim(), checklist_type: "todo", ralph_status: statuses[`todo-${sheetRow}`]?.ralph_status || "", june_status: statuses[`todo-${sheetRow}`]?.june_status || "" });
+        });
+        const groceryTab = await findExistingTab(token, trip.sheetId, ["Shopping List or Things to Bring", "Shopping List or Things to Brin"], "");
+        if (groceryTab) {
+          const groceryRows = await readSheetRows(token, trip.sheetId, groceryTab);
+          let groceryCategory = "Pack ’n Save";
+          groceryRows.slice(2).forEach((row, index) => {
+            const sheetRow = index + 3;
+            const malaysiaItem = String(row[0] || "").trim();
+            const malaysiaQty = String(row[1] || "").trim();
+            if (malaysiaItem && norm(malaysiaItem) !== "tobringfrommalaysia") result.push({ item_id: `grocery-malaysia-${sheetRow}`, category: "🧳 To bring from Malaysia", item: malaysiaItem, quantity: malaysiaQty, checklist_type: "grocery", ralph_status: statuses[`grocery-malaysia-${sheetRow}`]?.ralph_status || "", june_status: statuses[`grocery-malaysia-${sheetRow}`]?.june_status || "" });
+            const categoryCell = String(row[3] || "").trim();
+            if (categoryCell && norm(categoryCell) !== "category") groceryCategory = categoryCell;
+            const buyItem = String(row[4] || "").trim();
+            const buyQty = String(row[5] || "").trim();
+            const why = String(row[6] || "").trim();
+            if (buyItem && norm(buyItem) !== "whatidbuy") result.push({ item_id: `grocery-pns-${sheetRow}`, category: `🛒 ${groceryCategory}`, item: buyItem, quantity: buyQty, notes: why, checklist_type: "grocery", ralph_status: statuses[`grocery-pns-${sheetRow}`]?.ralph_status || "", june_status: statuses[`grocery-pns-${sheetRow}`]?.june_status || "" });
+            const quickItem = String(row[9] || "").trim();
+            if (quickItem) result.push({ item_id: `grocery-list-${sheetRow}`, category: "🛒 Grocery quick list", item: quickItem, checklist_type: "grocery", ralph_status: statuses[`grocery-list-${sheetRow}`]?.ralph_status || "", june_status: statuses[`grocery-list-${sheetRow}`]?.june_status || "" });
+          });
         }
-        const itemId = typeof body.item_id === "string" ? body.item_id.trim() : "";
-        const status = typeof body.status === "string" ? body.status : "";
-        if (!itemId || !["", "✓", "x"].includes(status)) return jsonResponse({ success: false, error: "Invalid checklist status." }, 400);
-        const statusCol = session.email.toLowerCase() === "koochanyee@gmail.com" ? ralphCol : session.email.toLowerCase() === "wookahwai@gmail.com" ? juneCol : -1;
-        if (statusCol < 0) return jsonResponse({ success: false, error: "This account is not assigned a checklist profile." }, 403);
-        const matches: number[] = [];
-        rows.slice(1).forEach((row, index) => { if (row[idCol] === itemId) matches.push(index + 2); });
-        if (matches.length !== 1) return jsonResponse({ success: false, error: "Checklist item not found or duplicated." }, 409);
-        let column = ""; let n = statusCol + 1;
-        while (n > 0) { const rem = (n - 1) % 26; column = String.fromCharCode(65 + rem) + column; n = Math.floor((n - 1) / 26); }
-        const write = await fetch(`${sheetsValuesUrl(trip.sheetId, `${quoteSheetTab(tab)}!${column}${matches[0]}`)}?valueInputOption=RAW`, { method: "PUT", headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" }, body: JSON.stringify({ values: [[status]] }) });
-        if (!write.ok) return jsonResponse({ success: false, error: "Could not sync checklist status to Google Sheets." }, 502);
-        return jsonResponse({ success: true, item_id: itemId, status, tripId: trip.id });
+        return jsonResponse({ success: true, checklistItems: result, tripId: trip.id, sourceTabs: { preTrip: mainTab, grocery: groceryTab || null } });
       } catch (error) { return jsonResponse({ success: false, error: error instanceof Error ? error.message : "Could not access the shared checklist." }, 500); }
     }
 
