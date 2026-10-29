@@ -65,6 +65,10 @@ type TripExpense = {
   currency: string;
   paid_by: string;
   expense_type: "pre-trip" | "actual-trip";
+  share_type?: "shared" | "personal";
+  latitude?: string;
+  longitude?: string;
+  location?: string;
   notes?: string;
   source?: string;
   split_share?: number;
@@ -107,7 +111,11 @@ function getMemoryPhotoIds(photoIds?: string): string[] {
   if (!photoIds) return [];
   try {
     const parsed: unknown = JSON.parse(photoIds);
-    return Array.isArray(parsed) ? parsed.filter((id): id is string => typeof id === "string" && Boolean(id.trim())) : [];
+    return Array.isArray(parsed) ? parsed.map((entry) => {
+      if (typeof entry === "string") return entry.trim();
+      if (entry && typeof entry === "object" && "id" in entry) return String((entry as { id?: unknown }).id || "").trim();
+      return "";
+    }).filter(Boolean) : [];
   } catch {
     return photoIds.split(",").map((id) => id.trim()).filter(Boolean);
   }
@@ -242,6 +250,12 @@ function App() {
   const [expenseSaving, setExpenseSaving] = useState(false);
   const [expenseDate, setExpenseDate] = useState(() => new Date().toISOString().slice(0, 10));
   const [expenseType, setExpenseType] = useState<"pre-trip" | "actual-trip">(() => new Date().toISOString().slice(0, 10) >= "2026-11-07" ? "actual-trip" : "pre-trip");
+  const [expenseTab, setExpenseTab] = useState<"pre-trip" | "actual-trip" | "personal">("pre-trip");
+  const [expenseShareType, setExpenseShareType] = useState<"shared" | "personal">("shared");
+  const [expenseLatitude, setExpenseLatitude] = useState("");
+  const [expenseLongitude, setExpenseLongitude] = useState("");
+  const [expenseLocation, setExpenseLocation] = useState("");
+  const [isDetectingExpenseLocation, setIsDetectingExpenseLocation] = useState(false);
   const [expenseDescription, setExpenseDescription] = useState("");
   const [expenseCategory, setExpenseCategory] = useState("Other");
   const [expenseAmount, setExpenseAmount] = useState("");
@@ -515,6 +529,10 @@ function App() {
       currency: expenseCurrency,
       paid_by: expensePaidBy,
       expense_type: expenseType,
+      share_type: expenseShareType,
+      latitude: expenseLatitude,
+      longitude: expenseLongitude,
+      location: expenseLocation,
       notes: expenseNotes.trim(),
     };
     try {
@@ -529,10 +547,36 @@ function App() {
       const refreshedResult = await refreshed.json() as ApiResponse;
       if (refreshed.ok && refreshedResult.success) setExpenses(Array.isArray(refreshedResult.expenses) ? refreshedResult.expenses : [...expenses, record]);
       setExpenseDescription(""); setExpenseAmount(""); setExpenseNotes("");
-      setExpenseMessage("Expense saved to the shared trip sheet.");
+      setExpenseLatitude(""); setExpenseLongitude(""); setExpenseLocation("");
+      setExpenseMessage(expenseShareType === "personal" ? "Personal expense saved to the trip sheet." : "Shared expense saved to the trip sheet. Split share: 50:50.");
     } catch (error) {
       setExpenseMessage(error instanceof Error ? error.message : "Could not save the expense.");
     } finally { setExpenseSaving(false); }
+  };
+
+  const detectExpenseLocation = () => {
+    if (!navigator.geolocation) { setExpenseMessage("GPS location is not supported by this browser."); return; }
+    setIsDetectingExpenseLocation(true);
+    setExpenseMessage("Requesting GPS permission…");
+    navigator.geolocation.getCurrentPosition(async (position) => {
+      const latitude = position.coords.latitude.toFixed(6);
+      const longitude = position.coords.longitude.toFixed(6);
+      setExpenseLatitude(latitude); setExpenseLongitude(longitude);
+      setExpenseLocation(`GPS ${latitude}, ${longitude}`);
+      try {
+        const response = await fetch(`https://nominatim.openstreetmap.org/reverse?format=jsonv2&lat=${latitude}&lon=${longitude}`);
+        if (response.ok) {
+          const result = await response.json() as { name?: string; display_name?: string };
+          const label = result.name || result.display_name;
+          if (label) setExpenseLocation(`${label} (${latitude}, ${longitude})`);
+        }
+      } catch { /* GPS coordinates are still saved if reverse geocoding is unavailable. */ }
+      setIsDetectingExpenseLocation(false);
+      setExpenseMessage("GPS location attached to this expense.");
+    }, (error) => {
+      setIsDetectingExpenseLocation(false);
+      setExpenseMessage(error.message || "Could not access GPS location. Check browser location permission.");
+    }, { enableHighAccuracy: true, timeout: 10000, maximumAge: 60000 });
   };
 
   const setChecklistStatus = async (item: ChecklistItem, status: "" | "✓" | "x") => {
@@ -1448,28 +1492,31 @@ function App() {
                 <h2 className="mt-4 text-2xl font-bold">{activeView === "expenses" ? "Trip expenses" : activeView === "memories" ? "Travel memories" : "Trip map"}</h2>
                 {activeView === "expenses" ? <div className="mt-5 space-y-5">
                   <div className="grid gap-3 sm:grid-cols-3">
-                    <div className="rounded-xl border border-slate-200 p-4"><p className="text-xs font-semibold uppercase text-slate-500">Pre-trip recorded</p><p className="mt-2 text-xl font-bold">{formatExpenseTotal(preTripExpenses)}</p><p className="mt-1 text-xs text-slate-500">Flights, deposits and advance bookings</p></div>
-                    <div className="rounded-xl border border-slate-200 p-4"><p className="text-xs font-semibold uppercase text-slate-500">Actual trip spending</p><p className="mt-2 text-xl font-bold">{formatExpenseTotal(actualTripExpenses)}</p><p className="mt-1 text-xs text-slate-500">Spending during the trip</p></div>
-                    <div className="rounded-xl border border-slate-200 p-4"><p className="text-xs font-semibold uppercase text-slate-500">Records</p><p className="mt-2 text-xl font-bold">{expenses.length}</p><p className="mt-1 text-xs text-slate-500">Shared expense entries</p></div>
+                    <div className="rounded-xl border border-slate-200 p-4"><p className="text-xs font-semibold uppercase text-slate-500">Pre-trip estimate / paid</p><p className="mt-2 text-xl font-bold">{formatExpenseTotal(preTripExpenses.filter((expense) => expense.share_type !== "personal"))}</p><p className="mt-1 text-xs text-slate-500">Planned bookings and advance payments</p></div>
+                    <div className="rounded-xl border border-slate-200 p-4"><p className="text-xs font-semibold uppercase text-slate-500">Actual shared spending</p><p className="mt-2 text-xl font-bold">{formatExpenseTotal(actualTripExpenses.filter((expense) => expense.share_type !== "personal"))}</p><p className="mt-1 text-xs text-slate-500">During the trip, split 50:50</p></div>
+                    <div className="rounded-xl border border-slate-200 p-4"><p className="text-xs font-semibold uppercase text-slate-500">Personal spending</p><p className="mt-2 text-xl font-bold">{formatExpenseTotal(expenses.filter((expense) => expense.share_type === "personal"))}</p><p className="mt-1 text-xs text-slate-500">Not included in the shared split</p></div>
                   </div>
-                  <div className="flex flex-wrap gap-2" role="group" aria-label="Expense type">
-                    <button type="button" onClick={() => setExpenseType("pre-trip")} className={`rounded-full border px-4 py-2 text-sm font-semibold ${expenseType === "pre-trip" ? "border-emerald-800 bg-emerald-800 text-white" : "border-slate-300 bg-white text-slate-700"}`}>Pre-trip</button>
-                    <button type="button" onClick={() => setExpenseType("actual-trip")} className={`rounded-full border px-4 py-2 text-sm font-semibold ${expenseType === "actual-trip" ? "border-emerald-800 bg-emerald-800 text-white" : "border-slate-300 bg-white text-slate-700"}`}>Actual trip</button>
+                  <div className="grid grid-cols-3 gap-2" role="tablist" aria-label="Expense sections">
+                    {([['pre-trip','Pre-trip'],['actual-trip','Actual trip'],['personal','Personal']] as const).map(([tab,label]) => <button key={tab} type="button" role="tab" aria-selected={expenseTab === tab} onClick={() => { setExpenseTab(tab); setExpenseShareType(tab === "personal" ? "personal" : "shared"); if (tab === "pre-trip") setExpenseType("pre-trip"); else if (tab === "actual-trip") setExpenseType("actual-trip"); }} className={`rounded-xl border px-3 py-3 text-sm font-semibold ${expenseTab === tab ? "border-emerald-800 bg-emerald-800 text-white" : "border-slate-300 bg-white text-slate-700"}`}>{label}</button>)}
                   </div>
+                  {expenseTab === "pre-trip" && <section className="rounded-xl border border-slate-200 p-4"><h3 className="font-semibold">Pre-trip category summary</h3><div className="mt-3 grid gap-2 sm:grid-cols-2">{["Camping site", "Hotel stay", "Activity", "Other"].map((category) => { const matches = preTripExpenses.filter((expense) => expense.share_type !== "personal" && (category === "Camping site" ? /camp|campsite|holiday park/i.test(expense.category + " " + expense.description) : category === "Hotel stay" ? /hotel|accommodation|motel|lodge/i.test(expense.category + " " + expense.description) : category === "Activity" ? /activity|ticket|tour|attraction|booking/i.test(expense.category + " " + expense.description) : !/camp|campsite|holiday park|hotel|accommodation|motel|lodge|activity|ticket|tour|attraction|booking/i.test(expense.category + " " + expense.description))); return <div key={category} className="flex items-center justify-between rounded-lg bg-slate-50 p-3"><span className="text-sm font-medium">{category}</span><span className="text-sm font-bold">{formatExpenseTotal(matches)}</span></div>; })}</div></section>}
+                  {expenseTab === "personal" && <section className="rounded-xl border border-slate-200 p-4"><h3 className="font-semibold">Trip expense summary</h3><div className="mt-3 grid gap-2 sm:grid-cols-3"><div className="rounded-lg bg-slate-50 p-3"><p className="text-xs text-slate-500">Shared expenses · 50:50</p><p className="mt-1 font-bold">{formatExpenseTotal(expenses.filter((expense) => expense.share_type !== "personal"))}</p></div><div className="rounded-lg bg-slate-50 p-3"><p className="text-xs text-slate-500">Personal expenses</p><p className="mt-1 font-bold">{formatExpenseTotal(expenses.filter((expense) => expense.share_type === "personal"))}</p></div><div className="rounded-lg bg-emerald-50 p-3"><p className="text-xs text-emerald-800">Total recorded trip expenses</p><p className="mt-1 font-bold">{formatExpenseTotal(expenses.filter((expense) => expense.source !== "FINAL EXPENSES" || expense.payment_status === "Paid"))}</p></div></div><p className="mt-2 text-xs text-slate-500">The total excludes unpaid estimates from FINAL EXPENSES; currencies are shown separately and are not converted.</p></section>}
                   <form onSubmit={(event) => void saveExpense(event)} className="rounded-xl border border-slate-200 p-4">
-                    <h3 className="font-semibold">Add {expenseType === "pre-trip" ? "pre-trip expense" : "actual trip expense"}</h3>
+                    <h3 className="font-semibold">Add {expenseTab === "pre-trip" ? "pre-trip expense" : expenseTab === "actual-trip" ? "actual trip expense" : "personal expense"}</h3>
                     <div className="mt-4 grid gap-3 sm:grid-cols-2">
                       <label className="text-sm font-medium">Date<input type="date" required value={expenseDate} onChange={(event) => { const value = event.target.value; setExpenseDate(value); setExpenseType(value >= "2026-11-07" ? "actual-trip" : "pre-trip"); }} className="mt-1 block w-full rounded-lg border border-slate-300 px-3 py-2 font-normal" /></label>
+                      <label className="text-sm font-medium">Expense sharing<select value={expenseShareType} onChange={(event) => setExpenseShareType(event.target.value as "shared" | "personal")} className="mt-1 block w-full rounded-lg border border-slate-300 px-3 py-2 font-normal"><option value="shared">Shared · split 50:50</option><option value="personal">Personal · not split</option></select></label>
                       <label className="text-sm font-medium">Paid by<select value={expensePaidBy} onChange={(event) => setExpensePaidBy(event.target.value)} className="mt-1 block w-full rounded-lg border border-slate-300 px-3 py-2 font-normal"><option>Ralph</option><option>June</option><option>Shared</option></select></label>
-                      <label className="text-sm font-medium sm:col-span-2">Description<input required maxLength={200} value={expenseDescription} onChange={(event) => setExpenseDescription(event.target.value)} placeholder="e.g. Campervan deposit" className="mt-1 block w-full rounded-lg border border-slate-300 px-3 py-2 font-normal" /></label>
-                      <label className="text-sm font-medium">Category<select value={expenseCategory} onChange={(event) => setExpenseCategory(event.target.value)} className="mt-1 block w-full rounded-lg border border-slate-300 px-3 py-2 font-normal">{["Flights", "Campervan", "Accommodation", "Insurance", "Bookings & activities", "Fuel", "Groceries", "Meals", "Parking & transport", "Shopping", "Other"].map((category) => <option key={category}>{category}</option>)}</select></label>
+                      <label className="text-sm font-medium">Description<input required maxLength={200} value={expenseDescription} onChange={(event) => setExpenseDescription(event.target.value)} placeholder="e.g. Campervan deposit" className="mt-1 block w-full rounded-lg border border-slate-300 px-3 py-2 font-normal" /></label>
+                      <label className="text-sm font-medium">Category<select value={expenseCategory} onChange={(event) => setExpenseCategory(event.target.value)} className="mt-1 block w-full rounded-lg border border-slate-300 px-3 py-2 font-normal">{["Camping site", "Hotel stay", "Activity", "Flights", "Campervan", "Accommodation", "Insurance", "Bookings & activities", "Fuel", "Groceries", "Meals", "Parking & transport", "Shopping", "Other"].map((category) => <option key={category}>{category}</option>)}</select></label>
                       <div className="grid grid-cols-[1fr_100px] gap-2"><label className="text-sm font-medium">Amount<input type="number" min="0.01" step="0.01" required value={expenseAmount} onChange={(event) => setExpenseAmount(event.target.value)} placeholder="0.00" className="mt-1 block w-full rounded-lg border border-slate-300 px-3 py-2 font-normal" /></label><label className="text-sm font-medium">Currency<select value={expenseCurrency} onChange={(event) => setExpenseCurrency(event.target.value)} className="mt-1 block w-full rounded-lg border border-slate-300 px-2 py-2 font-normal"><option>NZD</option><option>MYR</option><option>AUD</option><option>USD</option></select></label></div>
+                      <div className="sm:col-span-2"><div className="flex flex-wrap items-center justify-between gap-2"><span className="text-sm font-medium">Location (GPS)</span><button type="button" onClick={detectExpenseLocation} disabled={isDetectingExpenseLocation} className="rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm font-semibold disabled:opacity-50">{isDetectingExpenseLocation ? "Locating…" : "📍 Use GPS"}</button></div><input readOnly value={expenseLocation} placeholder="Optional — attach current location" className="mt-2 block w-full rounded-lg border border-slate-300 bg-slate-50 px-3 py-2 text-sm" /></div>
                       <label className="text-sm font-medium sm:col-span-2">Notes (optional)<textarea rows={2} maxLength={1000} value={expenseNotes} onChange={(event) => setExpenseNotes(event.target.value)} className="mt-1 block w-full rounded-lg border border-slate-300 px-3 py-2 font-normal" /></label>
                     </div>
                     <button type="submit" disabled={expenseSaving} className="mt-4 rounded-lg bg-emerald-800 px-4 py-2.5 text-sm font-semibold text-white disabled:opacity-50">{expenseSaving ? "Saving…" : "Save expense"}</button>
                     {expenseMessage && <p className="mt-3 text-sm text-slate-600" aria-live="polite">{expenseMessage}</p>}
                   </form>
-                  <section><h3 className="font-semibold">Expense records</h3>{expenses.length ? <div className="mt-3 space-y-3">{[...expenses].sort((a,b) => (b.date || "").localeCompare(a.date || "")).map((expense) => <article key={expense.expense_id} className="rounded-xl border border-slate-200 p-4"><div className="flex flex-wrap items-start justify-between gap-3"><div className="min-w-0"><p className="font-semibold">{expense.description}</p><p className="mt-1 text-xs text-slate-500">{expense.date || "Planned / booked"} · {expense.category} · Paid by {expense.paid_by}</p><div className="mt-2 flex flex-wrap gap-2"><span className="inline-block rounded-full bg-slate-100 px-2 py-1 text-xs text-slate-600">{expense.expense_type === "pre-trip" ? "Pre-trip" : "Actual trip"}{expense.source === "FINAL EXPENSES" ? " · From planning sheet" : ""}</span>{expense.payment_status && <span className={`inline-block rounded-full px-2 py-1 text-xs ${expense.payment_status === "Paid" ? "bg-emerald-100 text-emerald-800" : "bg-amber-100 text-amber-800"}`}>{expense.payment_status}</span>}</div>{typeof expense.split_share === "number" && <p className="mt-2 text-xs text-slate-600">50:50 share: {formatMoney(expense.split_share, expense.currency)}</p>}{expense.notes && <p className="mt-2 whitespace-pre-wrap text-sm text-slate-600">{expense.notes}</p>}</div><p className="shrink-0 font-bold">{formatMoney(Number(expense.amount), expense.currency)}</p></div></article>)}</div> : <p className="mt-2 rounded-xl bg-slate-50 p-4 text-sm text-slate-600">No expenses returned from Google Sheets yet.</p>}</section>
+                  {(() => { const visibleExpenses = expenses.filter((expense) => expenseTab === "personal" ? expense.share_type === "personal" : expense.share_type !== "personal" && expense.expense_type === expenseTab); return <section><h3 className="font-semibold">{expenseTab === "pre-trip" ? "Pre-trip expenses" : expenseTab === "actual-trip" ? "Actual trip expenses" : "Personal expenses"}</h3>{visibleExpenses.length ? <div className="mt-3 space-y-3">{[...visibleExpenses].sort((a,b) => (b.date || "").localeCompare(a.date || "")).map((expense) => <article key={expense.expense_id} className="rounded-xl border border-slate-200 p-4"><div className="flex flex-wrap items-start justify-between gap-3"><div className="min-w-0"><p className="font-semibold">{expense.description}</p><p className="mt-1 text-xs text-slate-500">{expense.date || "Planned / booked"} · {expense.category} · Paid by {expense.paid_by}</p><div className="mt-2 flex flex-wrap gap-2"><span className="inline-block rounded-full bg-slate-100 px-2 py-1 text-xs text-slate-600">{expense.expense_type === "pre-trip" ? "Pre-trip" : "Actual trip"}{expense.source === "FINAL EXPENSES" ? " · From planning sheet" : ""}</span><span className="inline-block rounded-full bg-blue-50 px-2 py-1 text-xs text-blue-800">{expense.share_type === "personal" ? "Personal" : "Shared · 50:50"}</span>{expense.payment_status && <span className={`inline-block rounded-full px-2 py-1 text-xs ${expense.payment_status === "Paid" ? "bg-emerald-100 text-emerald-800" : "bg-amber-100 text-amber-800"}`}>{expense.payment_status}</span>}</div>{typeof expense.split_share === "number" && <p className="mt-2 text-xs text-slate-600">50:50 share: {formatMoney(expense.split_share, expense.currency)}</p>}{expense.location && <a className="mt-2 block text-xs font-semibold text-emerald-800 underline" href={`https://www.google.com/maps?q=${encodeURIComponent(expense.latitude && expense.longitude ? `${expense.latitude},${expense.longitude}` : expense.location)}`} target="_blank" rel="noreferrer">📍 {expense.location} · Open map</a>}{expense.notes && <p className="mt-2 whitespace-pre-wrap text-sm text-slate-600">{expense.notes}</p>}</div><p className="shrink-0 font-bold">{formatMoney(Number(expense.amount), expense.currency)}</p></div></article>)}</div> : <p className="mt-2 rounded-xl bg-slate-50 p-4 text-sm text-slate-600">No {expenseTab === "personal" ? "personal" : expenseTab === "pre-trip" ? "pre-trip" : "actual trip"} expenses found.</p>}</section>; })()}
                 </div> : activeView === "map" ? <div className="mt-5 space-y-4"><p className="max-w-xl text-sm leading-6 text-slate-600">Open a day's route in Google Maps for driving directions. Flight days open a location search instead of driving directions.</p>{tripDays.map((day, index) => { const routeEntry = getEntriesForDay(day).find((entry) => /^(route|route\s*\/.*|route\s*and.*)$/i.test(entry.label.trim())) || getEntriesForDay(day).find((entry) => /route/i.test(entry.label)); const routeText = routeEntry?.value.trim() || ""; return <article key={day.key} className="rounded-xl border border-slate-200 p-4"><div className="flex items-start justify-between gap-3"><div><p className="text-xs font-semibold uppercase tracking-wide text-emerald-800">Day {index + 1} · {day.date}</p><h3 className="mt-1 font-semibold">{routeText || "Route not entered"}</h3></div><span aria-hidden="true" className="text-2xl">🛣️</span></div>{routeText ? <a href={googleMapsUrl(routeText)} target="_blank" rel="noreferrer" className="mt-3 inline-flex rounded-lg bg-emerald-800 px-4 py-2.5 text-sm font-semibold text-white hover:bg-emerald-900">{/\b(KUL|SIN)\b|flight|airport transfer/i.test(routeText) ? "Open locations in Google Maps ↗" : "Open driving route in Google Maps ↗"}</a> : <p className="mt-2 text-sm text-slate-500">Add route details to this day's itinerary to enable directions.</p>}</article>; })}<p className="text-xs text-slate-500">Google Maps opens separately. Route accuracy depends on the place names in your itinerary.</p></div> : <div className="mt-5 space-y-5">
                   <form onSubmit={(event) => { event.preventDefault(); setMemoryPreviewOpen(true); setMemoryMessage(""); }} className="rounded-xl border border-slate-200 p-4">
                     <h3 className="font-semibold">Add a shared memory</h3><p className="mt-1 text-sm text-slate-500">Review the preview before saving. Memories are shared with both approved travellers.</p>
