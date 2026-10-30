@@ -1904,6 +1904,42 @@ export default {
     }
 
     
+    // Serve private Google Drive memory photos through the authenticated Worker.
+    // Direct drive.google.com image URLs do not work reliably for private files.
+    if (request.method === "GET" && url.pathname === "/api/memory-photo") {
+      const session = await readSession(request, env);
+      if (!session) return jsonResponse({ success: false, error: "Authentication required." }, 401);
+      const trip = await resolveTrip(request, env);
+      if (!trip) return jsonResponse({ success: false, error: "Select a valid trip first." }, 404);
+      const fileId = (url.searchParams.get("fileId") || "").trim();
+      if (!/^[a-zA-Z0-9_-]{10,200}$/.test(fileId)) return jsonResponse({ success: false, error: "Invalid photo ID." }, 400);
+      try {
+        const accessToken = await googleAccessToken(session, env);
+        const driveResponse = await fetch(`https://www.googleapis.com/drive/v3/files/${encodeURIComponent(fileId)}?alt=media`, {
+          headers: { Authorization: `Bearer ${accessToken}` },
+        });
+        if (!driveResponse.ok) {
+          const detail = (await driveResponse.text().catch(() => "")).slice(0, 300);
+          return jsonResponse({ success: false, error: driveResponse.status === 404 ? "Photo not found or not shared with this traveller." : `Could not load photo from Google Drive (HTTP ${driveResponse.status}). ${detail}` }, driveResponse.status === 404 ? 404 : 502);
+        }
+        const contentType = driveResponse.headers.get("Content-Type") || "application/octet-stream";
+        if (!/^image\/(jpeg|png|webp|gif|heic|heif)$/i.test(contentType.split(";")[0])) {
+          return jsonResponse({ success: false, error: "The Drive file is not a supported image." }, 415);
+        }
+        return new Response(driveResponse.body, {
+          status: 200,
+          headers: {
+            "Content-Type": contentType,
+            "Cache-Control": "private, max-age=300",
+            "X-Content-Type-Options": "nosniff",
+            "Content-Disposition": "inline",
+          },
+        });
+      } catch (error) {
+        return jsonResponse({ success: false, error: error instanceof Error ? error.message : "Could not retrieve the trip photo." }, 502);
+      }
+    }
+
     if (url.pathname === "/api/highlight-photo" && (request.method === "GET" || request.method === "POST")) {
       const session = await readSession(request, env);
       if (!session) return jsonResponse({ success: false, error: "Authentication required." }, 401);
