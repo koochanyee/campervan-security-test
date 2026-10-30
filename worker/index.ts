@@ -1155,8 +1155,9 @@ export default {
       } catch (error) { return jsonResponse({ success: false, error: error instanceof Error ? error.message : "Could not access trip expenses." }, 500); }
     }
 
-    // Shared checklists: read the two existing source tabs without adding or changing
-    // columns. Individual Ralph/June completion states live in KV, not in the workbook.
+    // Checklists: read the existing source tabs without changing their layout.
+    // Packing states are individual in trip-scoped KV; THINGS TO DO is shared.
+    // Grocery retains its existing Ralph / June sheet-column behavior.
     if (url.pathname === "/api/checklist" && (request.method === "GET" || request.method === "POST")) {
       const session = await readSession(request, env);
       if (!session) return jsonResponse({ success: false, error: "Authentication required." }, 401);
@@ -1168,7 +1169,7 @@ export default {
         if (!trip) return jsonResponse({ success: false, error: "Select a valid trip first." }, 404);
         const token = await googleAccessToken(session, env);
         const statusKey = `checklist-status:${trip.id}`;
-        let statuses: Record<string, { ralph_status?: string; june_status?: string }> = {};
+        let statuses: Record<string, { ralph_status?: string; june_status?: string; shared_status?: string }> = {};
         const savedStatuses = await env.OAUTH_TOKEN_STORE.get(statusKey);
         if (savedStatuses) { try { statuses = JSON.parse(savedStatuses) as typeof statuses; } catch { statuses = {}; } }
         const profile = session.email.toLowerCase() === "koochanyee@gmail.com" ? "ralph_status" : session.email.toLowerCase() === "wookahwai@gmail.com" ? "june_status" : "";
@@ -1176,32 +1177,57 @@ export default {
         if (request.method === "POST") {
           const itemId = typeof body.item_id === "string" ? body.item_id.trim() : "";
           const status = typeof body.status === "string" ? body.status : "";
-          if (!/^(pack|todo|grocery-malaysia|grocery-pns|grocery-list)-\d+$/.test(itemId) || !["", "✓", "x"].includes(status)) return jsonResponse({ success: false, error: "Invalid checklist item or status." }, 400);
+          if (!/^(pack|todo|grocery-malaysia|grocery-pns|grocery-list)-\d+$/.test(itemId) || !["", "✓", "x"].includes(status)) {
+            return jsonResponse({ success: false, error: "Invalid checklist item or status." }, 400);
+          }
           const itemMatch = itemId.match(/^(pack|todo|grocery-malaysia|grocery-pns|grocery-list)-(\d+)$/);
           if (!itemMatch) return jsonResponse({ success: false, error: "Invalid checklist row reference." }, 400);
           const itemKind = itemMatch[1];
-          const sheetRow = Number(itemMatch[2]);
-          const targetTab = itemKind.startsWith("grocery-")
-            ? await findExistingTab(token, trip.sheetId, ["Shopping List or Things to Brin", "Shopping List or Things to Bring"], "")
-            : await findExistingTab(token, trip.sheetId, ["Thing to do n bring", "Things to do n bring", "Thing to do & bring", "Things to do & bring", "THINGS TO DO N BRING", "THINGS TO DO & BRING"], "");
-          if (!targetTab) return jsonResponse({ success: false, error: "Could not find the Google Sheet tab for this checklist item." }, 404);
-          const targetRows = await readSheetRows(token, trip.sheetId, targetTab);
-          const targetHeaderName = profile.replace("_status", "");
-          const headerRowIndex = targetRows.slice(0, 3).findIndex((row) => row.some((cell) => String(cell || "").trim().toLowerCase().replace(/[^a-z0-9]/g, "") === targetHeaderName));
-          const targetHeader = (targetRows[headerRowIndex >= 0 ? headerRowIndex : 0] || []).map((cell) => String(cell || "").trim().toLowerCase().replace(/[^a-z0-9]/g, ""));
-          const statusColumn = targetHeader.findIndex((cell) => cell === targetHeaderName);
-          if (statusColumn < 0) return jsonResponse({ success: false, error: `The “${targetTab}” tab has no ${targetHeaderName} status column. I saved nothing so the app and sheet will not disagree; add/label that existing checkbox column as ${targetHeaderName} first.` }, 409);
-          if (sheetRow < 2 || sheetRow > targetRows.length) return jsonResponse({ success: false, error: "The checklist row no longer exists in Google Sheets. Refresh the checklist and try again." }, 409);
-          const columnLetter = (index: number) => { let n = index + 1; let label = ""; while (n > 0) { const rem = (n - 1) % 26; label = String.fromCharCode(65 + rem) + label; n = Math.floor((n - 1) / 26); } return label; };
-          const cellRange = `${quoteSheetTab(targetTab)}!${columnLetter(statusColumn)}${sheetRow}`;
-          const sheetWrite = await fetch(`${sheetsValuesUrl(trip.sheetId, cellRange)}?valueInputOption=USER_ENTERED`, { method: "PUT", headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" }, body: JSON.stringify({ values: [[status === "✓"]] }) });
-          if (!sheetWrite.ok) {
-            const detail = (await sheetWrite.text().catch(() => "")).slice(0, 250);
-            return jsonResponse({ success: false, error: `Google Sheets did not update the ${profile.replace("_status", "")} checkbox (HTTP ${sheetWrite.status}). ${detail}` }, 502);
+
+          // Checklist completion is stored centrally in trip-scoped KV. This keeps
+          // the source workbook layout untouched and makes updates visible to both
+          // companions on their next checklist refresh.
+          if (itemKind.startsWith("grocery-")) {
+            // Preserve the existing Grocery behavior: write the signed-in person's
+            // checkbox to that tab's explicitly labelled Ralph / June column.
+            const groceryTab = await findExistingTab(token, trip.sheetId, ["Shopping List or Things to Brin", "Shopping List or Things to Bring"], "");
+            if (!groceryTab) return jsonResponse({ success: false, error: "Could not find the Google Sheet tab for this grocery item." }, 404);
+            const groceryRows = await readSheetRows(token, trip.sheetId, groceryTab);
+            const targetHeaderName = profile.replace("_status", "");
+            const headerRowIndex = groceryRows.slice(0, 3).findIndex((row) => row.some((cell) => String(cell || "").trim().toLowerCase().replace(/[^a-z0-9]/g, "") === targetHeaderName));
+            const targetHeader = (groceryRows[headerRowIndex >= 0 ? headerRowIndex : 0] || []).map((cell) => String(cell || "").trim().toLowerCase().replace(/[^a-z0-9]/g, ""));
+            const statusColumn = targetHeader.findIndex((cell) => cell === targetHeaderName);
+            if (statusColumn < 0) return jsonResponse({ success: false, error: `The “${groceryTab}” tab has no ${targetHeaderName} status column.` }, 409);
+            const sheetRow = Number(itemMatch[2]);
+            if (sheetRow < 3 || sheetRow > groceryRows.length) return jsonResponse({ success: false, error: "The grocery row no longer exists in Google Sheets. Refresh the checklist and try again." }, 409);
+            const columnLetter = (index: number) => { let n = index + 1; let label = ""; while (n > 0) { const rem = (n - 1) % 26; label = String.fromCharCode(65 + rem) + label; n = Math.floor((n - 1) / 26); } return label; };
+            const cellRange = `${quoteSheetTab(groceryTab)}!${columnLetter(statusColumn)}${sheetRow}`;
+            const sheetWrite = await fetch(`${sheetsValuesUrl(trip.sheetId, cellRange)}?valueInputOption=USER_ENTERED`, { method: "PUT", headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" }, body: JSON.stringify({ values: [[status === "✓"]] }) });
+            if (!sheetWrite.ok) return jsonResponse({ success: false, error: `Google Sheets did not update the ${targetHeaderName} grocery checkbox (HTTP ${sheetWrite.status}).` }, 502);
+            statuses[itemId] = { ...(statuses[itemId] || {}), [profile]: status };
+          } else if (itemKind === "todo") {
+            // THINGS TO DO is one shared task: either companion's action updates both.
+            statuses[itemId] = {
+              ...(statuses[itemId] || {}),
+              shared_status: status,
+              ralph_status: status,
+              june_status: status,
+            };
+          } else {
+            // Packing items retain separate Ralph / June states in trip-scoped KV.
+            statuses[itemId] = { ...(statuses[itemId] || {}), [profile]: status };
           }
-          statuses[itemId] = { ...(statuses[itemId] || {}), [profile]: status };
           await env.OAUTH_TOKEN_STORE.put(statusKey, JSON.stringify(statuses));
-          return jsonResponse({ success: true, item_id: itemId, status, sheetSynced: true, message: status === "x" ? "Marked not applicable in the app; Google Sheets checkbox is unchecked." : status === "✓" ? "Done status synced to Google Sheets." : "Checklist status cleared in Google Sheets." , tripId: trip.id });
+          return jsonResponse({
+            success: true,
+            item_id: itemId,
+            status,
+            shared: itemKind === "todo",
+            message: itemKind === "todo"
+              ? (status === "✓" ? "Shared task marked done for both Ralph and June." : status === "x" ? "Shared task marked not applicable for both." : "Shared task status cleared for both.")
+              : (status === "✓" ? (itemKind.startsWith("grocery-") ? "Grocery checkbox updated in Google Sheets." : "Your packing status was saved.") : status === "x" ? "Marked not applicable." : "Your checklist status was cleared."),
+            tripId: trip.id,
+          });
         }
         const result: Array<Record<string, unknown>> = [];
         const mainTab = await findExistingTab(token, trip.sheetId, ["Thing to do n bring", "Things to do n bring", "Thing to do & bring", "Things to do & bring", "THINGS TO DO N BRING", "THINGS TO DO & BRING"], "");
@@ -1225,13 +1251,15 @@ export default {
           return jsonResponse({ success: false, error: `The tab “${mainTab}” was found, but its first row did not match the expected Category / Item headers.` }, 409);
         }
         let currentCategory = "Other";
-        const savedStatus = (itemId: string, key: "ralph_status" | "june_status", row: string[], statusCol: number) => {
-          const saved = statuses[itemId]?.[key] || "";
-          // Preserve the app-only ignored state, but let the actual Google Sheet checkbox
-          // be authoritative for Done so stale KV values cannot mask a failed sheet write.
-          if (saved === "x") return "x";
-          if (statusCol >= 0) return [true, "TRUE", "true", "✓"].includes(row[statusCol] as never) ? "✓" : "";
-          return saved;
+        const savedStatus = (itemId: string, key: "ralph_status" | "june_status") => statuses[itemId]?.[key] || "";
+        const sharedTodoStatus = (itemId: string) => {
+          const saved = statuses[itemId] || {};
+          if (typeof saved.shared_status === "string") return saved.shared_status;
+          // Compatibility with any earlier per-person todo values: if either person
+          // had marked it done, carry that completion into the new shared behavior.
+          if (saved.ralph_status === "✓" || saved.june_status === "✓") return "✓";
+          if (saved.ralph_status === "x" && saved.june_status === "x") return "x";
+          return "";
         };
         rows.slice(1).forEach((row, index) => {
           const sheetRow = index + 2;
@@ -1245,8 +1273,8 @@ export default {
               item_id: itemId, category: currentCategory, item: packItem,
               quantity: String(row[qtyIdx] || "").trim(), notes: String(row[notesIdx] || "").trim(),
               must_have: mustHave, checklist_type: "packing",
-              ralph_status: savedStatus(itemId, "ralph_status", row, ralphIdx),
-              june_status: savedStatus(itemId, "june_status", row, juneIdx),
+              ralph_status: savedStatus(itemId, "ralph_status"),
+              june_status: savedStatus(itemId, "june_status"),
             });
           }
           const todoItem = String(row[todoIdx] || "").trim();
@@ -1255,8 +1283,9 @@ export default {
             result.push({
               item_id: itemId, category: "Things to do", item: todoItem,
               due_date: String(row[dueIdx] || "").trim(), checklist_type: "todo",
-              ralph_status: savedStatus(itemId, "ralph_status", row, -1),
-              june_status: savedStatus(itemId, "june_status", row, -1),
+              shared_status: sharedTodoStatus(itemId),
+              ralph_status: sharedTodoStatus(itemId),
+              june_status: sharedTodoStatus(itemId),
             });
           }
         });
