@@ -82,6 +82,7 @@ type ChecklistItem = {
   item: string;
   ralph_status?: string;
   june_status?: string;
+  shared_status?: string;
   quantity?: string;
   notes?: string;
   due_date?: string;
@@ -679,7 +680,9 @@ function App() {
   const setChecklistStatus = async (item: ChecklistItem, status: "" | "✓" | "x") => {
     const currentName = verifiedEmail.toLowerCase() === "koochanyee@gmail.com" ? "Ralph" : "June";
     const field = currentName === "Ralph" ? "ralph_status" : "june_status";
-    const updated = { ...item, [field]: status } as ChecklistItem;
+    const updated = item.checklist_type === "todo"
+      ? { ...item, shared_status: status, ralph_status: status, june_status: status }
+      : { ...item, [field]: status };
     setChecklistSavingId(item.item_id);
     setChecklistMessage("");
     setChecklistItems((current) => current.map((entry) => entry.item_id === item.item_id ? updated : entry));
@@ -691,7 +694,7 @@ function App() {
       });
       const result = await response.json() as ApiResponse;
       if (!response.ok || !result.success) throw new Error(result.error || "Could not sync checklist status.");
-      setChecklistMessage(typeof result.message === "string" ? result.message : "Checklist synced to Google Sheets.");
+      setChecklistMessage(typeof result.message === "string" ? result.message : "Checklist status saved.");
     } catch (error) {
       setChecklistItems((current) => current.map((entry) => entry.item_id === item.item_id ? item : entry));
       setChecklistMessage(error instanceof Error ? error.message : "Could not sync checklist status.");
@@ -804,7 +807,11 @@ function App() {
   const selectedChecklistCategory = checklistCategories[safeChecklistCategoryIndex] ?? "";
   const selectedChecklistItems = checklistItems.filter((item) => item.category === selectedChecklistCategory);
   const currentChecklistField = verifiedEmail.toLowerCase() === "koochanyee@gmail.com" ? "ralph_status" : "june_status";
-  const checklistCompletedCount = checklistItems.filter((item) => item[currentChecklistField] === "✓").length;
+  const checklistCompletedCount = checklistItems.filter((item) =>
+    item.checklist_type === "todo"
+      ? (item.shared_status || item.ralph_status || item.june_status) === "✓"
+      : item[currentChecklistField] === "✓"
+  ).length;
   const paidOrActualExpenses = expenses.filter((expense) => expense.source !== "FINAL EXPENSES" || expense.payment_status === "Paid");
   const paidPreTripExpenses = paidOrActualExpenses.filter((expense) => expense.expense_type === "pre-trip");
   const formatMoney = (amount: number, currency: string) => `${currency || "NZD"} ${Number(amount || 0).toFixed(2)}`;
@@ -1512,7 +1519,7 @@ function App() {
                 <button type="button" onClick={goToDashboard} className="text-sm font-semibold text-emerald-800 hover:underline">← Back to dashboard</button>
                 <p className="mt-6 text-xs font-bold uppercase tracking-[0.16em] text-emerald-800">Before departure</p>
                 <h2 className="mt-2 text-2xl font-bold">Things to do & bring</h2>
-                <p className="mt-2 text-sm text-slate-600">Your own status is saved separately from {welcomeName === "Ralph" ? "June" : "Ralph"}. Choose Done, To do or Ignored for each item.</p>
+                <p className="mt-2 text-sm text-slate-600">Things to do are shared: either person can mark them done for both. Packing items (Clothes, Shoes, Toiletries and other categories) have separate Ralph and June checkboxes.</p>
                 <div className="mt-4 rounded-xl bg-emerald-50 p-3 text-sm text-emerald-900">Completed: {checklistCompletedCount} of {checklistItems.length} items</div>
                 {checklistCategories.length > 0 ? (
                   <>
