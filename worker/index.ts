@@ -1240,7 +1240,6 @@ export default {
         const itemIdx = findHeader(["item"]) >= 0 ? findHeader(["item"]) : 1;
         const qtyIdx = findHeader(["qty", "quantity"]) >= 0 ? findHeader(["qty", "quantity"]) : 2;
         const ralphIdx = findHeader(["ralph"]);
-        const juneIdx = findHeader(["june"]);
         const notesIdx = findHeader(["notes"]) >= 0 ? findHeader(["notes"]) : (ralphIdx >= 0 ? 5 : 4);
         // Legacy workbook has a blank header in D and a checkbox there; newer
         // layout may use D/E for Ralph/June, in which case D is not must-have.
