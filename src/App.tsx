@@ -281,6 +281,7 @@ function App() {
   const [expensePaidBy, setExpensePaidBy] = useState("Ralph");
   const [expenseNotes, setExpenseNotes] = useState("");
   const [memories, setMemories] = useState<TripMemory[]>([]);
+  const [selectedMemoryPhoto, setSelectedMemoryPhoto] = useState<{ id: string; attraction: string; trip_date: string } | null>(null);
   const [memoryAttraction, setMemoryAttraction] = useState(() => {
     try { return window.sessionStorage.getItem("campervan-memory-attraction") || ""; }
     catch { return ""; }
@@ -760,6 +761,16 @@ function App() {
       setIsSavingMemory(false);
     }
   };
+
+  const memoryGalleryPhotos = useMemo(() => memories.flatMap((memory) =>
+    getMemoryPhotoIds(memory.photo_ids).map((id) => ({
+      id,
+      attraction: memory.attraction || "Trip memory",
+      trip_date: memory.trip_date || "",
+      memory_id: memory.memory_id,
+    }))
+  ), [memories]);
+  const getMemoryPhotoUrl = (fileId: string) => `/api/memory-photo?tripId=${encodeURIComponent(selectedTripId)}&fileId=${encodeURIComponent(fileId)}`;
 
   const headerKeys = useMemo(() => (itineraryRows.length > 0 ? Object.keys(itineraryRows[0]) : []), [itineraryRows]);
   const labelKey = headerKeys[0] || "DAY";
@@ -1652,7 +1663,11 @@ function App() {
                   </form>
                   {memoryPreviewOpen && <section className="rounded-xl border border-emerald-300 bg-emerald-50/50 p-4"><p className="text-xs font-bold uppercase tracking-wide text-emerald-800">Preview — not saved yet</p><h3 className="mt-2 font-semibold">{memoryAttraction}</h3><p className="mt-1 text-xs text-slate-500">{memoryDate}</p><p className="mt-3 whitespace-pre-wrap text-sm leading-6">{memoryContent}</p><div className="mt-4 flex flex-wrap gap-2"><button type="button" onClick={() => void saveMemory()} disabled={isSavingMemory} className="rounded-lg bg-emerald-800 px-4 py-2.5 text-sm font-semibold text-white disabled:opacity-50">{isSavingMemory ? "Saving…" : "Confirm & save"}</button><button type="button" onClick={() => setMemoryPreviewOpen(false)} className="rounded-lg border border-slate-300 bg-white px-4 py-2.5 text-sm font-semibold">Keep editing</button></div></section>}
                   {memoryMessage && <p className="text-sm text-slate-600" aria-live="polite">{memoryMessage}</p>}
-                  <section><h3 className="font-semibold">Shared memory collection</h3>{memories.length ? <div className="mt-3 space-y-3">{[...memories].sort((a,b) => (a.trip_date || "").localeCompare(b.trip_date || "")).map((memory) => <article key={memory.memory_id} className="rounded-xl border border-slate-200 p-4"><div className="flex flex-wrap items-start justify-between gap-2"><h4 className="font-semibold">{memory.attraction}</h4><span className="text-xs text-slate-500">{memory.trip_date}</span></div><p className="mt-2 whitespace-pre-wrap text-sm leading-6 text-slate-700">{memory.content}</p>{getMemoryPhotoIds(memory.photo_ids).length > 0 && <div className="mt-3 grid grid-cols-2 gap-2 sm:grid-cols-3">{getMemoryPhotoIds(memory.photo_ids).map((photoId) => <a key={photoId} href={`https://drive.google.com/uc?export=view&id=${encodeURIComponent(photoId)}`} target="_blank" rel="noreferrer" className="block overflow-hidden rounded-lg border border-slate-200"><img src={`https://drive.google.com/uc?export=view&id=${encodeURIComponent(photoId)}`} alt={`Photo for ${memory.attraction}`} loading="lazy" className="h-32 w-full object-cover" /><span className="block px-2 py-1 text-xs font-semibold text-emerald-800">Open photo ↗</span></a>)}</div>}<p className="mt-2 text-xs text-slate-500">Shared by {memory.author_email || "trip companion"}</p></article>)}</div> : <p className="mt-2 text-sm text-slate-500">No shared memories have been saved yet.</p>}</section>
+                  <section className="rounded-xl border border-slate-200 p-4">
+                    <div className="flex flex-wrap items-center justify-between gap-2"><h3 className="font-semibold">Trip photo gallery</h3><span className="text-xs text-slate-500">{memoryGalleryPhotos.length} photo{memoryGalleryPhotos.length === 1 ? "" : "s"}</span></div>
+                    {memoryGalleryPhotos.length ? <div className="mt-3 max-h-[420px] overflow-y-auto overscroll-contain rounded-lg border border-slate-100 p-2"><div className="grid grid-cols-2 gap-2 sm:grid-cols-3">{memoryGalleryPhotos.map((photo, index) => <button key={`${photo.memory_id}-${photo.id}-${index}`} type="button" onClick={() => setSelectedMemoryPhoto(photo)} className="overflow-hidden rounded-lg border border-slate-200 bg-white text-left shadow-sm hover:border-emerald-400 focus:outline-none focus:ring-2 focus:ring-emerald-600"><img src={getMemoryPhotoUrl(photo.id)} alt={`Trip photo: ${photo.attraction}`} loading="lazy" className="h-28 w-full bg-slate-100 object-cover sm:h-36" /><span className="block truncate px-2 pt-2 text-xs font-semibold text-slate-800">{photo.attraction}</span><span className="block px-2 pb-2 text-[11px] text-slate-500">{photo.trip_date}</span></button>)}</div></div> : <p className="mt-2 text-sm text-slate-500">Photos added to saved memories will appear here.</p>}
+                  </section>
+                  <section><h3 className="font-semibold">Shared memory collection</h3>{memories.length ? <div className="mt-3 space-y-3">{[...memories].sort((a,b) => (a.trip_date || "").localeCompare(b.trip_date || "")).map((memory) => <article key={memory.memory_id} className="rounded-xl border border-slate-200 p-4"><div className="flex flex-wrap items-start justify-between gap-2"><h4 className="font-semibold">{memory.attraction}</h4><span className="text-xs text-slate-500">{memory.trip_date}</span></div><p className="mt-2 whitespace-pre-wrap text-sm leading-6 text-slate-700">{memory.content}</p>{getMemoryPhotoIds(memory.photo_ids).length > 0 && <div className="mt-3 grid grid-cols-3 gap-2 sm:grid-cols-4">{getMemoryPhotoIds(memory.photo_ids).map((photoId) => <button key={photoId} type="button" onClick={() => setSelectedMemoryPhoto({ id: photoId, attraction: memory.attraction, trip_date: memory.trip_date })} className="overflow-hidden rounded-lg border border-slate-200 bg-white text-left"><img src={getMemoryPhotoUrl(photoId)} alt={`Photo for ${memory.attraction}`} loading="lazy" className="h-20 w-full bg-slate-100 object-cover sm:h-24" /><span className="block px-2 py-1 text-[11px] font-semibold text-emerald-800">View photo</span></button>)}</div>}<p className="mt-2 text-xs text-slate-500">Shared by {memory.author_email || "trip companion"}</p></article>)}</div> : <p className="mt-2 text-sm text-slate-500">No shared memories have been saved yet.</p>}</section>
 
                 </div>}
               </section>
@@ -1660,6 +1675,15 @@ function App() {
           </>
         )}
       </main>
+
+      {selectedMemoryPhoto && (
+        <div className="fixed inset-0 z-[70] flex items-center justify-center bg-slate-950/90 p-3 sm:p-6" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) setSelectedMemoryPhoto(null); }}>
+          <section role="dialog" aria-modal="true" aria-label={`Trip photo from ${selectedMemoryPhoto.attraction}`} className="relative flex max-h-full w-full max-w-5xl flex-col items-center">
+            <div className="mb-3 flex w-full items-center justify-between gap-3 text-white"><div className="min-w-0"><p className="truncate text-sm font-semibold">{selectedMemoryPhoto.attraction}</p><p className="text-xs text-slate-300">{selectedMemoryPhoto.trip_date}</p></div><button type="button" onClick={() => setSelectedMemoryPhoto(null)} className="shrink-0 rounded-full bg-white/15 px-4 py-2 text-sm font-semibold text-white hover:bg-white/25">Close ✕</button></div>
+            <img src={getMemoryPhotoUrl(selectedMemoryPhoto.id)} alt={`Full-size trip photo: ${selectedMemoryPhoto.attraction}`} className="max-h-[82vh] max-w-full rounded-lg object-contain" />
+          </section>
+        </div>
+      )}
 
       {locationModalSession && selectedDay && (
         <div className="fixed inset-0 z-50 flex items-end justify-center bg-slate-950/40 p-0 sm:items-center sm:p-4" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) setLocationModalSession(null); }}>
