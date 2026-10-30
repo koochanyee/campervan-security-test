@@ -1454,6 +1454,11 @@ function App() {
                                     wear?: string;
                                   }>;
                                   core_golden_rule?: string;
+                                  layering_formula?: {
+                                    title?: string;
+                                    description?: string;
+                                    steps?: Array<{ step?: number; item?: string; icon?: string }>;
+                                  };
                                 };
 
                                 const entries = parsed.itinerary ?? [];
@@ -1499,7 +1504,7 @@ function App() {
 
                                         {layering.icons && layering.icons.length > 0 && (
                                           <p className="text-4xl" aria-label="Suggested clothing">
-                                            {layering.icons.map((icon) => /fleece|wool|yarn|🧶|🧵/i.test(icon) ? "🧶" : icon).join(" ")}
+                                            {layering.icons.join(" ")}
                                           </p>
                                         )}
 
@@ -1513,15 +1518,44 @@ function App() {
                                       </p>
                                     )}
 
-                                    {parsed.core_golden_rule && (
-                                      <div className="border-t border-slate-200 pt-3">
-                                        <p className="text-xs font-semibold text-slate-700">
-                                          Packing tip
-                                        </p>
-                                        <p className="mt-1 text-sm leading-6 text-slate-600">
-                                          {parsed.core_golden_rule}
-                                        </p>
-                                      </div>
+                                    {(parsed.layering_formula || parsed.core_golden_rule) && (
+                                      <details className="rounded-lg border border-slate-200 bg-white">
+                                        <summary className="cursor-pointer select-none px-3 py-3 text-sm font-semibold text-slate-800">
+                                          🧥 General layering guide <span className="ml-1 text-xs font-normal text-slate-500">(tap to expand)</span>
+                                        </summary>
+                                        <div className="space-y-3 border-t border-slate-100 px-3 py-3">
+                                          {parsed.layering_formula && (
+                                            <div>
+                                              <p className="font-semibold text-slate-800">
+                                                {parsed.layering_formula.title || "Layering formula"}
+                                              </p>
+                                              {parsed.layering_formula.description && (
+                                                <p className="mt-1 text-sm leading-6 text-slate-600">
+                                                  {parsed.layering_formula.description}
+                                                </p>
+                                              )}
+                                              {parsed.layering_formula.steps && parsed.layering_formula.steps.length > 0 && (
+                                                <ol className="mt-3 grid grid-cols-1 gap-2 sm:grid-cols-2">
+                                                  {parsed.layering_formula.steps.map((step, index) => (
+                                                    <li key={`${step.step ?? index + 1}-${step.item ?? "layer"}`} className="flex items-center gap-2 rounded-lg bg-slate-50 px-3 py-2 text-sm text-slate-700">
+                                                      <span className="text-xl" aria-hidden="true">{step.icon || "•"}</span>
+                                                      <span><span className="mr-1 text-xs font-semibold text-slate-400">{step.step ?? index + 1}.</span>{step.item || "Layer"}</span>
+                                                    </li>
+                                                  ))}
+                                                </ol>
+                                              )}
+                                            </div>
+                                          )}
+                                          {parsed.core_golden_rule && (
+                                            <div className="border-t border-slate-200 pt-3">
+                                              <p className="text-xs font-semibold text-slate-700">Packing tip</p>
+                                              <p className="mt-1 text-sm leading-6 text-slate-600">
+                                                {parsed.core_golden_rule}
+                                              </p>
+                                            </div>
+                                          )}
+                                        </div>
+                                      </details>
                                     )}
                                   </div>
                                 );
