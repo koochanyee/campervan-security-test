@@ -259,6 +259,7 @@ function App() {
   };
   const [checklistItems, setChecklistItems] = useState<ChecklistItem[]>([]);
   const [checklistCategoryIndex, setChecklistCategoryIndex] = useState(0);
+  const [checklistTab, setChecklistTab] = useState<"before" | "grocery">("before");
   const [checklistMessage, setChecklistMessage] = useState("");
   const [checklistSavingId, setChecklistSavingId] = useState("");
   const [checklistTouchStart, setChecklistTouchStart] = useState<{ x: number; y: number } | null>(null);
@@ -629,6 +630,7 @@ function App() {
       const result = await response.json() as ApiResponse;
       if (!response.ok || !result.success) throw new Error(result.error || "Could not upload the Today Highlight photo.");
       setHighlightPhoto(result.photo as { id: string; url: string; date?: string });
+      setShowHighlightPhoto(true);
       setHighlightPhotoMessage("Photo saved to the shared trip folder for this date.");
     } catch (error) { setHighlightPhotoMessage(error instanceof Error ? error.message : "Could not upload the Today Highlight photo."); }
     finally { setHighlightPhotoSaving(false); }
@@ -676,6 +678,22 @@ function App() {
       setIsDetectingExpenseLocation(false);
       setExpenseMessage(error.message || "Could not access GPS location. Check browser location permission.");
     }, { enableHighAccuracy: true, timeout: 10000, maximumAge: 60000 });
+  };
+
+  const resetGroceryChecklist = async () => {
+    if (!window.confirm("Reset all grocery checkboxes for the next shopping trip? The grocery items will remain in Google Sheets.")) return;
+    setChecklistSavingId("__grocery_reset__"); setChecklistMessage("");
+    try {
+      const response = await fetch(`/api/checklist?tripId=${encodeURIComponent(selectedTripId)}`, { method: "POST", credentials: "same-origin", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ action: "reset_grocery", tripId: selectedTripId }) });
+      const result = await response.json() as ApiResponse;
+      if (!response.ok || !result.success) throw new Error(result.error || "Could not reset grocery checkboxes.");
+      const refreshed = await fetch(`/api/checklist?tripId=${encodeURIComponent(selectedTripId)}`, { credentials: "same-origin", cache: "no-store" });
+      const refreshedResult = await refreshed.json() as ApiResponse;
+      if (!refreshed.ok || !refreshedResult.success) throw new Error(refreshedResult.error || "Grocery reset, but the list could not refresh.");
+      setChecklistItems(Array.isArray(refreshedResult.checklistItems) ? refreshedResult.checklistItems : []);
+      setChecklistCategoryIndex(0); setChecklistMessage("Grocery checkboxes reset for the next shopping trip.");
+    } catch (error) { setChecklistMessage(error instanceof Error ? error.message : "Could not reset grocery checkboxes."); }
+    finally { setChecklistSavingId(""); }
   };
 
   const setChecklistStatus = async (item: ChecklistItem, status: "" | "✓" | "x") => {
@@ -813,12 +831,17 @@ function App() {
     : "Trip dates will appear here";
 
   const welcomeName = verifiedEmail.toLowerCase() === "koochanyee@gmail.com" ? "Ralph" : verifiedEmail.toLowerCase() === "wookahwai@gmail.com" ? "June" : "there";
-  const checklistCategories = Array.from(new Set(checklistItems.map((item) => item.category.trim()).filter(Boolean)));
+  const beforeDepartureItems = checklistItems.filter((item) => item.checklist_type !== "grocery");
+  const groceryItems = checklistItems.filter((item) => item.checklist_type === "grocery");
+  const beforeDepartureVisible = !tripStart || today <= tripStart;
+  const activeChecklistTab = checklistTab === "before" && !beforeDepartureVisible ? "grocery" : checklistTab;
+  const activeChecklistItems = activeChecklistTab === "before" ? beforeDepartureItems : groceryItems;
+  const checklistCategories = Array.from(new Set(activeChecklistItems.map((item) => item.category.trim()).filter(Boolean)));
   const safeChecklistCategoryIndex = checklistCategories.length ? Math.min(checklistCategoryIndex, checklistCategories.length - 1) : 0;
   const selectedChecklistCategory = checklistCategories[safeChecklistCategoryIndex] ?? "";
-  const selectedChecklistItems = checklistItems.filter((item) => item.category === selectedChecklistCategory);
+  const selectedChecklistItems = activeChecklistItems.filter((item) => item.category === selectedChecklistCategory);
   const currentChecklistField = verifiedEmail.toLowerCase() === "koochanyee@gmail.com" ? "ralph_status" : "june_status";
-  const checklistCompletedCount = checklistItems.filter((item) =>
+  const checklistCompletedCount = activeChecklistItems.filter((item) =>
     item.checklist_type === "todo"
       ? (item.shared_status || item.ralph_status || item.june_status) === "✓"
       : item[currentChecklistField] === "✓"
@@ -1601,10 +1624,13 @@ function App() {
                 className="rounded-2xl border border-slate-200 bg-white p-5 shadow-sm sm:p-7"
               >
                 <button type="button" onClick={goToDashboard} className="text-sm font-semibold text-emerald-800 hover:underline">← Back to dashboard</button>
-                <p className="mt-6 text-xs font-bold uppercase tracking-[0.16em] text-emerald-800">Before departure</p>
-                <h2 className="mt-2 text-2xl font-bold">Things to do & bring</h2>
-                <p className="mt-2 text-sm text-slate-600">Things to do are shared: either person can mark them done for both. Packing items (Clothes, Shoes, Toiletries and other categories) have separate Ralph and June checkboxes.</p>
-                <div className="mt-4 rounded-xl bg-emerald-50 p-3 text-sm text-emerald-900">Completed: {checklistCompletedCount} of {checklistItems.length} items</div>
+                <p className="mt-6 text-xs font-bold uppercase tracking-[0.16em] text-emerald-800">Trip checklist</p>
+                <h2 className="mt-2 text-2xl font-bold">Checklist</h2>
+                <div className="mt-4 grid grid-cols-2 gap-2" role="tablist" aria-label="Checklist sections">
+                  {beforeDepartureVisible && <button type="button" role="tab" aria-selected={activeChecklistTab === "before"} onClick={() => { setChecklistTab("before"); setChecklistCategoryIndex(0); }} className={`rounded-xl border px-3 py-2.5 text-sm font-semibold ${activeChecklistTab === "before" ? "border-emerald-800 bg-emerald-800 text-white" : "border-slate-200 bg-white text-slate-700"}`}>✈️ Before Departure</button>}
+                  <button type="button" role="tab" aria-selected={activeChecklistTab === "grocery"} onClick={() => { setChecklistTab("grocery"); setChecklistCategoryIndex(0); }} className={`rounded-xl border px-3 py-2.5 text-sm font-semibold ${activeChecklistTab === "grocery" ? "border-emerald-800 bg-emerald-800 text-white" : "border-slate-200 bg-white text-slate-700"}`}>🛒 Grocery</button>
+                </div>
+                {activeChecklistTab === "before" ? <><p className="mt-3 text-sm text-slate-600">One-time list before departure. Things to do are shared; packing checkboxes remain individual.</p><div className="mt-3 rounded-xl bg-emerald-50 p-3 text-sm text-emerald-900">Completed: {checklistCompletedCount} of {beforeDepartureItems.length} items</div></> : <><p className="mt-3 text-sm text-slate-600">Reusable grocery list. Reset checkboxes when you start the next shopping trip.</p><div className="mt-3 flex items-center justify-between gap-2 rounded-xl bg-emerald-50 p-3"><span className="text-sm text-emerald-900">Completed: {checklistCompletedCount} of {groceryItems.length} items</span><button type="button" onClick={() => void resetGroceryChecklist()} disabled={!groceryItems.length || Boolean(checklistSavingId)} className="rounded-lg border border-emerald-700 bg-white px-3 py-2 text-xs font-bold text-emerald-900 disabled:opacity-50">↻ Reset grocery</button></div></>}
                 {checklistCategories.length > 0 ? (
                   <>
                     <div className="-mx-1 mt-4 flex gap-2 overflow-x-auto px-1 pb-2" aria-label="Checklist categories">
