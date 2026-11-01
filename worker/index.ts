@@ -1175,6 +1175,27 @@ export default {
         const profile = session.email.toLowerCase() === "koochanyee@gmail.com" ? "ralph_status" : session.email.toLowerCase() === "wookahwai@gmail.com" ? "june_status" : "";
         if (!profile) return jsonResponse({ success: false, error: "This account is not assigned a checklist profile." }, 403);
         if (request.method === "POST") {
+          if (body.action === "reset_grocery") {
+            const groceryTab = await findExistingTab(token, trip.sheetId, ["Shopping List or Things to Brin", "Shopping List or Things to Bring"], "");
+            if (!groceryTab) return jsonResponse({ success: false, error: "Could not find the Google Sheet grocery tab." }, 404);
+            const groceryRows = await readSheetRows(token, trip.sheetId, groceryTab);
+            const headerRowIndex = groceryRows.slice(0, 3).findIndex((row) => row.some((cell) => ["ralph", "june"].includes(String(cell || "").toLowerCase().replace(/[^a-z0-9]/g, ""))));
+            const header = groceryRows[headerRowIndex >= 0 ? headerRowIndex : 0] || [];
+            const ralphCol = header.findIndex((cell) => String(cell || "").toLowerCase().replace(/[^a-z0-9]/g, "") === "ralph");
+            const juneCol = header.findIndex((cell) => String(cell || "").toLowerCase().replace(/[^a-z0-9]/g, "") === "june");
+            if (ralphCol < 0 || juneCol < 0) return jsonResponse({ success: false, error: "The grocery tab must have Ralph and June checkbox columns to reset both travellers." }, 409);
+            const colLetter = (index: number) => { let n = index + 1; let label = ""; while (n > 0) { const rem = (n - 1) % 26; label = String.fromCharCode(65 + rem) + label; n = Math.floor((n - 1) / 26); } return label; };
+            const firstDataRow = Math.max(3, (headerRowIndex >= 0 ? headerRowIndex : 0) + 2);
+            const lastDataRow = groceryRows.length;
+            if (lastDataRow >= firstDataRow) {
+              const ranges = [ralphCol, juneCol].map((col) => ({ range: `${quoteSheetTab(groceryTab)}!${colLetter(col)}${firstDataRow}:${colLetter(col)}${lastDataRow}`, values: Array.from({ length: lastDataRow - firstDataRow + 1 }, () => [false]) }));
+              const write = await fetch(`https://sheets.googleapis.com/v4/spreadsheets/${encodeURIComponent(trip.sheetId)}/values:batchUpdate`, { method: "POST", headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" }, body: JSON.stringify({ valueInputOption: "USER_ENTERED", data: ranges }) });
+              if (!write.ok) return jsonResponse({ success: false, error: `Google Sheets could not reset grocery checkboxes (HTTP ${write.status}).` }, 502);
+            }
+            for (const id of Object.keys(statuses)) if (id.startsWith("grocery-")) delete statuses[id];
+            await env.OAUTH_TOKEN_STORE.put(statusKey, JSON.stringify(statuses));
+            return jsonResponse({ success: true, message: "Both travellers’ grocery checkboxes were reset in Google Sheets.", tripId: trip.id });
+          }
           const itemId = typeof body.item_id === "string" ? body.item_id.trim() : "";
           const status = typeof body.status === "string" ? body.status : "";
           if (!/^(pack|todo|grocery-malaysia|grocery-pns|grocery-list)-\d+$/.test(itemId) || !["", "✓", "x"].includes(status)) {
@@ -1956,13 +1977,24 @@ export default {
         const key = `highlight-photo:${trip.id}:${dateKey}`;
         if (request.method === "GET") {
           const saved = await env.OAUTH_TOKEN_STORE.get(key);
-          return jsonResponse({ success: true, photo: saved ? JSON.parse(saved) : null, tripId: trip.id, date: String(date) });
+          const photo = saved ? JSON.parse(saved) as { id?: string; url?: string; date?: string; uploaded_by?: string } : null;
+          if (url.searchParams.get("image") === "1") {
+            const fileId = url.searchParams.get("fileId") || photo?.id || "";
+            if (!fileId || !photo?.id || fileId !== photo.id) return jsonResponse({ success: false, error: "The saved highlight photo was not found." }, 404);
+            const accessToken = await googleAccessToken(session, env);
+            const imageResponse = await fetch(`https://www.googleapis.com/drive/v3/files/${encodeURIComponent(fileId)}?alt=media`, { headers: { Authorization: `Bearer ${accessToken}` } });
+            if (!imageResponse.ok) return jsonResponse({ success: false, error: `Could not load the saved highlight photo from Google Drive (HTTP ${imageResponse.status}).` }, 502);
+            return new Response(imageResponse.body, { status: 200, headers: { "Content-Type": imageResponse.headers.get("Content-Type") || "image/jpeg", "Cache-Control": "private, max-age=300", "X-Content-Type-Options": "nosniff" } });
+          }
+          const imageUrl = photo?.id ? `${url.origin}/api/highlight-photo?tripId=${encodeURIComponent(trip.id)}&date=${encodeURIComponent(String(date))}&image=1&fileId=${encodeURIComponent(photo.id)}` : "";
+          return jsonResponse({ success: true, photo: photo ? { ...photo, url: imageUrl } : null, tripId: trip.id, date: String(date) });
         }
         const photo = body.photo as { name?: unknown; mime_type?: unknown; data_base64?: unknown } | undefined;
         if (!photo) return jsonResponse({ success: false, error: "Choose a photo first." }, 400);
         const accessToken = await googleAccessToken(session, env);
         const uploaded = await uploadSharedMemoryPhoto(accessToken, { ...photo, name: `highlight-${dateKey}-${String(photo.name || "photo")}` });
-        const savedPhoto = { id: uploaded.id, url: uploaded.url, date: String(date), uploaded_by: session.email, updated_at: new Date().toISOString() };
+        const imageUrl = `${url.origin}/api/highlight-photo?tripId=${encodeURIComponent(trip.id)}&date=${encodeURIComponent(String(date))}&image=1&fileId=${encodeURIComponent(uploaded.id)}`;
+        const savedPhoto = { id: uploaded.id, url: imageUrl, date: String(date), uploaded_by: session.email, updated_at: new Date().toISOString() };
         await env.OAUTH_TOKEN_STORE.put(key, JSON.stringify(savedPhoto));
         return jsonResponse({ success: true, photo: savedPhoto, message: "Today Highlight photo saved to the shared Drive folder." });
       } catch (error) {
