@@ -1155,6 +1155,38 @@ export default {
       } catch (error) { return jsonResponse({ success: false, error: error instanceof Error ? error.message : "Could not access trip expenses." }, 500); }
     }
 
+    // Approved trip resources: read the Link tab while excluding credential rows.
+    if (request.method === "GET" && url.pathname === "/api/document-links") {
+      const session = await readSession(request, env);
+      if (!session) return jsonResponse({ success: false, error: "Authentication required." }, 401);
+      try {
+        const trip = await resolveTrip(request, env);
+        if (!trip) return jsonResponse({ success: false, error: "Select a valid trip first." }, 404);
+        const token = await googleAccessToken(session, env);
+        const linkTab = await findExistingTab(token, trip.sheetId, ["Link", "Links"], "Link");
+        if (linkTab !== "Link" && linkTab !== "Links") return jsonResponse({ success: false, error: "Could not find the Link tab in the selected workbook." }, 404);
+        const rows = await readSheetRows(token, trip.sheetId, linkTab);
+        const documentLinks: Array<{ category: string; title: string; url: string; kind: "drive" | "url" }> = [];
+        let category = "Other";
+        for (const row of rows) {
+          const group = String(row[0] || "").trim();
+          const title = String(row[1] || "").trim();
+          const rawUrl = String(row[2] || "").trim();
+          if (group) category = group;
+          // Never return credential rows or values. The DOC booking website URL is
+          // retained, but the email/password cells beneath it are not returned.
+          if (!title || !/^https?:\/\//i.test(rawUrl)) continue;
+          if (/password|email|username|login credential/i.test(title) || /password|email|username|credential/i.test(category) && !/doc website/i.test(title)) continue;
+          let parsed: URL;
+          try { parsed = new URL(rawUrl); } catch { continue; }
+          if (!(["http:", "https:"].includes(parsed.protocol))) continue;
+          const isDriveFolder = parsed.hostname === "drive.google.com" && parsed.pathname.includes("/folders/");
+          documentLinks.push({ category: category === "Password" ? "Booking" : category, title, url: parsed.toString(), kind: isDriveFolder ? "drive" : "url" });
+        }
+        return jsonResponse({ success: true, documentLinks, tripId: trip.id });
+      } catch (error) { return jsonResponse({ success: false, error: error instanceof Error ? error.message : "Could not load trip document links." }, 500); }
+    }
+
     // Checklists: read the existing source tabs without changing their layout.
     // Packing states are individual in trip-scoped KV; THINGS TO DO is shared.
     // Grocery retains its existing Ralph / June sheet-column behavior.
