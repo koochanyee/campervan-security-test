@@ -9,7 +9,8 @@ type ViewName =
   | "itinerary"
   | "expenses"
   | "memories"
-  | "map";
+  | "map"
+  | "documents";
 
 type ApiResponse = {
   success?: boolean;
@@ -27,11 +28,13 @@ type ApiResponse = {
   items?: ChecklistItem[];
   item?: ChecklistItem;
   trips?: TripConfigSummary[];
+  documentLinks?: TripDocumentLink[];
   trip?: TripConfigSummary;
   photo?: { id: string; url: string; date?: string } | null;
 };
 
 type TripConfigSummary = { id: string; name: string; itineraryTab?: string };
+type TripDocumentLink = { category: string; title: string; url: string; kind: "drive" | "url" };
 
 type TripDay = {
   key: string;
@@ -173,7 +176,7 @@ function App() {
   const [activeView, setActiveViewState] = useState<ViewName>(() => {
     try {
       const saved = window.sessionStorage.getItem("campervan-active-view");
-      return saved && ["home", "checklist", "companion", "itinerary", "expenses", "memories", "map"].includes(saved) ? saved as ViewName : "home";
+      return saved && ["home", "checklist", "companion", "itinerary", "expenses", "memories", "map", "documents"].includes(saved) ? saved as ViewName : "home";
     } catch { return "home"; }
   });
   const [selectedTripId, setSelectedTripId] = useState(() => {
@@ -257,6 +260,8 @@ function App() {
     setSupplementaryTabs({});
     setActiveDayIndex(0);
   };
+  const [documentLinks, setDocumentLinks] = useState<TripDocumentLink[]>([]);
+  const [documentLinksMessage, setDocumentLinksMessage] = useState("");
   const [checklistItems, setChecklistItems] = useState<ChecklistItem[]>([]);
   const [checklistCategoryIndex, setChecklistCategoryIndex] = useState(0);
   const [checklistTab, setChecklistTab] = useState<"before" | "grocery">("before");
@@ -482,6 +487,23 @@ function App() {
       }
     }
     void loadItinerary();
+    return () => { cancelled = true; };
+  }, [verifiedEmail, selectedTripId, refreshKey]);
+
+  useEffect(() => {
+    if (!verifiedEmail || !selectedTripId) return;
+    let cancelled = false;
+    async function loadDocumentLinks() {
+      try {
+        const response = await fetch(`/api/document-links?tripId=${encodeURIComponent(selectedTripId)}`, { credentials: "same-origin", cache: "no-store" });
+        const result = await response.json() as ApiResponse;
+        if (!response.ok || !result.success) throw new Error(result.error || "Could not load trip documents and links.");
+        if (!cancelled) { setDocumentLinks(Array.isArray(result.documentLinks) ? result.documentLinks : []); setDocumentLinksMessage(""); }
+      } catch (error) {
+        if (!cancelled) setDocumentLinksMessage(error instanceof Error ? error.message : "Could not load trip documents and links.");
+      }
+    }
+    void loadDocumentLinks();
     return () => { cancelled = true; };
   }, [verifiedEmail, selectedTripId, refreshKey]);
 
@@ -1296,6 +1318,7 @@ function App() {
                       { view: "expenses" as ViewName, icon: "💳", title: "Expenses", description: "Pre-trip and actual spending", available: true },
                       { view: "memories" as ViewName, icon: "📸", title: "Memories", description: "Shared travel memories", available: true },
                       { view: "map" as ViewName, icon: "🗺️", title: "Map", description: "Routes and saved places", available: true },
+                      { view: "documents" as ViewName, icon: "📁", title: "Document & Link", description: "Trip documents, bookings and useful links", available: true },
                     ].map((item) => (
                       <button key={item.view} type="button" onClick={() => setActiveView(item.view)} className="rounded-2xl border border-slate-200 bg-white p-4 text-left shadow-sm transition hover:-translate-y-0.5 hover:border-emerald-300 hover:shadow">
                         <span className="text-2xl" aria-hidden="true">{item.icon}</span>
@@ -1307,6 +1330,26 @@ function App() {
                   </div>
                 </section>
               </div>
+            )}
+
+            {!isLoadingItinerary && !itineraryError && activeView === "documents" && (
+              <section className="rounded-2xl border border-slate-200 bg-white p-5 shadow-sm sm:p-7">
+                <button type="button" onClick={goToDashboard} className="text-sm font-semibold text-emerald-800 hover:underline">← Back to dashboard</button>
+                <p className="mt-6 text-xs font-bold uppercase tracking-[0.16em] text-emerald-800">Trip resources</p>
+                <h2 className="mt-2 text-2xl font-bold">Document & Link</h2>
+                <p className="mt-2 text-sm text-slate-600">Useful documents and websites for this trip. Login credentials are not shown here.</p>
+                {documentLinks.length ? (
+                  <div className="mt-5 space-y-3">
+                    {documentLinks.map((link, index) => (
+                      <a key={`${link.category}-${link.title}-${index}`} href={link.url} target="_blank" rel="noopener noreferrer" className="flex items-center gap-3 rounded-xl border border-slate-200 p-4 transition hover:border-emerald-300 hover:bg-emerald-50/40">
+                        <span className="flex h-10 w-10 shrink-0 items-center justify-center rounded-xl bg-emerald-50 text-xl" aria-hidden="true">{link.kind === "drive" ? "📁" : link.category.toLowerCase().includes("bus") ? "🚌" : link.category.toLowerCase().includes("camper") ? "🚐" : "🔗"}</span>
+                        <span className="min-w-0 flex-1"><span className="block text-xs font-semibold uppercase tracking-wide text-slate-500">{link.category}</span><span className="mt-0.5 block font-semibold text-slate-800">{link.title}</span><span className="mt-1 block break-all text-xs text-slate-500">{link.kind === "drive" ? "Open Google Drive folder" : link.url}</span></span>
+                        <span className="text-slate-400" aria-hidden="true">↗</span>
+                      </a>
+                    ))}
+                  </div>
+                ) : <p className="mt-5 rounded-xl border border-dashed border-slate-300 p-4 text-sm text-slate-600">{documentLinksMessage || "No document links were found in the Link tab."}</p>}
+              </section>
             )}
 
             {!isLoadingItinerary && !itineraryError && activeView === "itinerary" && (
