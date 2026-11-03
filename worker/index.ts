@@ -1155,8 +1155,9 @@ export default {
       } catch (error) { return jsonResponse({ success: false, error: error instanceof Error ? error.message : "Could not access trip expenses." }, 500); }
     }
 
-    // Approved trip resources: read the Link tab while excluding credential rows.
-    if (request.method === "GET" && url.pathname === "/api/document-links") {
+    // Approved trip documents and reference links. The Password/email rows in
+    // the source Link tab are intentionally excluded server-side.
+    if (request.method === "GET" && url.pathname === "/api/documents") {
       const session = await readSession(request, env);
       if (!session) return jsonResponse({ success: false, error: "Authentication required." }, 401);
       try {
@@ -1164,32 +1165,23 @@ export default {
         if (!trip) return jsonResponse({ success: false, error: "Select a valid trip first." }, 404);
         const token = await googleAccessToken(session, env);
         const linkTab = await findExistingTab(token, trip.sheetId, ["Link", "Links"], "Link");
-        if (linkTab !== "Link" && linkTab !== "Links") return jsonResponse({ success: false, error: "Could not find the Link tab in the selected workbook." }, 404);
         const rows = await readSheetRows(token, trip.sheetId, linkTab);
-        const documentLinks: Array<{ category: string; title: string; url: string; kind: "drive" | "url" }> = [];
-        let category = "Other";
-        for (const row of rows) {
-          const group = String(row[0] || "").trim();
+        const documents = rows.flatMap((row) => {
+          const sourceCategory = String(row[0] || "Reference").trim();
           const title = String(row[1] || "").trim();
-          const rawUrl = String(row[2] || "").trim();
-          if (group) category = group;
-          // Never return credential rows or values. The DOC booking website URL is
-          // retained, but the email/password cells beneath it are not returned.
-          if (!title || !/^https?:\/\//i.test(rawUrl)) continue;
-          if (/password|email|username|login credential/i.test(title) || /password|email|username|credential/i.test(category) && !/doc website/i.test(title)) continue;
-          let parsed: URL;
-          try { parsed = new URL(rawUrl); } catch { continue; }
-          if (!(["http:", "https:"].includes(parsed.protocol))) continue;
-          const isDriveFolder = parsed.hostname === "drive.google.com" && parsed.pathname.includes("/folders/");
-          documentLinks.push({ category: category === "Password" ? "Booking" : category, title, url: parsed.toString(), kind: isDriveFolder ? "drive" : "url" });
-        }
-        return jsonResponse({ success: true, documentLinks, tripId: trip.id });
-      } catch (error) { return jsonResponse({ success: false, error: error instanceof Error ? error.message : "Could not load trip document links." }, 500); }
+          const resourceUrl = String(row[2] || "").trim();
+          const allowedTitles = ["all document", "doc website", "jucy chaser spec", "bus route 29", "bus route 8"];
+          if (!title || !allowedTitles.includes(title.toLowerCase()) || /password|email|login|credential/i.test(title) || /@/.test(title) || !/^https:\/\//i.test(resourceUrl) || /password|email|login|credential/i.test(resourceUrl)) return [];
+          try { const parsed = new URL(resourceUrl); if (!parsed.hostname || parsed.protocol !== "https:") return []; } catch { return []; }
+          const category = title.toLowerCase() === "all document" ? "Documents" : title.toLowerCase() === "doc website" ? "Booking" : /drive/i.test(sourceCategory) ? "Documents" : sourceCategory;
+          return [{ category, title, url: resourceUrl, kind: /drive\.google\.com\/drive\/folders/i.test(resourceUrl) ? "drive_folder" : "link" }];
+        });
+        return jsonResponse({ success: true, documents, tripId: trip.id });
+      } catch (error) { return jsonResponse({ success: false, error: error instanceof Error ? error.message : "Could not load trip documents and links." }, 500); }
     }
 
-    // Checklists: read the existing source tabs without changing their layout.
-    // Packing states are individual in trip-scoped KV; THINGS TO DO is shared.
-    // Grocery retains its existing Ralph / June sheet-column behavior.
+    // Checklist single source of truth. APP_CHECKLIST is created and migrated
+    // automatically; the two original human-readable tabs are never modified.
     if (url.pathname === "/api/checklist" && (request.method === "GET" || request.method === "POST")) {
       const session = await readSession(request, env);
       if (!session) return jsonResponse({ success: false, error: "Authentication required." }, 401);
@@ -1200,177 +1192,135 @@ export default {
         const trip = await resolveTrip(request, env, typeof body.tripId === "string" ? body.tripId : undefined);
         if (!trip) return jsonResponse({ success: false, error: "Select a valid trip first." }, 404);
         const token = await googleAccessToken(session, env);
-        const statusKey = `checklist-status:${trip.id}`;
-        let statuses: Record<string, { ralph_status?: string; june_status?: string; shared_status?: string }> = {};
-        const savedStatuses = await env.OAUTH_TOKEN_STORE.get(statusKey);
-        if (savedStatuses) { try { statuses = JSON.parse(savedStatuses) as typeof statuses; } catch { statuses = {}; } }
-        const profile = session.email.toLowerCase() === "koochanyee@gmail.com" ? "ralph_status" : session.email.toLowerCase() === "wookahwai@gmail.com" ? "june_status" : "";
+        const profile = session.email.toLowerCase() === "koochanyee@gmail.com" ? "Ralph" : session.email.toLowerCase() === "wookahwai@gmail.com" ? "June" : "";
         if (!profile) return jsonResponse({ success: false, error: "This account is not assigned a checklist profile." }, 403);
-        if (request.method === "POST") {
-          if (body.action === "reset_grocery") {
-            const groceryTab = await findExistingTab(token, trip.sheetId, ["Shopping List or Things to Brin", "Shopping List or Things to Bring"], "");
-            if (!groceryTab) return jsonResponse({ success: false, error: "Could not find the Google Sheet grocery tab." }, 404);
-            const groceryRows = await readSheetRows(token, trip.sheetId, groceryTab);
-            const headerRowIndex = groceryRows.slice(0, 3).findIndex((row) => row.some((cell) => ["ralph", "june"].includes(String(cell || "").toLowerCase().replace(/[^a-z0-9]/g, ""))));
-            const header = groceryRows[headerRowIndex >= 0 ? headerRowIndex : 0] || [];
-            const ralphCol = header.findIndex((cell) => String(cell || "").toLowerCase().replace(/[^a-z0-9]/g, "") === "ralph");
-            const juneCol = header.findIndex((cell) => String(cell || "").toLowerCase().replace(/[^a-z0-9]/g, "") === "june");
-            if (ralphCol < 0 || juneCol < 0) return jsonResponse({ success: false, error: "The grocery tab must have Ralph and June checkbox columns to reset both travellers." }, 409);
-            const colLetter = (index: number) => { let n = index + 1; let label = ""; while (n > 0) { const rem = (n - 1) % 26; label = String.fromCharCode(65 + rem) + label; n = Math.floor((n - 1) / 26); } return label; };
-            const firstDataRow = Math.max(3, (headerRowIndex >= 0 ? headerRowIndex : 0) + 2);
-            const lastDataRow = groceryRows.length;
-            if (lastDataRow >= firstDataRow) {
-              const ranges = [ralphCol, juneCol].map((col) => ({ range: `${quoteSheetTab(groceryTab)}!${colLetter(col)}${firstDataRow}:${colLetter(col)}${lastDataRow}`, values: Array.from({ length: lastDataRow - firstDataRow + 1 }, () => [false]) }));
-              const write = await fetch(`https://sheets.googleapis.com/v4/spreadsheets/${encodeURIComponent(trip.sheetId)}/values:batchUpdate`, { method: "POST", headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" }, body: JSON.stringify({ valueInputOption: "USER_ENTERED", data: ranges }) });
-              if (!write.ok) return jsonResponse({ success: false, error: `Google Sheets could not reset grocery checkboxes (HTTP ${write.status}).` }, 502);
-            }
-            for (const id of Object.keys(statuses)) if (id.startsWith("grocery-")) delete statuses[id];
-            await env.OAUTH_TOKEN_STORE.put(statusKey, JSON.stringify(statuses));
-            return jsonResponse({ success: true, message: "Both travellers’ grocery checkboxes were reset in Google Sheets.", tripId: trip.id });
-          }
-          const itemId = typeof body.item_id === "string" ? body.item_id.trim() : "";
-          const status = typeof body.status === "string" ? body.status : "";
-          if (!/^(pack|todo|grocery-malaysia|grocery-pns|grocery-list)-\d+$/.test(itemId) || !["", "✓", "x"].includes(status)) {
-            return jsonResponse({ success: false, error: "Invalid checklist item or status." }, 400);
-          }
-          const itemMatch = itemId.match(/^(pack|todo|grocery-malaysia|grocery-pns|grocery-list)-(\d+)$/);
-          if (!itemMatch) return jsonResponse({ success: false, error: "Invalid checklist row reference." }, 400);
-          const itemKind = itemMatch[1];
-
-          // Checklist completion is stored centrally in trip-scoped KV. This keeps
-          // the source workbook layout untouched and makes updates visible to both
-          // companions on their next checklist refresh.
-          if (itemKind.startsWith("grocery-")) {
-            // Preserve the existing Grocery behavior: write the signed-in person's
-            // checkbox to that tab's explicitly labelled Ralph / June column.
-            const groceryTab = await findExistingTab(token, trip.sheetId, ["Shopping List or Things to Brin", "Shopping List or Things to Bring"], "");
-            if (!groceryTab) return jsonResponse({ success: false, error: "Could not find the Google Sheet tab for this grocery item." }, 404);
-            const groceryRows = await readSheetRows(token, trip.sheetId, groceryTab);
-            const targetHeaderName = profile.replace("_status", "");
-            const headerRowIndex = groceryRows.slice(0, 3).findIndex((row) => row.some((cell) => String(cell || "").trim().toLowerCase().replace(/[^a-z0-9]/g, "") === targetHeaderName));
-            const targetHeader = (groceryRows[headerRowIndex >= 0 ? headerRowIndex : 0] || []).map((cell) => String(cell || "").trim().toLowerCase().replace(/[^a-z0-9]/g, ""));
-            const statusColumn = targetHeader.findIndex((cell) => cell === targetHeaderName);
-            if (statusColumn < 0) return jsonResponse({ success: false, error: `The “${groceryTab}” tab has no ${targetHeaderName} status column.` }, 409);
-            const sheetRow = Number(itemMatch[2]);
-            if (sheetRow < 3 || sheetRow > groceryRows.length) return jsonResponse({ success: false, error: "The grocery row no longer exists in Google Sheets. Refresh the checklist and try again." }, 409);
-            const columnLetter = (index: number) => { let n = index + 1; let label = ""; while (n > 0) { const rem = (n - 1) % 26; label = String.fromCharCode(65 + rem) + label; n = Math.floor((n - 1) / 26); } return label; };
-            const cellRange = `${quoteSheetTab(groceryTab)}!${columnLetter(statusColumn)}${sheetRow}`;
-            const sheetWrite = await fetch(`${sheetsValuesUrl(trip.sheetId, cellRange)}?valueInputOption=USER_ENTERED`, { method: "PUT", headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" }, body: JSON.stringify({ values: [[status === "✓"]] }) });
-            if (!sheetWrite.ok) return jsonResponse({ success: false, error: `Google Sheets did not update the ${targetHeaderName} grocery checkbox (HTTP ${sheetWrite.status}).` }, 502);
-            statuses[itemId] = { ...(statuses[itemId] || {}), [profile]: status };
-          } else if (itemKind === "todo") {
-            // THINGS TO DO is one shared task: either companion's action updates both.
-            statuses[itemId] = {
-              ...(statuses[itemId] || {}),
-              shared_status: status,
-              ralph_status: status,
-              june_status: status,
-            };
-          } else {
-            // Packing items retain separate Ralph / June states in trip-scoped KV.
-            statuses[itemId] = { ...(statuses[itemId] || {}), [profile]: status };
-          }
-          await env.OAUTH_TOKEN_STORE.put(statusKey, JSON.stringify(statuses));
-          return jsonResponse({
-            success: true,
-            item_id: itemId,
-            status,
-            shared: itemKind === "todo",
-            message: itemKind === "todo"
-              ? (status === "✓" ? "Shared task marked done for both Ralph and June." : status === "x" ? "Shared task marked not applicable for both." : "Shared task status cleared for both.")
-              : (status === "✓" ? (itemKind.startsWith("grocery-") ? "Grocery checkbox updated in Google Sheets." : "Your packing status was saved.") : status === "x" ? "Marked not applicable." : "Your checklist status was cleared."),
-            tripId: trip.id,
-          });
+        const tab = "APP_CHECKLIST";
+        const headers = ["checklist_id", "list_type", "category", "item", "quantity", "notes", "shared_done", "to_buy", "sort_order", "active", "created_at", "updated_at", "source_tab", "source_row", "must_have", "due_date"];
+        await ensureSheetTab(token, trip.sheetId, tab, headers);
+        const readAppRows = async () => readSheetRows(token, trip.sheetId, tab);
+        let appRows = await readAppRows();
+        const headerNorm = (appRows[0] || []).map((cell) => cell.trim().toLowerCase());
+        if (headers.some((header, index) => headerNorm[index] !== header)) {
+          return jsonResponse({ success: false, error: "APP_CHECKLIST exists but its headers do not match the expected schema. No data was changed; please inspect the tab before retrying." }, 409);
         }
-        const result: Array<Record<string, unknown>> = [];
+        const col = (name: string) => headers.indexOf(name);
+        const now = new Date().toISOString();
+
+        // One-time, idempotent migration. Deterministic IDs mean retries cannot
+        // duplicate legacy rows. Existing source tabs remain untouched.
+        const existingIds = new Set(appRows.slice(1).map((row) => String(row[col("checklist_id")] || "").trim()).filter(Boolean));
+        const migrationRows: string[][] = [];
+        const legacyStatusKey = `checklist-status:${trip.id}`;
+        let legacyStatuses: Record<string, { ralph_status?: string; june_status?: string; shared_status?: string }> = {};
+        const savedLegacyStatuses = await env.OAUTH_TOKEN_STORE.get(legacyStatusKey);
+        if (savedLegacyStatuses) { try { legacyStatuses = JSON.parse(savedLegacyStatuses) as typeof legacyStatuses; } catch { legacyStatuses = {}; } }
+        const truthy = (value: unknown) => [true, "TRUE", "true", "✓", "1", 1].includes(value as never);
+        const appendLegacy = (id: string, listType: string, category: string, item: string, quantity: string, notes: string, sourceTab: string, sourceRow: number, oldIds: string[], mustHave = false, dueDate = "", sourceDone = false) => {
+          if (!item.trim() || existingIds.has(id) || migrationRows.some((row) => row[0] === id)) return;
+          const prior = oldIds.map((oldId) => legacyStatuses[oldId] || {}).find((status) => status.shared_status === "✓" || status.ralph_status === "✓" || status.june_status === "✓");
+          const done = Boolean(prior) || sourceDone;
+          migrationRows.push([id, listType, category || "Other", item.trim(), quantity, notes, String(done), "FALSE", String(migrationRows.length + 1), "TRUE", now, now, sourceTab, String(sourceRow), String(mustHave), dueDate]);
+        };
         const mainTab = await findExistingTab(token, trip.sheetId, ["Thing to do n bring", "Things to do n bring", "Thing to do & bring", "Things to do & bring", "THINGS TO DO N BRING", "THINGS TO DO & BRING"], "");
-        if (!mainTab) return jsonResponse({ success: false, error: "Could not find the existing pre-trip checklist tab ‘Thing to do n bring’ in the selected workbook." }, 404);
-        const rows = await readSheetRows(token, trip.sheetId, mainTab);
+        if (!mainTab) return jsonResponse({ success: false, error: "Could not find the existing pre-trip checklist tab ‘Thing to do n bring’." }, 404);
+        const mainRows = await readSheetRows(token, trip.sheetId, mainTab);
         const norm = (value: string) => value.toLowerCase().replace(/[^a-z0-9]/g, "");
-        const header = rows[0] || [];
-        const findHeader = (tests: string[]) => header.findIndex((cell) => tests.includes(norm(String(cell || ""))));
+        const mainHeader = mainRows[0] || [];
+        const findHeader = (tests: string[]) => mainHeader.findIndex((cell) => tests.includes(norm(String(cell || ""))));
         const categoryIdx = Math.max(0, findHeader(["category"]));
         const itemIdx = findHeader(["item"]) >= 0 ? findHeader(["item"]) : 1;
         const qtyIdx = findHeader(["qty", "quantity"]) >= 0 ? findHeader(["qty", "quantity"]) : 2;
+        const notesIdx = findHeader(["notes"]) >= 0 ? findHeader(["notes"]) : 5;
         const ralphIdx = findHeader(["ralph"]);
-        const notesIdx = findHeader(["notes"]) >= 0 ? findHeader(["notes"]) : (ralphIdx >= 0 ? 5 : 4);
-        // Legacy workbook has a blank header in D and a checkbox there; newer
-        // layout may use D/E for Ralph/June, in which case D is not must-have.
-        const mustHaveIdx = header[3]?.trim() ? -1 : 3;
-        const todoIdx = findHeader(["thingstodo", "todo", "task"]) >= 0 ? findHeader(["thingstodo", "todo", "task"]) : 8;
-        const dueIdx = findHeader(["duedate", "due", "month"]) >= 0 ? findHeader(["duedate", "due", "month"]) : Math.max(0, todoIdx - 1);
-        if (norm(String(header[categoryIdx] || "")) !== "category" || norm(String(header[itemIdx] || "")) !== "item") {
-          return jsonResponse({ success: false, error: `The tab “${mainTab}” was found, but its first row did not match the expected Category / Item headers.` }, 409);
-        }
+        const juneIdx = findHeader(["june"]);
+        const todoIdx = findHeader(["thingstodo", "todo", "task"]) >= 0 ? findHeader(["thingstodo", "todo", "task"]) : 9;
+        const dueIdx = findHeader(["duedate", "due", "month"]) >= 0 ? findHeader(["duedate", "due", "month"]) : 8;
+        const mustHaveIdx = String(mainHeader[3] || "").trim() ? -1 : 3;
+        if (norm(String(mainHeader[categoryIdx] || "")) !== "category" || norm(String(mainHeader[itemIdx] || "")) !== "item") return jsonResponse({ success: false, error: `The tab “${mainTab}” does not have the expected Category / Item headers.` }, 409);
         let currentCategory = "Other";
-        const savedStatus = (itemId: string, key: "ralph_status" | "june_status") => statuses[itemId]?.[key] || "";
-        const sharedTodoStatus = (itemId: string) => {
-          const saved = statuses[itemId] || {};
-          if (typeof saved.shared_status === "string") return saved.shared_status;
-          // Compatibility with any earlier per-person todo values: if either person
-          // had marked it done, carry that completion into the new shared behavior.
-          if (saved.ralph_status === "✓" || saved.june_status === "✓") return "✓";
-          if (saved.ralph_status === "x" && saved.june_status === "x") return "x";
-          return "";
-        };
-        rows.slice(1).forEach((row, index) => {
-          const sheetRow = index + 2;
-          const categoryCell = String(row[categoryIdx] || "").trim();
-          if (categoryCell) currentCategory = categoryCell;
-          const packItem = String(row[itemIdx] || "").trim();
-          const mustHave = mustHaveIdx >= 0 && ["TRUE", "✓", "☑", "1"].includes(String(row[mustHaveIdx] || "").trim().toUpperCase());
-          if (packItem) {
-            const itemId = `pack-${sheetRow}`;
-            result.push({
-              item_id: itemId, category: currentCategory, item: packItem,
-              quantity: String(row[qtyIdx] || "").trim(), notes: String(row[notesIdx] || "").trim(),
-              must_have: mustHave, checklist_type: "packing",
-              ralph_status: savedStatus(itemId, "ralph_status"),
-              june_status: savedStatus(itemId, "june_status"),
-            });
-          }
-          const todoItem = String(row[todoIdx] || "").trim();
-          if (todoItem) {
-            const itemId = `todo-${sheetRow}`;
-            result.push({
-              item_id: itemId, category: "Things to do", item: todoItem,
-              due_date: String(row[dueIdx] || "").trim(), checklist_type: "todo",
-              shared_status: sharedTodoStatus(itemId),
-              ralph_status: sharedTodoStatus(itemId),
-              june_status: sharedTodoStatus(itemId),
-            });
-          }
+        mainRows.slice(1).forEach((row, index) => {
+          const sourceRow = index + 2;
+          if (String(row[categoryIdx] || "").trim()) currentCategory = String(row[categoryIdx]).trim();
+          const packing = String(row[itemIdx] || "").trim();
+          if (packing) appendLegacy(`legacy:packing:${sourceRow}`, "BEFORE_DEPARTURE", currentCategory, packing, String(row[qtyIdx] || "").trim(), String(row[notesIdx] || "").trim(), mainTab, sourceRow, [`pack-${sourceRow}`], mustHaveIdx >= 0 && truthy(row[mustHaveIdx]), "", (ralphIdx >= 0 && truthy(row[ralphIdx])) || (juneIdx >= 0 && truthy(row[juneIdx])));
+          const todo = String(row[todoIdx] || "").trim();
+          if (todo) appendLegacy(`legacy:todo:${sourceRow}`, "BEFORE_DEPARTURE", "Things to do", todo, "", "", mainTab, sourceRow, [`todo-${sourceRow}`], false, String(row[dueIdx] || "").trim(), truthy(row[7]));
         });
         const groceryTab = await findExistingTab(token, trip.sheetId, ["Shopping List or Things to Brin", "Shopping List or Things to Bring"], "");
         if (groceryTab) {
           const groceryRows = await readSheetRows(token, trip.sheetId, groceryTab);
-          const groceryHeaderRowIndex = groceryRows.slice(0, 3).findIndex((row) => row.some((cell) => ["ralph", "june"].includes(norm(String(cell || "")))));
-          const groceryHeader = groceryRows[groceryHeaderRowIndex >= 0 ? groceryHeaderRowIndex : 0] || [];
-          const groceryRalphIdx = groceryHeader.findIndex((cell) => norm(String(cell || "")) === "ralph");
-          const groceryJuneIdx = groceryHeader.findIndex((cell) => norm(String(cell || "")) === "june");
-          const groceryStatus = (itemId: string, key: "ralph_status" | "june_status", row: string[], column: number) => {
-            const saved = statuses[itemId]?.[key] || "";
-            if (saved === "x") return "x";
-            if (column >= 0) return [true, "TRUE", "true", "✓"].includes(row[column] as never) ? "✓" : "";
-            return saved;
-          };
           let groceryCategory = "Pack ’n Save";
           groceryRows.slice(2).forEach((row, index) => {
-            const sheetRow = index + 3;
+            const sourceRow = index + 3;
             const malaysiaItem = String(row[0] || "").trim();
             const malaysiaQty = String(row[1] || "").trim();
-            if (malaysiaItem && norm(malaysiaItem) !== "tobringfrommalaysia") result.push({ item_id: `grocery-malaysia-${sheetRow}`, category: "🧳 To bring from Malaysia", item: malaysiaItem, quantity: malaysiaQty, checklist_type: "grocery", ralph_status: groceryStatus(`grocery-malaysia-${sheetRow}`, "ralph_status", row, groceryRalphIdx), june_status: groceryStatus(`grocery-malaysia-${sheetRow}`, "june_status", row, groceryJuneIdx) });
+            if (malaysiaItem && norm(malaysiaItem) !== "tobringfrommalaysia") appendLegacy(`legacy:grocery-malaysia:${sourceRow}`, "GROCERY", "🧳 To bring from Malaysia", malaysiaItem, malaysiaQty, "", groceryTab, sourceRow, [`grocery-malaysia-${sourceRow}`]);
             const categoryCell = String(row[3] || "").trim();
             if (categoryCell && norm(categoryCell) !== "category") groceryCategory = categoryCell;
             const buyItem = String(row[4] || "").trim();
-            const buyQty = String(row[5] || "").trim();
-            const why = String(row[6] || "").trim();
-            if (buyItem && norm(buyItem) !== "whatidbuy") result.push({ item_id: `grocery-pns-${sheetRow}`, category: `🛒 ${groceryCategory}`, item: buyItem, quantity: buyQty, notes: why, checklist_type: "grocery", ralph_status: groceryStatus(`grocery-pns-${sheetRow}`, "ralph_status", row, groceryRalphIdx), june_status: groceryStatus(`grocery-pns-${sheetRow}`, "june_status", row, groceryJuneIdx) });
+            if (buyItem && norm(buyItem) !== "whatidbuy") appendLegacy(`legacy:grocery-pns:${sourceRow}`, "GROCERY", `🛒 ${groceryCategory}`, buyItem, String(row[5] || "").trim(), String(row[6] || "").trim(), groceryTab, sourceRow, [`grocery-pns-${sourceRow}`]);
             const quickItem = String(row[9] || "").trim();
-            if (quickItem) result.push({ item_id: `grocery-list-${sheetRow}`, category: "🛒 Grocery quick list", item: quickItem, checklist_type: "grocery", ralph_status: groceryStatus(`grocery-list-${sheetRow}`, "ralph_status", row, groceryRalphIdx), june_status: groceryStatus(`grocery-list-${sheetRow}`, "june_status", row, groceryJuneIdx) });
+            if (quickItem) appendLegacy(`legacy:grocery-list:${sourceRow}`, "GROCERY", "🛒 Grocery quick list", quickItem, "", "", groceryTab, sourceRow, [`grocery-list-${sourceRow}`]);
           });
         }
-        return jsonResponse({ success: true, checklistItems: result, tripId: trip.id, sourceTabs: { preTrip: mainTab, grocery: groceryTab || null } });
+        if (migrationRows.length) {
+          const appendUrl = `${sheetsValuesUrl(trip.sheetId, `${quoteSheetTab(tab)}!A:P`)}:append?valueInputOption=RAW&insertDataOption=INSERT_ROWS`;
+          const migrationWrite = await fetch(appendUrl, { method: "POST", headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" }, body: JSON.stringify({ values: migrationRows }) });
+          if (!migrationWrite.ok) return jsonResponse({ success: false, error: `Could not migrate existing checklist items to APP_CHECKLIST (HTTP ${migrationWrite.status}).` }, 502);
+          appRows = await readAppRows();
+        }
+
+        if (request.method === "POST") {
+          const action = String(body.action || "set_status");
+          if (action === "reset_grocery") {
+            const updates = appRows.slice(1).flatMap((row, index) => String(row[col("list_type")] || "") === "GROCERY" && String(row[col("active")] || "TRUE").toUpperCase() !== "FALSE" ? [{ range: `${quoteSheetTab(tab)}!G${index + 2}:H${index + 2}`, values: [[false, false]] }] : []);
+            if (updates.length) {
+              const write = await fetch(`https://sheets.googleapis.com/v4/spreadsheets/${encodeURIComponent(trip.sheetId)}/values:batchUpdate`, { method: "POST", headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" }, body: JSON.stringify({ valueInputOption: "RAW", data: updates }) });
+              if (!write.ok) return jsonResponse({ success: false, error: "Google Sheets could not reset grocery completion." }, 502);
+            }
+            return jsonResponse({ success: true, message: "Grocery checkboxes reset for both travellers." });
+          }
+          if (action === "add") {
+            const listType = body.list_type === "GROCERY" ? "GROCERY" : "BEFORE_DEPARTURE";
+            const category = typeof body.category === "string" ? body.category.trim().slice(0, 100) : "";
+            const item = typeof body.item === "string" ? body.item.trim().slice(0, 250) : "";
+            const quantity = typeof body.quantity === "string" ? body.quantity.trim().slice(0, 80) : "";
+            const notes = typeof body.notes === "string" ? body.notes.trim().slice(0, 500) : "";
+            if (!category || !item) return jsonResponse({ success: false, error: "Choose a category and enter an item." }, 400);
+            const id = `custom:${crypto.randomUUID()}`;
+            const addUrl = `${sheetsValuesUrl(trip.sheetId, `${quoteSheetTab(tab)}!A:P`)}:append?valueInputOption=RAW&insertDataOption=INSERT_ROWS`;
+            const addWrite = await fetch(addUrl, { method: "POST", headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" }, body: JSON.stringify({ values: [[id, listType, category, item, quantity, notes, "FALSE", "FALSE", String(appRows.length), "TRUE", now, now, "APP", "", "FALSE", ""]] }) });
+            if (!addWrite.ok) return jsonResponse({ success: false, error: "Could not add the item to Google Sheets." }, 502);
+            return jsonResponse({ success: true, message: "Item added and synced to Google Sheets.", item: { item_id: id, checklist_type: listType === "GROCERY" ? "grocery" : "packing", category, item, quantity, notes, shared_done: false, to_buy: false } }, 201);
+          }
+          const itemId = typeof body.item_id === "string" ? body.item_id.trim() : "";
+          const rowIndex = appRows.slice(1).findIndex((row) => String(row[col("checklist_id")] || "") === itemId);
+          if (!itemId || rowIndex < 0) return jsonResponse({ success: false, error: "Checklist item not found. Refresh and try again." }, 404);
+          const sheetRow = rowIndex + 2;
+          if (action === "set_to_buy") {
+            const toBuy = Boolean(body.to_buy) && String(appRows[sheetRow - 1][col("list_type")]) === "BEFORE_DEPARTURE";
+            const write = await fetch(`${sheetsValuesUrl(trip.sheetId, `${quoteSheetTab(tab)}!H${sheetRow}`)}?valueInputOption=RAW`, { method: "PUT", headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" }, body: JSON.stringify({ values: [[toBuy]] }) });
+            if (!write.ok) return jsonResponse({ success: false, error: "Could not update To Buy status in Google Sheets." }, 502);
+            await fetch(`${sheetsValuesUrl(trip.sheetId, `${quoteSheetTab(tab)}!L${sheetRow}`)}?valueInputOption=RAW`, { method: "PUT", headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" }, body: JSON.stringify({ values: [[now]] }) });
+            return jsonResponse({ success: true, message: toBuy ? "Added to To Buy." : "Removed from To Buy." });
+          }
+          const sharedDone = Boolean(body.shared_done ?? (body.status === "✓"));
+          const values = [sharedDone, sharedDone ? false : truthy(appRows[sheetRow - 1][col("to_buy")]), now];
+          const write = await fetch(`${sheetsValuesUrl(trip.sheetId, `${quoteSheetTab(tab)}!G${sheetRow}:H${sheetRow}`)}?valueInputOption=RAW`, { method: "PUT", headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" }, body: JSON.stringify({ values: [[values[0], values[1]]] }) });
+          if (!write.ok) return jsonResponse({ success: false, error: `Google Sheets did not save the shared completion status (HTTP ${write.status}).` }, 502);
+          await fetch(`${sheetsValuesUrl(trip.sheetId, `${quoteSheetTab(tab)}!L${sheetRow}`)}?valueInputOption=RAW`, { method: "PUT", headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" }, body: JSON.stringify({ values: [[now]] }) });
+          return jsonResponse({ success: true, item_id: itemId, shared_done: sharedDone, message: sharedDone ? `Marked done for both Ralph and June by ${profile}.` : "Shared completion cleared for both travellers." });
+        }
+
+        const items = appRows.slice(1).flatMap((row) => {
+          const id = String(row[col("checklist_id")] || "").trim();
+          const item = String(row[col("item")] || "").trim();
+          if (!id || !item || String(row[col("active")] || "TRUE").toUpperCase() === "FALSE") return [];
+          const listType = String(row[col("list_type")] || "BEFORE_DEPARTURE");
+          const done = truthy(row[col("shared_done")]);
+          return [{ item_id: id, category: String(row[col("category")] || "Other"), item, quantity: String(row[col("quantity")] || ""), notes: String(row[col("notes")] || ""), checklist_type: listType === "GROCERY" ? "grocery" : "packing", list_type: listType, shared_done: done, shared_status: done ? "✓" : "", ralph_status: done ? "✓" : "", june_status: done ? "✓" : "", to_buy: truthy(row[col("to_buy")]), sort_order: Number(row[col("sort_order")] || 0), must_have: truthy(row[col("must_have")]), due_date: String(row[col("due_date")] || "") }];
+        });
+        return jsonResponse({ success: true, checklistItems: items, tripId: trip.id, sourceTab: tab, migratedCount: migrationRows.length, sharedCompletion: true });
       } catch (error) { return jsonResponse({ success: false, error: error instanceof Error ? error.message : "Could not access the shared checklist." }, 500); }
     }
 
@@ -2326,6 +2276,63 @@ export default {
       }
     }
     
+    // Per-photo comments and emoji reactions are stored separately from the
+    // original TRIP_MEMORIES records and Google Drive photo files.
+    if ((request.method === "GET" || request.method === "POST") && url.pathname === "/api/memory-interactions") {
+      const session = await readSession(request, env);
+      if (!session) return jsonResponse({ success: false, error: "Authentication required." }, 401);
+      if (request.method === "POST" && request.headers.get("Origin") !== url.origin) return jsonResponse({ success: false, error: "Invalid request origin." }, 403);
+      try {
+        const body = request.method === "POST" ? await request.json() as Record<string, unknown> : {};
+        const trip = await resolveTrip(request, env, typeof body.tripId === "string" ? body.tripId : undefined);
+        if (!trip) return jsonResponse({ success: false, error: "Select a valid trip first." }, 404);
+        const token = await googleAccessToken(session, env);
+        const tab = "TRIP_MEMORY_INTERACTIONS";
+        const headers = ["interaction_id", "memory_id", "photo_id", "kind", "value", "author_email", "created_at"];
+        await ensureSheetTab(token, trip.sheetId, tab, headers);
+        const range = `${quoteSheetTab(tab)}!A:G`;
+        const read = await fetch(sheetsValuesUrl(trip.sheetId, range), { headers: { Authorization: `Bearer ${token}` } });
+        if (!read.ok) return jsonResponse({ success: false, error: "Could not read photo comments and reactions." }, 502);
+        const data = await read.json() as { values?: unknown[][] };
+        const rows = data.values || [];
+        const authorName = session.email.toLowerCase() === "koochanyee@gmail.com" ? "Ralph" : session.email.toLowerCase() === "wookahwai@gmail.com" ? "June" : "Traveller";
+        if (request.method === "GET") {
+          const interactions = rows.slice(1).filter((row) => String(row[1] || "").trim() && String(row[2] || "").trim() && String(row[4] || "").trim()).map((row) => ({ interaction_id: String(row[0] || ""), memory_id: String(row[1] || ""), photo_id: String(row[2] || ""), kind: String(row[3] || ""), value: String(row[4] || ""), author: String(row[5] || "").toLowerCase() === "koochanyee@gmail.com" ? "Ralph" : String(row[5] || "").toLowerCase() === "wookahwai@gmail.com" ? "June" : "Traveller", created_at: String(row[6] || "") }));
+          return jsonResponse({ success: true, interactions });
+        }
+        const action = String(body.action || "");
+        const memoryId = typeof body.memory_id === "string" ? body.memory_id.trim() : "";
+        const photoId = typeof body.photo_id === "string" ? body.photo_id.trim() : "";
+        if (!memoryId || memoryId.length > 120 || !photoId || photoId.length > 200) return jsonResponse({ success: false, error: "Invalid memory or photo reference." }, 400);
+        const createdAt = new Date().toISOString();
+        if (action === "reaction") {
+          const allowed = ["❤️", "😂", "😍", "👍", "🎉", "🥰", "👏"];
+          const emoji = typeof body.value === "string" ? body.value : "";
+          if (!allowed.includes(emoji)) return jsonResponse({ success: false, error: "Unsupported emoji reaction." }, 400);
+          const existingIndex = rows.slice(1).findIndex((row) => String(row[1] || "") === memoryId && String(row[2] || "") === photoId && String(row[3] || "") === "REACTION" && String(row[5] || "").toLowerCase() === session.email.toLowerCase());
+          if (existingIndex >= 0) {
+            const sheetRow = existingIndex + 2;
+            const current = String(rows[sheetRow - 1]?.[4] || "");
+            const nextValue = current === emoji ? "" : emoji;
+            const update = await fetch(`${sheetsValuesUrl(trip.sheetId, `${quoteSheetTab(tab)}!E${sheetRow}`)}?valueInputOption=RAW`, { method: "PUT", headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" }, body: JSON.stringify({ values: [[nextValue]] }) });
+            if (!update.ok) return jsonResponse({ success: false, error: "Could not update emoji reaction." }, 502);
+          } else {
+            const append = await fetch(`${sheetsValuesUrl(trip.sheetId, `${quoteSheetTab(tab)}!A:G`)}:append?valueInputOption=RAW&insertDataOption=INSERT_ROWS`, { method: "POST", headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" }, body: JSON.stringify({ values: [[crypto.randomUUID(), memoryId, photoId, "REACTION", emoji, session.email, createdAt]] }) });
+            if (!append.ok) return jsonResponse({ success: false, error: "Could not save emoji reaction." }, 502);
+          }
+          return jsonResponse({ success: true, message: "Reaction updated." });
+        }
+        if (action === "comment") {
+          const comment = typeof body.value === "string" ? body.value.trim() : "";
+          if (!comment || comment.length > 1000) return jsonResponse({ success: false, error: "Enter a comment of up to 1,000 characters." }, 400);
+          const append = await fetch(`${sheetsValuesUrl(trip.sheetId, `${quoteSheetTab(tab)}!A:G`)}:append?valueInputOption=RAW&insertDataOption=INSERT_ROWS`, { method: "POST", headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" }, body: JSON.stringify({ values: [[crypto.randomUUID(), memoryId, photoId, "COMMENT", comment, session.email, createdAt]] }) });
+          if (!append.ok) return jsonResponse({ success: false, error: "Could not save comment." }, 502);
+          return jsonResponse({ success: true, message: "Comment shared." }, 201);
+        }
+        return jsonResponse({ success: false, error: "Unsupported interaction." }, 400);
+      } catch (error) { return jsonResponse({ success: false, error: error instanceof Error ? error.message : "Could not save photo interaction." }, 500); }
+    }
+
     return jsonResponse(
       { error: "Not Found" },
       404,
