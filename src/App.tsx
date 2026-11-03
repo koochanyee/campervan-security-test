@@ -28,13 +28,11 @@ type ApiResponse = {
   items?: ChecklistItem[];
   item?: ChecklistItem;
   trips?: TripConfigSummary[];
-  documentLinks?: TripDocumentLink[];
   trip?: TripConfigSummary;
   photo?: { id: string; url: string; date?: string } | null;
 };
 
 type TripConfigSummary = { id: string; name: string; itineraryTab?: string };
-type TripDocumentLink = { category: string; title: string; url: string; kind: "drive" | "url" };
 
 type TripDay = {
   key: string;
@@ -59,6 +57,10 @@ type TripMemory = {
   updated_at?: string;
   photo_ids?: string;
 };
+
+type TripDocument = { category: string; title: string; url: string; kind: "drive_folder" | "link" };
+
+type MemoryInteraction = { interaction_id: string; memory_id: string; photo_id: string; kind: "REACTION" | "COMMENT"; value: string; author: string; created_at: string };
 
 type TripExpense = {
   expense_id: string;
@@ -91,6 +93,10 @@ type ChecklistItem = {
   due_date?: string;
   checklist_type?: "packing" | "todo" | "grocery";
   must_have?: boolean;
+  shared_done?: boolean;
+  to_buy?: boolean;
+  list_type?: "BEFORE_DEPARTURE" | "GROCERY";
+  sort_order?: number;
 };
 
 declare global {
@@ -260,14 +266,18 @@ function App() {
     setSupplementaryTabs({});
     setActiveDayIndex(0);
   };
-  const [documentLinks, setDocumentLinks] = useState<TripDocumentLink[]>([]);
-  const [documentLinksMessage, setDocumentLinksMessage] = useState("");
   const [checklistItems, setChecklistItems] = useState<ChecklistItem[]>([]);
   const [checklistCategoryIndex, setChecklistCategoryIndex] = useState(0);
   const [checklistTab, setChecklistTab] = useState<"before" | "grocery">("before");
   const [checklistMessage, setChecklistMessage] = useState("");
   const [checklistSavingId, setChecklistSavingId] = useState("");
   const [checklistTouchStart, setChecklistTouchStart] = useState<{ x: number; y: number } | null>(null);
+  const [showChecklistAddModal, setShowChecklistAddModal] = useState(false);
+  const [newChecklistType, setNewChecklistType] = useState<"BEFORE_DEPARTURE" | "GROCERY">("BEFORE_DEPARTURE");
+  const [newChecklistCategory, setNewChecklistCategory] = useState("");
+  const [newChecklistItem, setNewChecklistItem] = useState("");
+  const [newChecklistQuantity, setNewChecklistQuantity] = useState("");
+  const [newChecklistNotes, setNewChecklistNotes] = useState("");
   const [expenses, setExpenses] = useState<TripExpense[]>([]);
   const [expenseMessage, setExpenseMessage] = useState("");
   const [expenseSaving, setExpenseSaving] = useState(false);
@@ -287,7 +297,14 @@ function App() {
   const [expensePaidBy, setExpensePaidBy] = useState("Ralph");
   const [expenseNotes, setExpenseNotes] = useState("");
   const [memories, setMemories] = useState<TripMemory[]>([]);
-  const [selectedMemoryPhoto, setSelectedMemoryPhoto] = useState<{ id: string; attraction: string; trip_date: string } | null>(null);
+  const [tripDocuments, setTripDocuments] = useState<TripDocument[]>([]);
+  const [documentsMessage, setDocumentsMessage] = useState("");
+  const [selectedMemoryPhoto, setSelectedMemoryPhoto] = useState<{ id: string; attraction: string; trip_date: string; memory_id: string } | null>(null);
+  const [memoryInteractions, setMemoryInteractions] = useState<MemoryInteraction[]>([]);
+  const [memoryCommentDraft, setMemoryCommentDraft] = useState("");
+  const [memoryInteractionSaving, setMemoryInteractionSaving] = useState(false);
+  const [memoryInteractionMessage, setMemoryInteractionMessage] = useState("");
+  const [photoTouchStart, setPhotoTouchStart] = useState<{ x: number; y: number } | null>(null);
   const [memoryAttraction, setMemoryAttraction] = useState(() => {
     try { return window.sessionStorage.getItem("campervan-memory-attraction") || ""; }
     catch { return ""; }
@@ -493,23 +510,6 @@ function App() {
   useEffect(() => {
     if (!verifiedEmail || !selectedTripId) return;
     let cancelled = false;
-    async function loadDocumentLinks() {
-      try {
-        const response = await fetch(`/api/document-links?tripId=${encodeURIComponent(selectedTripId)}`, { credentials: "same-origin", cache: "no-store" });
-        const result = await response.json() as ApiResponse;
-        if (!response.ok || !result.success) throw new Error(result.error || "Could not load trip documents and links.");
-        if (!cancelled) { setDocumentLinks(Array.isArray(result.documentLinks) ? result.documentLinks : []); setDocumentLinksMessage(""); }
-      } catch (error) {
-        if (!cancelled) setDocumentLinksMessage(error instanceof Error ? error.message : "Could not load trip documents and links.");
-      }
-    }
-    void loadDocumentLinks();
-    return () => { cancelled = true; };
-  }, [verifiedEmail, selectedTripId, refreshKey]);
-
-  useEffect(() => {
-    if (!verifiedEmail || !selectedTripId) return;
-    let cancelled = false;
     async function loadMemories() {
       try {
         const response = await fetch(`/api/memories?tripId=${encodeURIComponent(selectedTripId)}`, {
@@ -518,11 +518,28 @@ function App() {
         const result = (await response.json()) as ApiResponse;
         if (!response.ok || !result.success) throw new Error(result.error || "Could not load travel memories.");
         if (!cancelled) setMemories(Array.isArray(result.memories) ? result.memories : []);
+        const interactionsResponse = await fetch(`/api/memory-interactions?tripId=${encodeURIComponent(selectedTripId)}`, { credentials: "same-origin", cache: "no-store" });
+        const interactionsResult = await interactionsResponse.json() as { success?: boolean; interactions?: MemoryInteraction[]; error?: string };
+        if (!interactionsResponse.ok || !interactionsResult.success) throw new Error(interactionsResult.error || "Could not load photo comments and reactions.");
+        if (!cancelled) setMemoryInteractions(Array.isArray(interactionsResult.interactions) ? interactionsResult.interactions : []);
       } catch (error) {
         if (!cancelled) setMemoryMessage(error instanceof Error ? error.message : "Could not load travel memories.");
       }
     }
     void loadMemories();
+    return () => { cancelled = true; };
+  }, [verifiedEmail, selectedTripId]);
+
+  useEffect(() => {
+    if (!verifiedEmail || !selectedTripId) return;
+    let cancelled = false;
+    fetch(`/api/documents?tripId=${encodeURIComponent(selectedTripId)}`, { credentials: "same-origin", cache: "no-store" })
+      .then(async (response) => ({ response, result: await response.json() as { success?: boolean; documents?: TripDocument[]; error?: string } }))
+      .then(({ response, result }) => {
+        if (!response.ok || !result.success) throw new Error(result.error || "Could not load trip documents.");
+        if (!cancelled) { setTripDocuments(Array.isArray(result.documents) ? result.documents : []); setDocumentsMessage(""); }
+      })
+      .catch((error) => { if (!cancelled) setDocumentsMessage(error instanceof Error ? error.message : "Could not load trip documents."); });
     return () => { cancelled = true; };
   }, [verifiedEmail, selectedTripId]);
 
@@ -559,6 +576,20 @@ function App() {
     void loadExpensesAndChecklist();
     return () => { cancelled = true; };
   }, [verifiedEmail, selectedTripId, activeView, refreshKey]);
+
+  // Keep both travellers' shared checklist views in sync without requiring a manual refresh.
+  useEffect(() => {
+    if (!verifiedEmail || !selectedTripId || activeView !== "checklist") return;
+    const pollId = window.setInterval(async () => {
+      if (checklistSavingId) return;
+      try {
+        const response = await fetch(`/api/checklist?tripId=${encodeURIComponent(selectedTripId)}`, { credentials: "same-origin", cache: "no-store" });
+        const result = await response.json() as ApiResponse;
+        if (response.ok && result.success) setChecklistItems(Array.isArray(result.checklistItems) ? result.checklistItems : []);
+      } catch { /* The next poll retries; preserve the last successfully loaded list. */ }
+    }, 7000);
+    return () => window.clearInterval(pollId);
+  }, [verifiedEmail, selectedTripId, activeView, checklistSavingId]);
 
   const saveExpense = async (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
@@ -702,44 +733,89 @@ function App() {
     }, { enableHighAccuracy: true, timeout: 10000, maximumAge: 60000 });
   };
 
+  const refreshChecklist = async () => {
+    const response = await fetch(`/api/checklist?tripId=${encodeURIComponent(selectedTripId)}`, { credentials: "same-origin", cache: "no-store" });
+    const result = await response.json() as ApiResponse;
+    if (!response.ok || !result.success) throw new Error(result.error || "Could not refresh the shared checklist.");
+    const items = Array.isArray(result.checklistItems) ? result.checklistItems : [];
+    setChecklistItems(items);
+    return items;
+  };
+
   const resetGroceryChecklist = async () => {
-    if (!window.confirm("Reset all grocery checkboxes for the next shopping trip? The grocery items will remain in Google Sheets.")) return;
+    if (!window.confirm("Reset all shared grocery checkboxes for the next shopping trip? The grocery items will remain in Google Sheets.")) return;
     setChecklistSavingId("__grocery_reset__"); setChecklistMessage("");
     try {
       const response = await fetch(`/api/checklist?tripId=${encodeURIComponent(selectedTripId)}`, { method: "POST", credentials: "same-origin", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ action: "reset_grocery", tripId: selectedTripId }) });
       const result = await response.json() as ApiResponse;
       if (!response.ok || !result.success) throw new Error(result.error || "Could not reset grocery checkboxes.");
-      const refreshed = await fetch(`/api/checklist?tripId=${encodeURIComponent(selectedTripId)}`, { credentials: "same-origin", cache: "no-store" });
-      const refreshedResult = await refreshed.json() as ApiResponse;
-      if (!refreshed.ok || !refreshedResult.success) throw new Error(refreshedResult.error || "Grocery reset, but the list could not refresh.");
-      setChecklistItems(Array.isArray(refreshedResult.checklistItems) ? refreshedResult.checklistItems : []);
-      setChecklistCategoryIndex(0); setChecklistMessage("Grocery checkboxes reset for the next shopping trip.");
+      await refreshChecklist();
+      setChecklistCategoryIndex(0); setChecklistMessage("Grocery checkboxes reset for both travellers.");
     } catch (error) { setChecklistMessage(error instanceof Error ? error.message : "Could not reset grocery checkboxes."); }
     finally { setChecklistSavingId(""); }
   };
 
-  const setChecklistStatus = async (item: ChecklistItem, status: "" | "✓" | "x") => {
-    const currentName = verifiedEmail.toLowerCase() === "koochanyee@gmail.com" ? "Ralph" : "June";
-    const field = currentName === "Ralph" ? "ralph_status" : "june_status";
-    const updated = item.checklist_type === "todo"
-      ? { ...item, shared_status: status, ralph_status: status, june_status: status }
-      : { ...item, [field]: status };
+  const setChecklistStatus = async (item: ChecklistItem, status: "✓" | "") => {
+    const sharedDone = status === "✓";
+    const previous = item;
+    const updated = { ...item, shared_done: sharedDone, shared_status: status, ralph_status: status, june_status: status, to_buy: sharedDone ? false : Boolean(item.to_buy) };
     setChecklistSavingId(item.item_id);
     setChecklistMessage("");
     setChecklistItems((current) => current.map((entry) => entry.item_id === item.item_id ? updated : entry));
+    let savedToSheet = false;
     try {
       const response = await fetch(`/api/checklist?tripId=${encodeURIComponent(selectedTripId)}`, {
         method: "POST", credentials: "same-origin",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ item_id: item.item_id, status, tripId: selectedTripId }),
+        body: JSON.stringify({ item_id: item.item_id, shared_done: sharedDone, tripId: selectedTripId }),
       });
       const result = await response.json() as ApiResponse;
-      if (!response.ok || !result.success) throw new Error(result.error || "Could not sync checklist status.");
-      setChecklistMessage(typeof result.message === "string" ? result.message : "Checklist status saved.");
+      if (!response.ok || !result.success) throw new Error(result.error || "Could not sync shared checklist status.");
+      savedToSheet = true;
+      setChecklistMessage(typeof result.message === "string" ? result.message : "Shared completion saved to Google Sheets.");
+      try { await refreshChecklist(); } catch { setChecklistMessage("Saved to Google Sheets. The other device will receive the update on its next sync."); }
     } catch (error) {
-      setChecklistItems((current) => current.map((entry) => entry.item_id === item.item_id ? item : entry));
-      setChecklistMessage(error instanceof Error ? error.message : "Could not sync checklist status.");
+      if (!savedToSheet) setChecklistItems((current) => current.map((entry) => entry.item_id === item.item_id ? previous : entry));
+      setChecklistMessage(error instanceof Error ? error.message : "Could not sync shared checklist status.");
     } finally { setChecklistSavingId(""); }
+  };
+
+  const toggleChecklistToBuy = async (item: ChecklistItem) => {
+    const toBuy = !item.to_buy;
+    setChecklistSavingId(item.item_id);
+    setChecklistMessage("");
+    setChecklistItems((current) => current.map((entry) => entry.item_id === item.item_id ? { ...entry, to_buy: toBuy } : entry));
+    let savedToSheet = false;
+    try {
+      const response = await fetch(`/api/checklist?tripId=${encodeURIComponent(selectedTripId)}`, { method: "POST", credentials: "same-origin", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ action: "set_to_buy", item_id: item.item_id, to_buy: toBuy, tripId: selectedTripId }) });
+      const result = await response.json() as ApiResponse;
+      if (!response.ok || !result.success) throw new Error(result.error || "Could not update To Buy status.");
+      savedToSheet = true;
+      try { await refreshChecklist(); } catch { setChecklistMessage("To Buy status saved. The list will refresh on its next sync."); }
+    } catch (error) {
+      if (!savedToSheet) setChecklistItems((current) => current.map((entry) => entry.item_id === item.item_id ? { ...entry, to_buy: !toBuy } : entry));
+      setChecklistMessage(error instanceof Error ? error.message : "Could not update To Buy status.");
+    } finally { setChecklistSavingId(""); }
+  };
+
+  const addChecklistItem = async (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    const category = newChecklistCategory || checklistItems.find((item) => (item.list_type || (item.checklist_type === "grocery" ? "GROCERY" : "BEFORE_DEPARTURE")) === newChecklistType)?.category || "Other";
+    if (!newChecklistItem.trim()) { setChecklistMessage("Enter an item name."); return; }
+    setChecklistSavingId("__add__"); setChecklistMessage("");
+    try {
+      const response = await fetch(`/api/checklist?tripId=${encodeURIComponent(selectedTripId)}`, { method: "POST", credentials: "same-origin", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ action: "add", tripId: selectedTripId, list_type: newChecklistType, category, item: newChecklistItem.trim(), quantity: newChecklistQuantity.trim(), notes: newChecklistNotes.trim() }) });
+      const result = await response.json() as ApiResponse;
+      if (!response.ok || !result.success) throw new Error(result.error || "Could not add checklist item.");
+      const refreshedItems = await refreshChecklist();
+      setChecklistTab(newChecklistType === "GROCERY" ? "grocery" : "before");
+      const refreshedCategories = Array.from(new Set(refreshedItems.filter((entry) => (entry.list_type || (entry.checklist_type === "grocery" ? "GROCERY" : "BEFORE_DEPARTURE")) === newChecklistType).map((entry) => entry.category.trim()).filter(Boolean)));
+      setChecklistCategoryIndex(Math.max(0, refreshedCategories.indexOf(category)));
+      setNewChecklistItem(""); setNewChecklistQuantity(""); setNewChecklistNotes(""); setNewChecklistCategory("");
+      setShowChecklistAddModal(false);
+      setChecklistMessage("New item saved to Google Sheets and shared with both travellers.");
+    } catch (error) { setChecklistMessage(error instanceof Error ? error.message : "Could not add checklist item."); }
+    finally { setChecklistSavingId(""); }
   };
 
   const saveMemory = async () => {
@@ -811,6 +887,33 @@ function App() {
     }))
   ), [memories]);
   const getMemoryPhotoUrl = (fileId: string) => `/api/memory-photo?tripId=${encodeURIComponent(selectedTripId)}&fileId=${encodeURIComponent(fileId)}`;
+  const selectedMemoryPhotoIndex = selectedMemoryPhoto ? memoryGalleryPhotos.findIndex((photo) => photo.id === selectedMemoryPhoto.id && photo.memory_id === selectedMemoryPhoto.memory_id) : -1;
+  const selectedPhotoInteractions = selectedMemoryPhoto ? memoryInteractions.filter((entry) => entry.photo_id === selectedMemoryPhoto.id && entry.memory_id === selectedMemoryPhoto.memory_id) : [];
+  const refreshMemoryInteractions = async () => {
+    const response = await fetch(`/api/memory-interactions?tripId=${encodeURIComponent(selectedTripId)}`, { credentials: "same-origin", cache: "no-store" });
+    const result = await response.json() as { success?: boolean; interactions?: MemoryInteraction[]; error?: string };
+    if (!response.ok || !result.success) throw new Error(result.error || "Could not refresh comments and reactions.");
+    setMemoryInteractions(Array.isArray(result.interactions) ? result.interactions : []);
+  };
+  const saveMemoryInteraction = async (action: "reaction" | "comment", value: string) => {
+    if (!selectedMemoryPhoto || !value.trim()) return;
+    setMemoryInteractionSaving(true); setMemoryInteractionMessage("");
+    try {
+      const response = await fetch(`/api/memory-interactions?tripId=${encodeURIComponent(selectedTripId)}`, { method: "POST", credentials: "same-origin", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ action, tripId: selectedTripId, memory_id: selectedMemoryPhoto.memory_id, photo_id: selectedMemoryPhoto.id, value }) });
+      const result = await response.json() as ApiResponse;
+      if (!response.ok || !result.success) throw new Error(result.error || "Could not save this photo interaction.");
+      if (action === "comment") setMemoryCommentDraft("");
+      await refreshMemoryInteractions();
+    } catch (error) { setMemoryInteractionMessage(error instanceof Error ? error.message : "Could not save this interaction."); }
+    finally { setMemoryInteractionSaving(false); }
+  };
+
+  useEffect(() => {
+    if (!verifiedEmail || !selectedTripId || (activeView !== "memories" && !selectedMemoryPhoto)) return;
+    void refreshMemoryInteractions().catch(() => { /* The interval below retries. */ });
+    const pollId = window.setInterval(() => { void refreshMemoryInteractions().catch(() => { /* Retry on the next poll. */ }); }, 8000);
+    return () => window.clearInterval(pollId);
+  }, [verifiedEmail, selectedTripId, activeView, selectedMemoryPhoto?.id, selectedMemoryPhoto?.memory_id]);
 
   const headerKeys = useMemo(() => (itineraryRows.length > 0 ? Object.keys(itineraryRows[0]) : []), [itineraryRows]);
   const labelKey = headerKeys[0] || "DAY";
@@ -861,13 +964,9 @@ function App() {
   const checklistCategories = Array.from(new Set(activeChecklistItems.map((item) => item.category.trim()).filter(Boolean)));
   const safeChecklistCategoryIndex = checklistCategories.length ? Math.min(checklistCategoryIndex, checklistCategories.length - 1) : 0;
   const selectedChecklistCategory = checklistCategories[safeChecklistCategoryIndex] ?? "";
-  const selectedChecklistItems = activeChecklistItems.filter((item) => item.category === selectedChecklistCategory);
-  const currentChecklistField = verifiedEmail.toLowerCase() === "koochanyee@gmail.com" ? "ralph_status" : "june_status";
-  const checklistCompletedCount = activeChecklistItems.filter((item) =>
-    item.checklist_type === "todo"
-      ? (item.shared_status || item.ralph_status || item.june_status) === "✓"
-      : item[currentChecklistField] === "✓"
-  ).length;
+  const selectedChecklistItems = activeChecklistItems.filter((item) => item.category === selectedChecklistCategory).sort((a, b) => Number(Boolean(b.to_buy)) - Number(Boolean(a.to_buy)) || Number(Boolean(a.shared_done || a.shared_status === "✓")) - Number(Boolean(b.shared_done || b.shared_status === "✓")) || Number(a.sort_order || 0) - Number(b.sort_order || 0));
+  const checklistCompletedCount = activeChecklistItems.filter((item) => Boolean(item.shared_done || item.shared_status === "✓" || item.ralph_status === "✓" || item.june_status === "✓")).length;
+  const addChecklistCategories = Array.from(new Set(checklistItems.filter((item) => (item.list_type || (item.checklist_type === "grocery" ? "GROCERY" : "BEFORE_DEPARTURE")) === newChecklistType).map((item) => item.category.trim()).filter(Boolean)));
   const paidOrActualExpenses = expenses.filter((expense) => expense.source !== "FINAL EXPENSES" || expense.payment_status === "Paid");
   const paidPreTripExpenses = paidOrActualExpenses.filter((expense) => expense.expense_type === "pre-trip");
   const formatMoney = (amount: number, currency: string) => `${currency || "NZD"} ${Number(amount || 0).toFixed(2)}`;
@@ -1317,8 +1416,8 @@ function App() {
                       { view: "checklist" as ViewName, icon: "🎒", title: "Things to do & bring", description: "Shared pre-trip checklist", available: true },
                       { view: "expenses" as ViewName, icon: "💳", title: "Expenses", description: "Pre-trip and actual spending", available: true },
                       { view: "memories" as ViewName, icon: "📸", title: "Memories", description: "Shared travel memories", available: true },
+                      { view: "documents" as ViewName, icon: "📁", title: "Documents & Links", description: "Bookings, campervan details and travel references", available: true },
                       { view: "map" as ViewName, icon: "🗺️", title: "Map", description: "Routes and saved places", available: true },
-                      { view: "documents" as ViewName, icon: "📁", title: "Document & Link", description: "Trip documents, bookings and useful links", available: true },
                     ].map((item) => (
                       <button key={item.view} type="button" onClick={() => setActiveView(item.view)} className="rounded-2xl border border-slate-200 bg-white p-4 text-left shadow-sm transition hover:-translate-y-0.5 hover:border-emerald-300 hover:shadow">
                         <span className="text-2xl" aria-hidden="true">{item.icon}</span>
@@ -1330,26 +1429,6 @@ function App() {
                   </div>
                 </section>
               </div>
-            )}
-
-            {!isLoadingItinerary && !itineraryError && activeView === "documents" && (
-              <section className="rounded-2xl border border-slate-200 bg-white p-5 shadow-sm sm:p-7">
-                <button type="button" onClick={goToDashboard} className="text-sm font-semibold text-emerald-800 hover:underline">← Back to dashboard</button>
-                <p className="mt-6 text-xs font-bold uppercase tracking-[0.16em] text-emerald-800">Trip resources</p>
-                <h2 className="mt-2 text-2xl font-bold">Document & Link</h2>
-                <p className="mt-2 text-sm text-slate-600">Useful documents and websites for this trip. Login credentials are not shown here.</p>
-                {documentLinks.length ? (
-                  <div className="mt-5 space-y-3">
-                    {documentLinks.map((link, index) => (
-                      <a key={`${link.category}-${link.title}-${index}`} href={link.url} target="_blank" rel="noopener noreferrer" className="flex items-center gap-3 rounded-xl border border-slate-200 p-4 transition hover:border-emerald-300 hover:bg-emerald-50/40">
-                        <span className="flex h-10 w-10 shrink-0 items-center justify-center rounded-xl bg-emerald-50 text-xl" aria-hidden="true">{link.kind === "drive" ? "📁" : link.category.toLowerCase().includes("bus") ? "🚌" : link.category.toLowerCase().includes("camper") ? "🚐" : "🔗"}</span>
-                        <span className="min-w-0 flex-1"><span className="block text-xs font-semibold uppercase tracking-wide text-slate-500">{link.category}</span><span className="mt-0.5 block font-semibold text-slate-800">{link.title}</span><span className="mt-1 block break-all text-xs text-slate-500">{link.kind === "drive" ? "Open Google Drive folder" : link.url}</span></span>
-                        <span className="text-slate-400" aria-hidden="true">↗</span>
-                      </a>
-                    ))}
-                  </div>
-                ) : <p className="mt-5 rounded-xl border border-dashed border-slate-300 p-4 text-sm text-slate-600">{documentLinksMessage || "No document links were found in the Link tab."}</p>}
-              </section>
             )}
 
             {!isLoadingItinerary && !itineraryError && activeView === "itinerary" && (
@@ -1652,6 +1731,17 @@ function App() {
               </section>
             )}
 
+            {!isLoadingItinerary && !itineraryError && activeView === "documents" && (
+              <section className="rounded-2xl border border-slate-200 bg-white p-5 shadow-sm sm:p-7">
+                <button type="button" onClick={goToDashboard} className="text-sm font-semibold text-emerald-800 hover:underline">← Back to dashboard</button>
+                <p className="mt-6 text-xs font-bold uppercase tracking-[0.16em] text-emerald-800">Trip resources</p>
+                <h2 className="mt-2 text-2xl font-bold">Documents & Links</h2>
+                <p className="mt-2 text-sm text-slate-600">Approved trip documents and useful reference websites, loaded from the Google Sheets Link tab.</p>
+                {documentsMessage && <p className="mt-3 rounded-lg bg-amber-50 p-3 text-sm text-amber-900">{documentsMessage}</p>}
+                {tripDocuments.length ? <div className="mt-5 space-y-3">{tripDocuments.map((document, index) => <a key={`${document.title}-${index}`} href={document.url} target="_blank" rel="noreferrer" className="flex items-center gap-3 rounded-xl border border-slate-200 p-4 transition hover:border-emerald-400 hover:bg-emerald-50/40"><span className="flex h-11 w-11 shrink-0 items-center justify-center rounded-xl bg-emerald-50 text-xl">{document.kind === "drive_folder" ? "📁" : "🔗"}</span><span className="min-w-0 flex-1"><span className="block text-xs font-semibold uppercase tracking-wide text-slate-500">{document.category}</span><span className="mt-1 block font-semibold text-slate-900">{document.title}</span><span className="mt-1 block break-all text-xs text-slate-500">{document.kind === "drive_folder" ? "Open shared Google Drive folder" : document.url}</span></span><span className="text-emerald-800">↗</span></a>)}</div> : !documentsMessage ? <p className="mt-4 rounded-xl bg-slate-50 p-4 text-sm text-slate-600">No approved links were found in the Link tab.</p> : null}
+              </section>
+            )}
+
             {!isLoadingItinerary && !itineraryError && activeView === "checklist" && (
               <section
                 onTouchStart={(event) => setChecklistTouchStart({ x: event.touches[0].clientX, y: event.touches[0].clientY })}
@@ -1673,7 +1763,7 @@ function App() {
                   {beforeDepartureVisible && <button type="button" role="tab" aria-selected={activeChecklistTab === "before"} onClick={() => { setChecklistTab("before"); setChecklistCategoryIndex(0); }} className={`rounded-xl border px-3 py-2.5 text-sm font-semibold ${activeChecklistTab === "before" ? "border-emerald-800 bg-emerald-800 text-white" : "border-slate-200 bg-white text-slate-700"}`}>✈️ Before Departure</button>}
                   <button type="button" role="tab" aria-selected={activeChecklistTab === "grocery"} onClick={() => { setChecklistTab("grocery"); setChecklistCategoryIndex(0); }} className={`rounded-xl border px-3 py-2.5 text-sm font-semibold ${activeChecklistTab === "grocery" ? "border-emerald-800 bg-emerald-800 text-white" : "border-slate-200 bg-white text-slate-700"}`}>🛒 Grocery</button>
                 </div>
-                {activeChecklistTab === "before" ? <><p className="mt-3 text-sm text-slate-600">One-time list before departure. Things to do are shared; packing checkboxes remain individual.</p><div className="mt-3 rounded-xl bg-emerald-50 p-3 text-sm text-emerald-900">Completed: {checklistCompletedCount} of {beforeDepartureItems.length} items</div></> : <><p className="mt-3 text-sm text-slate-600">Reusable grocery list. Reset checkboxes when you start the next shopping trip.</p><div className="mt-3 flex items-center justify-between gap-2 rounded-xl bg-emerald-50 p-3"><span className="text-sm text-emerald-900">Completed: {checklistCompletedCount} of {groceryItems.length} items</span><button type="button" onClick={() => void resetGroceryChecklist()} disabled={!groceryItems.length || Boolean(checklistSavingId)} className="rounded-lg border border-emerald-700 bg-white px-3 py-2 text-xs font-bold text-emerald-900 disabled:opacity-50">↻ Reset grocery</button></div></>}
+                {activeChecklistTab === "before" ? <><p className="mt-3 text-sm text-slate-600">One-time list before departure. Every item is shared: either traveller can mark it done for both.</p><div className="mt-3 rounded-xl bg-emerald-50 p-3 text-sm text-emerald-900">Completed: {checklistCompletedCount} of {beforeDepartureItems.length} items</div></> : <><p className="mt-3 text-sm text-slate-600">Reusable shared grocery list. Either traveller can mark an item done; reset for the next shopping trip.</p><div className="mt-3 flex items-center justify-between gap-2 rounded-xl bg-emerald-50 p-3"><span className="text-sm text-emerald-900">Completed: {checklistCompletedCount} of {groceryItems.length} items</span><button type="button" onClick={() => void resetGroceryChecklist()} disabled={!groceryItems.length || Boolean(checklistSavingId)} className="rounded-lg border border-emerald-700 bg-white px-3 py-2 text-xs font-bold text-emerald-900 disabled:opacity-50">↻ Reset grocery</button></div></>}
                 {checklistCategories.length > 0 ? (
                   <>
                     <div className="-mx-1 mt-4 flex gap-2 overflow-x-auto px-1 pb-2" aria-label="Checklist categories">
@@ -1683,17 +1773,19 @@ function App() {
                     </div>
                     <div key={selectedChecklistCategory} className="mt-3 space-y-3" style={{ animation: "itinerarySlideIn 220ms ease-out" }}>
                       {selectedChecklistItems.map((item) => {
-                        const status = String(item[currentChecklistField] ?? "");
+                        const done = Boolean(item.shared_done || item.shared_status === "✓" || item.ralph_status === "✓" || item.june_status === "✓");
                         return (
-                          <article key={item.item_id} className={`rounded-xl border p-4 transition ${status === "x" ? "border-slate-200 bg-slate-50 opacity-75" : status === "✓" ? "border-emerald-200 bg-emerald-50/40" : "border-slate-200 bg-white"}`}>
+                          <article key={item.item_id} className={`rounded-xl border p-4 transition ${done ? "border-emerald-200 bg-emerald-50/40" : item.to_buy ? "border-amber-300 bg-amber-50/50" : "border-slate-200 bg-white"}`}>
                             <div className="flex flex-wrap items-center gap-2">
-                              <p className={`font-medium ${status === "x" ? "text-slate-500 line-through" : "text-slate-800"}`}>{item.item}</p>
+                              <p className={`font-medium ${done ? "text-slate-500 line-through" : "text-slate-800"}`}>{item.item}</p>
+                              <span className="inline-flex items-center rounded-full border border-sky-200 bg-sky-50 px-2 py-0.5 text-xs font-bold text-sky-800">Shared</span>
+                              {item.to_buy && !done && <span className="inline-flex items-center rounded-full border border-amber-300 bg-amber-100 px-2 py-0.5 text-xs font-bold text-amber-900">🛒 To Buy</span>}
                               {item.checklist_type === "packing" && item.must_have && <span className="inline-flex items-center rounded-full border border-rose-200 bg-rose-50 px-2 py-0.5 text-xs font-bold text-rose-700">✔️ Must have</span>}
                             </div>
                             {(item.quantity || item.due_date || item.notes) && <p className="mt-1 whitespace-pre-wrap text-sm leading-5 text-slate-500">{[item.quantity ? `Qty: ${item.quantity}` : "", item.due_date ? `Due: ${item.due_date}` : "", item.notes || ""].filter(Boolean).join(" · ")}</p>}
                             <div className="mt-3 flex flex-wrap gap-2">
-                              <button type="button" disabled={checklistSavingId === item.item_id} onClick={() => void setChecklistStatus(item, status === "✓" ? "" : "✓")} className={`min-h-12 min-w-[132px] rounded-lg border px-4 py-3 text-base font-semibold md:min-h-14 md:min-w-[156px] md:px-5 md:py-3.5 md:text-lg disabled:opacity-50 ${status === "✓" ? "border-emerald-800 bg-emerald-800 text-white" : "border-slate-300 bg-white text-slate-700"}`}>{status === "✓" ? "✓ Done" : "□ Mark done"}</button>
-                              <button type="button" disabled={checklistSavingId === item.item_id} onClick={() => void setChecklistStatus(item, status === "x" ? "" : "x")} className={`min-h-12 min-w-[132px] rounded-lg border px-4 py-3 text-base font-semibold md:min-h-14 md:min-w-[156px] md:px-5 md:py-3.5 md:text-lg disabled:opacity-50 ${status === "x" ? "border-slate-500 bg-slate-600 text-white" : "border-slate-300 bg-white text-slate-600"}`}>{status === "x" ? "x Ignored" : "Not applicable"}</button>
+                              <button type="button" disabled={Boolean(checklistSavingId)} onClick={() => void setChecklistStatus(item, done ? "" : "✓")} className={`min-h-12 min-w-[132px] rounded-lg border px-4 py-3 text-base font-semibold md:min-h-14 md:min-w-[156px] md:px-5 md:py-3.5 md:text-lg disabled:opacity-50 ${done ? "border-emerald-800 bg-emerald-800 text-white" : "border-slate-300 bg-white text-slate-700"}`}>{done ? "✓ Done · Shared" : "□ Mark done"}</button>
+                              {activeChecklistTab === "before" && !done && <button type="button" disabled={Boolean(checklistSavingId)} onClick={() => void toggleChecklistToBuy(item)} className={`min-h-12 rounded-lg border px-4 py-3 text-sm font-semibold disabled:opacity-50 ${item.to_buy ? "border-amber-400 bg-amber-100 text-amber-900" : "border-slate-300 bg-white text-slate-700"}`}>{item.to_buy ? "✓ Remove To Buy" : "+ To Buy"}</button>}
                               {checklistSavingId === item.item_id && <span className="self-center text-xs text-slate-500">Syncing…</span>}
                             </div>
                           </article>
@@ -1710,6 +1802,7 @@ function App() {
                   <p className="mt-4 rounded-xl border border-dashed border-slate-300 p-4 text-sm text-slate-600">No checklist items were returned from Google Sheets. Confirm the “Things to do & bring” tab and its headers are configured.</p>
                 )}
                 {checklistMessage && <p className="mt-3 text-sm text-slate-600" aria-live="polite">{checklistMessage}</p>}
+                <button type="button" onClick={() => { setNewChecklistType(activeChecklistTab === "grocery" ? "GROCERY" : "BEFORE_DEPARTURE"); setNewChecklistCategory(""); setShowChecklistAddModal(true); }} className="fixed bottom-24 right-5 z-40 flex h-14 w-14 items-center justify-center rounded-full bg-emerald-800 text-3xl font-semibold text-white shadow-xl transition hover:scale-105 hover:bg-emerald-900 sm:bottom-8 sm:right-8" aria-label="Add checklist item" title="Add checklist item">+</button>
               </section>
             )}
 
@@ -1798,7 +1891,7 @@ function App() {
                     <label className="mt-4 block text-sm font-medium">Trip date</label><select value={memoryDate} onChange={(event) => setMemoryDate(event.target.value)} required className="mt-1 w-full rounded-lg border border-slate-300 px-3 py-2 text-sm">{!tripDays.some((day) => normalizeTripDate(day.date) === normalizeTripDate(memoryDate)) && <option value={memoryDate}>Today · {memoryDate}</option>}{tripDays.map((day) => <option key={day.key} value={day.date}>{day.date}</option>)}</select>
                     <label className="mt-3 block text-sm font-medium">Attraction / place</label><div className="mt-1 flex gap-2"><input value={memoryAttraction} onChange={(event) => setMemoryAttraction(event.target.value)} required maxLength={160} placeholder="e.g. Lake Tekapo" className="min-w-0 flex-1 rounded-lg border border-slate-300 px-3 py-2 text-sm" /><button type="button" onClick={() => void detectMemoryPlace()} disabled={isDetectingPlace} className="shrink-0 rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm font-semibold disabled:opacity-50">{isDetectingPlace ? "Locating…" : "📍 Use GPS"}</button></div>
                     <label className="mt-3 block text-sm font-medium">Memory</label><textarea value={memoryContent} onChange={(event) => setMemoryContent(event.target.value)} required maxLength={5000} rows={4} placeholder="What would you like to remember about this place?" className="mt-1 w-full rounded-lg border border-slate-300 px-3 py-2 text-sm" />
-                    <label className="mt-3 block text-sm font-medium">Photos</label><div className="mt-2 grid gap-2 sm:grid-cols-2"><label className="cursor-pointer rounded-lg border border-slate-300 bg-white px-3 py-3 text-center text-sm font-semibold text-slate-700 hover:bg-slate-50">🖼️ Choose from gallery<input type="file" accept="image/*" multiple onChange={(event) => setMemoryPhotoFiles((current) => [...current, ...Array.from(event.target.files ?? [])].slice(0, 4))} className="sr-only" /></label><label className="cursor-pointer rounded-lg border border-emerald-300 bg-emerald-50 px-3 py-3 text-center text-sm font-semibold text-emerald-900 hover:bg-emerald-100">📷 Take a picture<input type="file" accept="image/*" capture="environment" onChange={(event) => setMemoryPhotoFiles((current) => [...current, ...Array.from(event.target.files ?? [])].slice(0, 4))} className="sr-only" /></label></div>
+                    <label className="mt-3 block text-sm font-medium">Photos</label><div className="mt-2 grid gap-2 sm:grid-cols-2"><label className="cursor-pointer rounded-lg border border-slate-300 bg-white px-3 py-3 text-center text-sm font-semibold text-slate-700 hover:bg-slate-50">🖼️ Choose from gallery<input type="file" accept="image/*" multiple onChange={(event) => setMemoryPhotoFiles((current) => [...current, ...(Array.from(event.target.files ?? []) as File[])].slice(0, 4))} className="sr-only" /></label><label className="cursor-pointer rounded-lg border border-emerald-300 bg-emerald-50 px-3 py-3 text-center text-sm font-semibold text-emerald-900 hover:bg-emerald-100">📷 Take a picture<input type="file" accept="image/*" capture="environment" onChange={(event) => setMemoryPhotoFiles((current) => [...current, ...(Array.from(event.target.files ?? []) as File[])].slice(0, 4))} className="sr-only" /></label></div>
                     {memoryPhotoFiles.length > 0 && <div className="mt-2 flex flex-wrap gap-2">{memoryPhotoFiles.map((file, index) => <span key={`${file.name}-${index}`} className="rounded-lg bg-slate-100 px-2 py-1 text-xs text-slate-700">📷 {file.name}</span>)}</div>}
                     <p className="mt-1 text-xs text-slate-500">Up to 4 photos, 4 MB each. If Drive access is not yet authorized, the app will ask you to reconnect once.</p>
                     <button type="submit" className="mt-3 rounded-lg bg-emerald-800 px-4 py-2.5 text-sm font-semibold text-white">Preview memory</button>
@@ -1809,7 +1902,7 @@ function App() {
                     <div className="flex flex-wrap items-center justify-between gap-2"><h3 className="font-semibold">Trip photo gallery</h3><span className="text-xs text-slate-500">{memoryGalleryPhotos.length} photo{memoryGalleryPhotos.length === 1 ? "" : "s"}</span></div>
                     {memoryGalleryPhotos.length ? <div className="mt-3 max-h-[420px] overflow-y-auto overscroll-contain rounded-lg border border-slate-100 p-2"><div className="grid grid-cols-2 gap-2 sm:grid-cols-3">{memoryGalleryPhotos.map((photo, index) => <button key={`${photo.memory_id}-${photo.id}-${index}`} type="button" onClick={() => setSelectedMemoryPhoto(photo)} className="overflow-hidden rounded-lg border border-slate-200 bg-white text-left shadow-sm hover:border-emerald-400 focus:outline-none focus:ring-2 focus:ring-emerald-600"><img src={getMemoryPhotoUrl(photo.id)} alt={`Trip photo: ${photo.attraction}`} loading="lazy" className="h-28 w-full bg-slate-100 object-cover sm:h-36" /><span className="block truncate px-2 pt-2 text-xs font-semibold text-slate-800">{photo.attraction}</span><span className="block px-2 pb-2 text-[11px] text-slate-500">{photo.trip_date}</span></button>)}</div></div> : <p className="mt-2 text-sm text-slate-500">Photos added to saved memories will appear here.</p>}
                   </section>
-                  <section><h3 className="font-semibold">Shared memory collection</h3>{memories.length ? <div className="mt-3 space-y-3">{[...memories].sort((a,b) => (a.trip_date || "").localeCompare(b.trip_date || "")).map((memory) => <article key={memory.memory_id} className="rounded-xl border border-slate-200 p-4"><div className="flex flex-wrap items-start justify-between gap-2"><h4 className="font-semibold">{memory.attraction}</h4><span className="text-xs text-slate-500">{memory.trip_date}</span></div><p className="mt-2 whitespace-pre-wrap text-sm leading-6 text-slate-700">{memory.content}</p>{getMemoryPhotoIds(memory.photo_ids).length > 0 && <div className="mt-3 grid grid-cols-3 gap-2 sm:grid-cols-4">{getMemoryPhotoIds(memory.photo_ids).map((photoId) => <button key={photoId} type="button" onClick={() => setSelectedMemoryPhoto({ id: photoId, attraction: memory.attraction, trip_date: memory.trip_date })} className="overflow-hidden rounded-lg border border-slate-200 bg-white text-left"><img src={getMemoryPhotoUrl(photoId)} alt={`Photo for ${memory.attraction}`} loading="lazy" className="h-20 w-full bg-slate-100 object-cover sm:h-24" /><span className="block px-2 py-1 text-[11px] font-semibold text-emerald-800">View photo</span></button>)}</div>}<p className="mt-2 text-xs text-slate-500">Shared by {memory.author_email || "trip companion"}</p></article>)}</div> : <p className="mt-2 text-sm text-slate-500">No shared memories have been saved yet.</p>}</section>
+                  <section><h3 className="font-semibold">Shared memory collection</h3>{memories.length ? <div className="mt-3 space-y-3">{[...memories].sort((a,b) => (a.trip_date || "").localeCompare(b.trip_date || "")).map((memory) => <article key={memory.memory_id} className="rounded-xl border border-slate-200 p-4"><div className="flex flex-wrap items-start justify-between gap-2"><h4 className="font-semibold">{memory.attraction}</h4><span className="text-xs text-slate-500">{memory.trip_date}</span></div><p className="mt-2 whitespace-pre-wrap text-sm leading-6 text-slate-700">{memory.content}</p>{getMemoryPhotoIds(memory.photo_ids).length > 0 && <div className="mt-3 grid grid-cols-3 gap-2 sm:grid-cols-4">{getMemoryPhotoIds(memory.photo_ids).map((photoId) => <button key={photoId} type="button" onClick={() => setSelectedMemoryPhoto({ id: photoId, attraction: memory.attraction, trip_date: memory.trip_date, memory_id: memory.memory_id })} className="overflow-hidden rounded-lg border border-slate-200 bg-white text-left"><img src={getMemoryPhotoUrl(photoId)} alt={`Photo for ${memory.attraction}`} loading="lazy" className="h-20 w-full bg-slate-100 object-cover sm:h-24" /><span className="block px-2 py-1 text-[11px] font-semibold text-emerald-800">View photo</span></button>)}</div>}<p className="mt-2 text-xs text-slate-500">Shared by {memory.author_email || "trip companion"}</p></article>)}</div> : <p className="mt-2 text-sm text-slate-500">No shared memories have been saved yet.</p>}</section>
 
                 </div>}
               </section>
@@ -1818,11 +1911,41 @@ function App() {
         )}
       </main>
 
+      {showChecklistAddModal && (
+        <div className="fixed inset-0 z-[80] flex items-end justify-center bg-slate-950/50 p-0 sm:items-center sm:p-4" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) setShowChecklistAddModal(false); }}>
+          <section role="dialog" aria-modal="true" aria-labelledby="add-checklist-title" className="w-full max-w-lg rounded-t-2xl bg-white p-5 shadow-2xl sm:rounded-2xl sm:p-6">
+            <div className="flex items-center justify-between gap-3"><h2 id="add-checklist-title" className="text-xl font-bold">Add checklist item</h2><button type="button" onClick={() => setShowChecklistAddModal(false)} className="rounded-lg px-3 py-2 text-lg hover:bg-slate-100" aria-label="Close">✕</button></div>
+            <form onSubmit={(event) => void addChecklistItem(event)} className="mt-4 space-y-3">
+              <label className="block text-sm font-semibold">List<select value={newChecklistType} onChange={(event) => { setNewChecklistType(event.target.value as "BEFORE_DEPARTURE" | "GROCERY"); setNewChecklistCategory(""); }} className="mt-1 w-full rounded-lg border border-slate-300 px-3 py-2.5"><option value="BEFORE_DEPARTURE">Before Departure</option><option value="GROCERY">Grocery</option></select></label>
+              <label className="block text-sm font-semibold">Category<select required value={newChecklistCategory || addChecklistCategories[0] || "Other"} onChange={(event) => setNewChecklistCategory(event.target.value)} className="mt-1 w-full rounded-lg border border-slate-300 px-3 py-2.5">{(addChecklistCategories.length ? addChecklistCategories : ["Other"]).map((category) => <option key={category} value={category}>{category}</option>)}</select></label>
+              <label className="block text-sm font-semibold">Item<input required maxLength={250} value={newChecklistItem} onChange={(event) => setNewChecklistItem(event.target.value)} placeholder="Enter item" className="mt-1 w-full rounded-lg border border-slate-300 px-3 py-2.5" /></label>
+              <label className="block text-sm font-semibold">Quantity (optional)<input maxLength={80} value={newChecklistQuantity} onChange={(event) => setNewChecklistQuantity(event.target.value)} placeholder="e.g. 2" className="mt-1 w-full rounded-lg border border-slate-300 px-3 py-2.5" /></label>
+              <label className="block text-sm font-semibold">Notes (optional)<textarea maxLength={500} rows={2} value={newChecklistNotes} onChange={(event) => setNewChecklistNotes(event.target.value)} className="mt-1 w-full rounded-lg border border-slate-300 px-3 py-2.5" /></label>
+              <p className="text-xs text-slate-500">The new item is shared with Ralph and June and saved in Google Sheets.</p>
+              <div className="flex gap-2"><button type="button" onClick={() => setShowChecklistAddModal(false)} className="flex-1 rounded-xl border border-slate-300 px-4 py-3 text-sm font-semibold">Cancel</button><button type="submit" disabled={checklistSavingId === "__add__" || !newChecklistItem.trim()} className="flex-1 rounded-xl bg-emerald-800 px-4 py-3 text-sm font-semibold text-white disabled:opacity-50">{checklistSavingId === "__add__" ? "Saving…" : "Save item"}</button></div>
+            </form>
+          </section>
+        </div>
+      )}
+
       {selectedMemoryPhoto && (
-        <div className="fixed inset-0 z-[70] flex items-center justify-center bg-slate-950/90 p-3 sm:p-6" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) setSelectedMemoryPhoto(null); }}>
-          <section role="dialog" aria-modal="true" aria-label={`Trip photo from ${selectedMemoryPhoto.attraction}`} className="relative flex max-h-full w-full max-w-5xl flex-col items-center">
-            <div className="mb-3 flex w-full items-center justify-between gap-3 text-white"><div className="min-w-0"><p className="truncate text-sm font-semibold">{selectedMemoryPhoto.attraction}</p><p className="text-xs text-slate-300">{selectedMemoryPhoto.trip_date}</p></div><button type="button" onClick={() => setSelectedMemoryPhoto(null)} className="shrink-0 rounded-full bg-white/15 px-4 py-2 text-sm font-semibold text-white hover:bg-white/25">Close ✕</button></div>
-            <img src={getMemoryPhotoUrl(selectedMemoryPhoto.id)} alt={`Full-size trip photo: ${selectedMemoryPhoto.attraction}`} className="max-h-[82vh] max-w-full rounded-lg object-contain" />
+        <div className="fixed inset-0 z-[70] flex items-center justify-center bg-slate-950/95 p-3 sm:p-6" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) setSelectedMemoryPhoto(null); }}>
+          <section role="dialog" aria-modal="true" aria-label={`Trip photo from ${selectedMemoryPhoto.attraction}`} className="relative flex max-h-full w-full max-w-5xl flex-col items-center" onTouchStart={(event) => setPhotoTouchStart({ x: event.touches[0].clientX, y: event.touches[0].clientY })} onTouchEnd={(event) => { if (!photoTouchStart || memoryGalleryPhotos.length < 2) return; const dx = event.changedTouches[0].clientX - photoTouchStart.x; const dy = event.changedTouches[0].clientY - photoTouchStart.y; if (Math.abs(dx) > 45 && Math.abs(dx) > Math.abs(dy) * 1.2) { const next = Math.max(0, Math.min(memoryGalleryPhotos.length - 1, selectedMemoryPhotoIndex + (dx < 0 ? 1 : -1))); setSelectedMemoryPhoto(memoryGalleryPhotos[next]); setMemoryInteractionMessage(""); } setPhotoTouchStart(null); }}>
+            <div className="mb-3 flex w-full items-center justify-between gap-3 text-white"><div className="min-w-0"><p className="truncate text-sm font-semibold">{selectedMemoryPhoto.attraction}</p><p className="text-xs text-slate-300">{selectedMemoryPhoto.trip_date} · {selectedMemoryPhotoIndex >= 0 ? selectedMemoryPhotoIndex + 1 : 1} / {memoryGalleryPhotos.length}</p></div><button type="button" onClick={() => setSelectedMemoryPhoto(null)} className="shrink-0 rounded-full bg-white/15 px-4 py-2 text-sm font-semibold text-white hover:bg-white/25">Close ✕</button></div>
+            <div className="flex min-h-0 w-full items-center justify-center gap-2">
+              <button type="button" disabled={selectedMemoryPhotoIndex <= 0} onClick={() => setSelectedMemoryPhoto(memoryGalleryPhotos[selectedMemoryPhotoIndex - 1])} aria-label="Previous photo" className="hidden rounded-full bg-white/15 px-3 py-3 text-2xl text-white disabled:opacity-20 sm:block">‹</button>
+              <img src={getMemoryPhotoUrl(selectedMemoryPhoto.id)} alt={`Full-size trip photo: ${selectedMemoryPhoto.attraction}`} className="max-h-[52vh] max-w-full rounded-lg object-contain" />
+              <button type="button" disabled={selectedMemoryPhotoIndex < 0 || selectedMemoryPhotoIndex >= memoryGalleryPhotos.length - 1} onClick={() => setSelectedMemoryPhoto(memoryGalleryPhotos[selectedMemoryPhotoIndex + 1])} aria-label="Next photo" className="hidden rounded-full bg-white/15 px-3 py-3 text-2xl text-white disabled:opacity-20 sm:block">›</button>
+            </div>
+            <p className="mt-2 text-xs text-slate-300 sm:hidden">Swipe left or right to view another photo</p>
+            <div className="mt-4 w-full max-w-2xl rounded-xl bg-white p-4 text-slate-900">
+              <h3 className="font-semibold">Reactions</h3>
+              <div className="mt-2 flex flex-wrap gap-2">{["❤️", "😂", "😍", "👍", "🎉", "🥰", "👏"].map((emoji) => { const count = selectedPhotoInteractions.filter((entry) => entry.kind === "REACTION" && entry.value === emoji).length; const mine = selectedPhotoInteractions.some((entry) => entry.kind === "REACTION" && entry.value === emoji && entry.author === welcomeName); return <button key={emoji} type="button" disabled={memoryInteractionSaving} onClick={() => void saveMemoryInteraction("reaction", emoji)} className={`rounded-full border px-3 py-2 text-lg disabled:opacity-50 ${mine ? "border-emerald-700 bg-emerald-50" : "border-slate-200 bg-white"}`}>{emoji}<span className="ml-1 text-xs font-semibold text-slate-600">{count || ""}</span></button>; })}</div>
+              <h3 className="mt-4 font-semibold">Comments</h3>
+              <div className="mt-2 max-h-36 space-y-2 overflow-y-auto">{selectedPhotoInteractions.filter((entry) => entry.kind === "COMMENT").map((entry) => <div key={entry.interaction_id} className="rounded-lg bg-slate-50 p-2"><div className="flex items-center justify-between gap-2"><span className="text-xs font-bold text-slate-700">{entry.author}</span><span className="text-[10px] text-slate-400">{entry.created_at ? new Date(entry.created_at).toLocaleString() : ""}</span></div><p className="mt-1 whitespace-pre-wrap text-sm text-slate-700">{entry.value}</p></div>)}{!selectedPhotoInteractions.some((entry) => entry.kind === "COMMENT") && <p className="text-sm text-slate-500">No comments yet. Add the first one.</p>}</div>
+              <form onSubmit={(event) => { event.preventDefault(); void saveMemoryInteraction("comment", memoryCommentDraft); }} className="mt-3 flex gap-2"><input value={memoryCommentDraft} onChange={(event) => setMemoryCommentDraft(event.target.value)} maxLength={1000} placeholder="Write a comment…" className="min-w-0 flex-1 rounded-lg border border-slate-300 px-3 py-2 text-sm" /><button type="submit" disabled={memoryInteractionSaving || !memoryCommentDraft.trim()} className="rounded-lg bg-emerald-800 px-4 py-2 text-sm font-semibold text-white disabled:opacity-50">Send</button></form>
+              {memoryInteractionMessage && <p className="mt-2 text-xs text-slate-600" aria-live="polite">{memoryInteractionMessage}</p>}
+            </div>
           </section>
         </div>
       )}
