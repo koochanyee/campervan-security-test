@@ -1,5 +1,5 @@
-import { useEffect, useMemo, useState } from "react";
-import type { FormEvent } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
+import type { FormEvent, PointerEvent as ReactPointerEvent } from "react";
 
 type ItineraryRow = Record<string, string>;
 type ViewName =
@@ -97,6 +97,10 @@ type ChecklistItem = {
   to_buy?: boolean;
   list_type?: "BEFORE_DEPARTURE" | "GROCERY";
   sort_order?: number;
+  completion_mode?: "SHARED" | "PERSONAL";
+  ralph_done?: boolean;
+  june_done?: boolean;
+  cancelled?: boolean;
 };
 
 declare global {
@@ -272,6 +276,7 @@ function App() {
   const [checklistMessage, setChecklistMessage] = useState("");
   const [checklistSavingId, setChecklistSavingId] = useState("");
   const [checklistTouchStart, setChecklistTouchStart] = useState<{ x: number; y: number } | null>(null);
+  const checklistLongPressTimer = useRef<number | null>(null);
   const [showChecklistAddModal, setShowChecklistAddModal] = useState(false);
   const [newChecklistType, setNewChecklistType] = useState<"BEFORE_DEPARTURE" | "GROCERY">("BEFORE_DEPARTURE");
   const [newChecklistCategory, setNewChecklistCategory] = useState("");
@@ -743,7 +748,7 @@ function App() {
   };
 
   const resetGroceryChecklist = async () => {
-    if (!window.confirm("Reset all shared grocery checkboxes for the next shopping trip? The grocery items will remain in Google Sheets.")) return;
+    if (!window.confirm("Reset all grocery completion checkboxes for the next shopping trip? The grocery items will remain in Google Sheets.")) return;
     setChecklistSavingId("__grocery_reset__"); setChecklistMessage("");
     try {
       const response = await fetch(`/api/checklist?tripId=${encodeURIComponent(selectedTripId)}`, { method: "POST", credentials: "same-origin", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ action: "reset_grocery", tripId: selectedTripId }) });
@@ -755,30 +760,57 @@ function App() {
     finally { setChecklistSavingId(""); }
   };
 
-  const setChecklistStatus = async (item: ChecklistItem, status: "✓" | "") => {
-    const sharedDone = status === "✓";
+  const saveChecklistAction = async (item: ChecklistItem, payload: Record<string, unknown>, optimistic: ChecklistItem, fallbackMessage: string) => {
     const previous = item;
-    const updated = { ...item, shared_done: sharedDone, shared_status: status, ralph_status: status, june_status: status, to_buy: sharedDone ? false : Boolean(item.to_buy) };
     setChecklistSavingId(item.item_id);
     setChecklistMessage("");
-    setChecklistItems((current) => current.map((entry) => entry.item_id === item.item_id ? updated : entry));
+    setChecklistItems((current) => current.map((entry) => entry.item_id === item.item_id ? optimistic : entry));
     let savedToSheet = false;
     try {
-      const response = await fetch(`/api/checklist?tripId=${encodeURIComponent(selectedTripId)}`, {
-        method: "POST", credentials: "same-origin",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ item_id: item.item_id, shared_done: sharedDone, tripId: selectedTripId }),
-      });
+      const response = await fetch(`/api/checklist?tripId=${encodeURIComponent(selectedTripId)}`, { method: "POST", credentials: "same-origin", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ ...payload, item_id: item.item_id, tripId: selectedTripId }) });
       const result = await response.json() as ApiResponse;
-      if (!response.ok || !result.success) throw new Error(result.error || "Could not sync shared checklist status.");
+      if (!response.ok || !result.success) throw new Error(result.error || fallbackMessage);
       savedToSheet = true;
-      setChecklistMessage(typeof result.message === "string" ? result.message : "Shared completion saved to Google Sheets.");
+      setChecklistMessage(typeof result.message === "string" ? result.message : fallbackMessage);
       try { await refreshChecklist(); } catch { setChecklistMessage("Saved to Google Sheets. The other device will receive the update on its next sync."); }
     } catch (error) {
       if (!savedToSheet) setChecklistItems((current) => current.map((entry) => entry.item_id === item.item_id ? previous : entry));
-      setChecklistMessage(error instanceof Error ? error.message : "Could not sync shared checklist status.");
+      setChecklistMessage(error instanceof Error ? error.message : fallbackMessage);
     } finally { setChecklistSavingId(""); }
   };
+
+  const setChecklistStatus = async (item: ChecklistItem, person: "Ralph" | "June" | "Shared", status: "✓" | "") => {
+    const done = status === "✓";
+    if (person === "Shared") {
+      const updated = { ...item, shared_done: done, shared_status: status, ralph_status: status, june_status: status, ralph_done: done, june_done: done, to_buy: done ? false : Boolean(item.to_buy) };
+      await saveChecklistAction(item, { action: "set_status", shared_done: done }, updated, "Could not sync shared checklist status.");
+    } else {
+      const nextRalphDone = person === "Ralph" ? done : Boolean(item.ralph_done || item.ralph_status === "✓");
+      const nextJuneDone = person === "June" ? done : Boolean(item.june_done || item.june_status === "✓");
+      const updated = { ...item, [person === "Ralph" ? "ralph_done" : "june_done"]: done, [person === "Ralph" ? "ralph_status" : "june_status"]: status, to_buy: nextRalphDone && nextJuneDone ? false : Boolean(item.to_buy) };
+      await saveChecklistAction(item, { action: "set_status", person, done }, updated, "Could not sync personal checklist status.");
+    }
+  };
+
+  const setChecklistMode = async (item: ChecklistItem, mode: "SHARED" | "PERSONAL") => {
+    if ((item.completion_mode || "PERSONAL") === mode) return;
+    const sharedDone = Boolean(item.ralph_done || item.ralph_status === "✓" || item.june_done || item.june_status === "✓");
+    const toPersonal = mode === "PERSONAL";
+    await saveChecklistAction(item, { action: "set_mode", completion_mode: mode }, { ...item, completion_mode: mode, shared_done: toPersonal ? item.shared_done : sharedDone, ralph_done: toPersonal ? Boolean(item.shared_done) : item.ralph_done, june_done: toPersonal ? Boolean(item.shared_done) : item.june_done }, "Could not change checklist sharing mode.");
+  };
+
+  const setChecklistCancelled = async (item: ChecklistItem) => {
+    if (!window.confirm(item.cancelled ? `Restore “${item.item}” to the active checklist?` : `Cancel “${item.item}”? It will remain visible in grey with a strikethrough.`)) return;
+    await saveChecklistAction(item, { action: "set_cancelled", cancelled: !item.cancelled }, { ...item, cancelled: !item.cancelled, to_buy: item.cancelled ? item.to_buy : false }, "Could not update cancelled status.");
+  };
+
+  const startChecklistLongPress = (event: ReactPointerEvent<HTMLElement>, item: ChecklistItem) => {
+    if (event.pointerType === "mouse" && event.button !== 0) return;
+    if ((event.target as HTMLElement).closest("button, a, input, select, textarea")) return;
+    if (checklistLongPressTimer.current !== null) window.clearTimeout(checklistLongPressTimer.current);
+    checklistLongPressTimer.current = window.setTimeout(() => { checklistLongPressTimer.current = null; void setChecklistCancelled(item); }, 700);
+  };
+  const clearChecklistLongPress = () => { if (checklistLongPressTimer.current !== null) window.clearTimeout(checklistLongPressTimer.current); checklistLongPressTimer.current = null; };
 
   const toggleChecklistToBuy = async (item: ChecklistItem) => {
     const toBuy = !item.to_buy;
@@ -964,8 +996,10 @@ function App() {
   const checklistCategories = Array.from(new Set(activeChecklistItems.map((item) => item.category.trim()).filter(Boolean)));
   const safeChecklistCategoryIndex = checklistCategories.length ? Math.min(checklistCategoryIndex, checklistCategories.length - 1) : 0;
   const selectedChecklistCategory = checklistCategories[safeChecklistCategoryIndex] ?? "";
-  const selectedChecklistItems = activeChecklistItems.filter((item) => item.category === selectedChecklistCategory).sort((a, b) => Number(Boolean(b.to_buy)) - Number(Boolean(a.to_buy)) || Number(Boolean(a.shared_done || a.shared_status === "✓")) - Number(Boolean(b.shared_done || b.shared_status === "✓")) || Number(a.sort_order || 0) - Number(b.sort_order || 0));
-  const checklistCompletedCount = activeChecklistItems.filter((item) => Boolean(item.shared_done || item.shared_status === "✓" || item.ralph_status === "✓" || item.june_status === "✓")).length;
+  const itemIsDone = (item: ChecklistItem) => (item.completion_mode || "PERSONAL") === "SHARED" ? Boolean(item.shared_done || item.shared_status === "✓") : Boolean(item.ralph_done || item.ralph_status === "✓") && Boolean(item.june_done || item.june_status === "✓");
+  const selectedChecklistItems = activeChecklistItems.filter((item) => item.category === selectedChecklistCategory).sort((a, b) => Number(Boolean(b.to_buy)) - Number(Boolean(a.to_buy)) || Number(itemIsDone(a)) - Number(itemIsDone(b)) || Number(Boolean(a.cancelled)) - Number(Boolean(b.cancelled)) || Number(a.sort_order || 0) - Number(b.sort_order || 0));
+  const checklistActiveCount = activeChecklistItems.filter((item) => !item.cancelled).length;
+  const checklistCompletedCount = activeChecklistItems.filter((item) => !item.cancelled && ((item.completion_mode || "PERSONAL") === "SHARED" ? Boolean(item.shared_done || item.shared_status === "✓") : Boolean(item.ralph_done || item.ralph_status === "✓") && Boolean(item.june_done || item.june_status === "✓"))).length;
   const addChecklistCategories = Array.from(new Set(checklistItems.filter((item) => (item.list_type || (item.checklist_type === "grocery" ? "GROCERY" : "BEFORE_DEPARTURE")) === newChecklistType).map((item) => item.category.trim()).filter(Boolean)));
   const paidOrActualExpenses = expenses.filter((expense) => expense.source !== "FINAL EXPENSES" || expense.payment_status === "Paid");
   const paidPreTripExpenses = paidOrActualExpenses.filter((expense) => expense.expense_type === "pre-trip");
@@ -1763,7 +1797,7 @@ function App() {
                   {beforeDepartureVisible && <button type="button" role="tab" aria-selected={activeChecklistTab === "before"} onClick={() => { setChecklistTab("before"); setChecklistCategoryIndex(0); }} className={`rounded-xl border px-3 py-2.5 text-sm font-semibold ${activeChecklistTab === "before" ? "border-emerald-800 bg-emerald-800 text-white" : "border-slate-200 bg-white text-slate-700"}`}>✈️ Before Departure</button>}
                   <button type="button" role="tab" aria-selected={activeChecklistTab === "grocery"} onClick={() => { setChecklistTab("grocery"); setChecklistCategoryIndex(0); }} className={`rounded-xl border px-3 py-2.5 text-sm font-semibold ${activeChecklistTab === "grocery" ? "border-emerald-800 bg-emerald-800 text-white" : "border-slate-200 bg-white text-slate-700"}`}>🛒 Grocery</button>
                 </div>
-                {activeChecklistTab === "before" ? <><p className="mt-3 text-sm text-slate-600">One-time list before departure. Every item is shared: either traveller can mark it done for both.</p><div className="mt-3 rounded-xl bg-emerald-50 p-3 text-sm text-emerald-900">Completed: {checklistCompletedCount} of {beforeDepartureItems.length} items</div></> : <><p className="mt-3 text-sm text-slate-600">Reusable shared grocery list. Either traveller can mark an item done; reset for the next shopping trip.</p><div className="mt-3 flex items-center justify-between gap-2 rounded-xl bg-emerald-50 p-3"><span className="text-sm text-emerald-900">Completed: {checklistCompletedCount} of {groceryItems.length} items</span><button type="button" onClick={() => void resetGroceryChecklist()} disabled={!groceryItems.length || Boolean(checklistSavingId)} className="rounded-lg border border-emerald-700 bg-white px-3 py-2 text-xs font-bold text-emerald-900 disabled:opacity-50">↻ Reset grocery</button></div></>}
+                {activeChecklistTab === "before" ? <><p className="mt-3 text-sm text-slate-600">Choose Shared or Personal for each item. Long-press an item to cancel or restore it.</p><div className="mt-3 rounded-xl bg-emerald-50 p-3 text-sm text-emerald-900">Completed: {checklistCompletedCount} of {checklistActiveCount} items</div></> : <><p className="mt-3 text-sm text-slate-600">Reusable grocery list. Choose Shared or Personal for each item; reset completion for the next shopping trip.</p><div className="mt-3 flex items-center justify-between gap-2 rounded-xl bg-emerald-50 p-3"><span className="text-sm text-emerald-900">Completed: {checklistCompletedCount} of {checklistActiveCount} items</span><button type="button" onClick={() => void resetGroceryChecklist()} disabled={!groceryItems.length || Boolean(checklistSavingId)} className="rounded-lg border border-emerald-700 bg-white px-3 py-2 text-xs font-bold text-emerald-900 disabled:opacity-50">↻ Reset grocery</button></div></>}
                 {checklistCategories.length > 0 ? (
                   <>
                     <div className="-mx-1 mt-4 flex gap-2 overflow-x-auto px-1 pb-2" aria-label="Checklist categories">
@@ -1773,21 +1807,35 @@ function App() {
                     </div>
                     <div key={selectedChecklistCategory} className="mt-3 space-y-3" style={{ animation: "itinerarySlideIn 220ms ease-out" }}>
                       {selectedChecklistItems.map((item) => {
-                        const done = Boolean(item.shared_done || item.shared_status === "✓" || item.ralph_status === "✓" || item.june_status === "✓");
+                        const mode = item.completion_mode || "PERSONAL";
+                        const sharedDone = Boolean(item.shared_done || item.shared_status === "✓");
+                        const ralphDone = Boolean(item.ralph_done || item.ralph_status === "✓");
+                        const juneDone = Boolean(item.june_done || item.june_status === "✓");
+                        const done = mode === "SHARED" ? sharedDone : (ralphDone && juneDone);
+                        const ownDone = welcomeName === "Ralph" ? ralphDone : juneDone;
+                        const otherName = welcomeName === "Ralph" ? "June" : "Ralph";
+                        const otherDone = welcomeName === "Ralph" ? juneDone : ralphDone;
                         return (
-                          <article key={item.item_id} className={`rounded-xl border p-4 transition ${done ? "border-emerald-200 bg-emerald-50/40" : item.to_buy ? "border-amber-300 bg-amber-50/50" : "border-slate-200 bg-white"}`}>
+                          <article key={item.item_id} onPointerDown={(event) => startChecklistLongPress(event, item)} onPointerUp={clearChecklistLongPress} onPointerLeave={clearChecklistLongPress} onPointerCancel={clearChecklistLongPress} className={`rounded-xl border p-4 transition ${item.cancelled ? "border-slate-200 bg-slate-100 opacity-65" : done ? "border-emerald-200 bg-emerald-50/40" : item.to_buy ? "border-amber-300 bg-amber-50/50" : "border-slate-200 bg-white"}`}>
                             <div className="flex flex-wrap items-center gap-2">
-                              <p className={`font-medium ${done ? "text-slate-500 line-through" : "text-slate-800"}`}>{item.item}</p>
-                              <span className="inline-flex items-center rounded-full border border-sky-200 bg-sky-50 px-2 py-0.5 text-xs font-bold text-sky-800">Shared</span>
-                              {item.to_buy && !done && <span className="inline-flex items-center rounded-full border border-amber-300 bg-amber-100 px-2 py-0.5 text-xs font-bold text-amber-900">🛒 To Buy</span>}
+                              <p className={`font-medium ${item.cancelled ? "text-slate-500 line-through" : done ? "text-slate-500 line-through" : "text-slate-800"}`}>{item.item}</p>
+                              <span className={`inline-flex items-center rounded-full border px-2 py-0.5 text-xs font-bold ${mode === "SHARED" ? "border-sky-200 bg-sky-50 text-sky-800" : "border-violet-200 bg-violet-50 text-violet-800"}`}>{mode === "SHARED" ? "Shared" : "Personal"}</span>
+                              {item.cancelled && <span className="rounded-full bg-slate-200 px-2 py-0.5 text-xs font-bold text-slate-600">Cancelled</span>}
+                              {item.to_buy && !done && !item.cancelled && <span className="inline-flex items-center rounded-full border border-amber-300 bg-amber-100 px-2 py-0.5 text-xs font-bold text-amber-900">🛒 To Buy</span>}
                               {item.checklist_type === "packing" && item.must_have && <span className="inline-flex items-center rounded-full border border-rose-200 bg-rose-50 px-2 py-0.5 text-xs font-bold text-rose-700">✔️ Must have</span>}
                             </div>
                             {(item.quantity || item.due_date || item.notes) && <p className="mt-1 whitespace-pre-wrap text-sm leading-5 text-slate-500">{[item.quantity ? `Qty: ${item.quantity}` : "", item.due_date ? `Due: ${item.due_date}` : "", item.notes || ""].filter(Boolean).join(" · ")}</p>}
-                            <div className="mt-3 flex flex-wrap gap-2">
-                              <button type="button" disabled={Boolean(checklistSavingId)} onClick={() => void setChecklistStatus(item, done ? "" : "✓")} className={`min-h-12 min-w-[132px] rounded-lg border px-4 py-3 text-base font-semibold md:min-h-14 md:min-w-[156px] md:px-5 md:py-3.5 md:text-lg disabled:opacity-50 ${done ? "border-emerald-800 bg-emerald-800 text-white" : "border-slate-300 bg-white text-slate-700"}`}>{done ? "✓ Done · Shared" : "□ Mark done"}</button>
-                              {activeChecklistTab === "before" && !done && <button type="button" disabled={Boolean(checklistSavingId)} onClick={() => void toggleChecklistToBuy(item)} className={`min-h-12 rounded-lg border px-4 py-3 text-sm font-semibold disabled:opacity-50 ${item.to_buy ? "border-amber-400 bg-amber-100 text-amber-900" : "border-slate-300 bg-white text-slate-700"}`}>{item.to_buy ? "✓ Remove To Buy" : "+ To Buy"}</button>}
-                              {checklistSavingId === item.item_id && <span className="self-center text-xs text-slate-500">Syncing…</span>}
+                            <div className="mt-3 flex flex-wrap items-center gap-2">
+                              <span className="mr-1 text-xs font-semibold text-slate-500">Completion:</span>
+                              <button type="button" disabled={Boolean(checklistSavingId) || Boolean(item.cancelled)} onClick={() => void setChecklistMode(item, "SHARED")} className={`rounded-lg border px-3 py-2 text-sm font-bold disabled:opacity-50 ${mode === "SHARED" ? "border-sky-700 bg-sky-700 text-white" : "border-slate-300 bg-white text-slate-700"}`}>Shared</button>
+                              <button type="button" disabled={Boolean(checklistSavingId) || Boolean(item.cancelled)} onClick={() => void setChecklistMode(item, "PERSONAL")} className={`rounded-lg border px-3 py-2 text-sm font-bold disabled:opacity-50 ${mode === "PERSONAL" ? "border-violet-700 bg-violet-700 text-white" : "border-slate-300 bg-white text-slate-700"}`}>Personal</button>
                             </div>
+                            {!item.cancelled && <div className="mt-3 flex flex-wrap gap-2">
+                              {mode === "SHARED" ? <button type="button" disabled={Boolean(checklistSavingId)} onClick={() => void setChecklistStatus(item, "Shared", sharedDone ? "" : "✓")} className={`min-h-11 rounded-lg border px-4 py-2.5 text-sm font-semibold disabled:opacity-50 ${sharedDone ? "border-emerald-800 bg-emerald-800 text-white" : "border-slate-300 bg-white text-slate-700"}`}>{sharedDone ? "✓ Done · Both" : "□ Mark done · Both"}</button> : <><button type="button" disabled={Boolean(checklistSavingId) || (welcomeName !== "Ralph")} onClick={() => void setChecklistStatus(item, "Ralph", ralphDone ? "" : "✓")} className={`min-h-11 rounded-lg border px-3 py-2.5 text-sm font-semibold disabled:opacity-50 ${ralphDone ? "border-emerald-800 bg-emerald-800 text-white" : "border-slate-300 bg-white text-slate-700"}`}>{ralphDone ? "✓ Ralph done" : "□ Ralph done"}</button><button type="button" disabled={Boolean(checklistSavingId) || (welcomeName !== "June")} onClick={() => void setChecklistStatus(item, "June", juneDone ? "" : "✓")} className={`min-h-11 rounded-lg border px-3 py-2.5 text-sm font-semibold disabled:opacity-50 ${juneDone ? "border-emerald-800 bg-emerald-800 text-white" : "border-slate-300 bg-white text-slate-700"}`}>{juneDone ? "✓ June done" : "□ June done"}</button><span className="self-center text-xs text-slate-500">{otherName}: {otherDone ? "Done" : "Not done"}</span></>}
+                              {activeChecklistTab === "before" && !done && <button type="button" disabled={Boolean(checklistSavingId)} onClick={() => void toggleChecklistToBuy(item)} className={`min-h-11 rounded-lg border px-3 py-2.5 text-sm font-semibold disabled:opacity-50 ${item.to_buy ? "border-amber-400 bg-amber-100 text-amber-900" : "border-slate-300 bg-white text-slate-700"}`}>{item.to_buy ? "✓ Remove To Buy" : "+ To Buy"}</button>}
+                            </div>}
+                            {checklistSavingId === item.item_id && <span className="mt-2 block text-xs text-slate-500">Syncing…</span>}
+                            <p className="mt-2 text-[11px] text-slate-400">Long-press this item to cancel or restore it.</p>
                           </article>
                         );
                       })}
