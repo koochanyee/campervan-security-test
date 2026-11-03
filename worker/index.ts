@@ -2349,8 +2349,7 @@ export default {
         const read = await fetch(sheetsValuesUrl(trip.sheetId, range), { headers: { Authorization: `Bearer ${token}` } });
         if (!read.ok) return jsonResponse({ success: false, error: "Could not read photo comments and reactions." }, 502);
         const data = await read.json() as { values?: unknown[][] };
-        const rows = data.values || [];
-        const authorName = session.email.toLowerCase() === "koochanyee@gmail.com" ? "Ralph" : session.email.toLowerCase() === "wookahwai@gmail.com" ? "June" : "Traveller";
+        const rows = data.values || [];        
         if (request.method === "GET") {
           const interactions = rows.slice(1).filter((row) => String(row[1] || "").trim() && String(row[2] || "").trim() && String(row[4] || "").trim()).map((row) => ({ interaction_id: String(row[0] || ""), memory_id: String(row[1] || ""), photo_id: String(row[2] || ""), kind: String(row[3] || ""), value: String(row[4] || ""), author: String(row[5] || "").toLowerCase() === "koochanyee@gmail.com" ? "Ralph" : String(row[5] || "").toLowerCase() === "wookahwai@gmail.com" ? "June" : "Traveller", created_at: String(row[6] || "") }));
           return jsonResponse({ success: true, interactions });
