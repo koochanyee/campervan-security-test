@@ -1195,13 +1195,20 @@ export default {
         const profile = session.email.toLowerCase() === "koochanyee@gmail.com" ? "Ralph" : session.email.toLowerCase() === "wookahwai@gmail.com" ? "June" : "";
         if (!profile) return jsonResponse({ success: false, error: "This account is not assigned a checklist profile." }, 403);
         const tab = "APP_CHECKLIST";
-        const headers = ["checklist_id", "list_type", "category", "item", "quantity", "notes", "shared_done", "to_buy", "sort_order", "active", "created_at", "updated_at", "source_tab", "source_row", "must_have", "due_date"];
+        const headers = ["checklist_id", "list_type", "category", "item", "quantity", "notes", "shared_done", "to_buy", "sort_order", "active", "created_at", "updated_at", "source_tab", "source_row", "must_have", "due_date", "completion_mode", "ralph_done", "june_done", "cancelled"];
         await ensureSheetTab(token, trip.sheetId, tab, headers);
         const readAppRows = async () => readSheetRows(token, trip.sheetId, tab);
         let appRows = await readAppRows();
-        const headerNorm = (appRows[0] || []).map((cell) => cell.trim().toLowerCase());
-        if (headers.some((header, index) => headerNorm[index] !== header)) {
-          return jsonResponse({ success: false, error: "APP_CHECKLIST exists but its headers do not match the expected schema. No data was changed; please inspect the tab before retrying." }, 409);
+        const headerNorm = (appRows[0] || []).map((cell) => String(cell ?? "").trim().toLowerCase());
+        if (headers.slice(0, 16).some((header, index) => headerNorm[index] !== header)) {
+          return jsonResponse({ success: false, error: "APP_CHECKLIST exists but its original headers do not match the expected schema. No data was changed; please inspect the tab before retrying." }, 409);
+        }
+        // Extend an existing A:P checklist safely; never replace or reorder its data.
+        const extraHeaders = headers.slice(16);
+        if (extraHeaders.some((header, index) => headerNorm[index + 16] !== header)) {
+          const headerWrite = await fetch(`${sheetsValuesUrl(trip.sheetId, `${quoteSheetTab(tab)}!Q1:T1`)}?valueInputOption=RAW`, { method: "PUT", headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" }, body: JSON.stringify({ values: [extraHeaders] }) });
+          if (!headerWrite.ok) return jsonResponse({ success: false, error: "Could not add the Shared/Personal and cancellation columns to APP_CHECKLIST." }, 502);
+          appRows = await readAppRows();
         }
         const col = (name: string) => headers.indexOf(name);
         const now = new Date().toISOString();
@@ -1215,11 +1222,25 @@ export default {
         const savedLegacyStatuses = await env.OAUTH_TOKEN_STORE.get(legacyStatusKey);
         if (savedLegacyStatuses) { try { legacyStatuses = JSON.parse(savedLegacyStatuses) as typeof legacyStatuses; } catch { legacyStatuses = {}; } }
         const truthy = (value: unknown) => [true, "TRUE", "true", "✓", "1", 1].includes(value as never);
+        // Existing checklist rows predate the Personal/Shared choice. Default
+        // them to Personal while carrying their previous shared completion to
+        // both travellers, so no checked state is lost during the upgrade.
+        const defaultsToBackfill = appRows.slice(1).flatMap((row, index) => {
+          const rowId = String(row[col("checklist_id")] || "").trim();
+          if (!rowId || String(row[col("completion_mode")] || "").trim()) return [];
+          const priorDone = truthy(row[col("shared_done")]);
+          return [{ range: `${quoteSheetTab(tab)}!Q${index + 2}:T${index + 2}`, values: [["PERSONAL", priorDone, priorDone, false]] }];
+        });
+        if (defaultsToBackfill.length) {
+          const defaultsWrite = await fetch(`https://sheets.googleapis.com/v4/spreadsheets/${encodeURIComponent(trip.sheetId)}/values:batchUpdate`, { method: "POST", headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" }, body: JSON.stringify({ valueInputOption: "RAW", data: defaultsToBackfill }) });
+          if (!defaultsWrite.ok) return jsonResponse({ success: false, error: "Could not initialise existing checklist items as Personal. No checklist status was changed; please retry." }, 502);
+          appRows = await readAppRows();
+        }
         const appendLegacy = (id: string, listType: string, category: string, item: string, quantity: string, notes: string, sourceTab: string, sourceRow: number, oldIds: string[], mustHave = false, dueDate = "", sourceDone = false) => {
           if (!item.trim() || existingIds.has(id) || migrationRows.some((row) => row[0] === id)) return;
           const prior = oldIds.map((oldId) => legacyStatuses[oldId] || {}).find((status) => status.shared_status === "✓" || status.ralph_status === "✓" || status.june_status === "✓");
           const done = Boolean(prior) || sourceDone;
-          migrationRows.push([id, listType, category || "Other", item.trim(), quantity, notes, String(done), "FALSE", String(migrationRows.length + 1), "TRUE", now, now, sourceTab, String(sourceRow), String(mustHave), dueDate]);
+          migrationRows.push([id, listType, category || "Other", item.trim(), quantity, notes, String(done), "FALSE", String(migrationRows.length + 1), "TRUE", now, now, sourceTab, String(sourceRow), String(mustHave), dueDate, "PERSONAL", String(done), String(done), "FALSE"]);
         };
         const mainTab = await findExistingTab(token, trip.sheetId, ["Thing to do n bring", "Things to do n bring", "Thing to do & bring", "Things to do & bring", "THINGS TO DO N BRING", "THINGS TO DO & BRING"], "");
         if (!mainTab) return jsonResponse({ success: false, error: "Could not find the existing pre-trip checklist tab ‘Thing to do n bring’." }, 404);
@@ -1264,7 +1285,7 @@ export default {
           });
         }
         if (migrationRows.length) {
-          const appendUrl = `${sheetsValuesUrl(trip.sheetId, `${quoteSheetTab(tab)}!A:P`)}:append?valueInputOption=RAW&insertDataOption=INSERT_ROWS`;
+          const appendUrl = `${sheetsValuesUrl(trip.sheetId, `${quoteSheetTab(tab)}!A:T`)}:append?valueInputOption=RAW&insertDataOption=INSERT_ROWS`;
           const migrationWrite = await fetch(appendUrl, { method: "POST", headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" }, body: JSON.stringify({ values: migrationRows }) });
           if (!migrationWrite.ok) return jsonResponse({ success: false, error: `Could not migrate existing checklist items to APP_CHECKLIST (HTTP ${migrationWrite.status}).` }, 502);
           appRows = await readAppRows();
@@ -1273,7 +1294,7 @@ export default {
         if (request.method === "POST") {
           const action = String(body.action || "set_status");
           if (action === "reset_grocery") {
-            const updates = appRows.slice(1).flatMap((row, index) => String(row[col("list_type")] || "") === "GROCERY" && String(row[col("active")] || "TRUE").toUpperCase() !== "FALSE" ? [{ range: `${quoteSheetTab(tab)}!G${index + 2}:H${index + 2}`, values: [[false, false]] }] : []);
+            const updates = appRows.slice(1).flatMap((row, index) => String(row[col("list_type")] || "") === "GROCERY" && String(row[col("active")] || "TRUE").toUpperCase() !== "FALSE" ? [{ range: `${quoteSheetTab(tab)}!G${index + 2}:H${index + 2}`, values: [[false, false]] }, { range: `${quoteSheetTab(tab)}!R${index + 2}:S${index + 2}`, values: [[false, false]] }] : []);
             if (updates.length) {
               const write = await fetch(`https://sheets.googleapis.com/v4/spreadsheets/${encodeURIComponent(trip.sheetId)}/values:batchUpdate`, { method: "POST", headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" }, body: JSON.stringify({ valueInputOption: "RAW", data: updates }) });
               if (!write.ok) return jsonResponse({ success: false, error: "Google Sheets could not reset grocery completion." }, 502);
@@ -1288,15 +1309,36 @@ export default {
             const notes = typeof body.notes === "string" ? body.notes.trim().slice(0, 500) : "";
             if (!category || !item) return jsonResponse({ success: false, error: "Choose a category and enter an item." }, 400);
             const id = `custom:${crypto.randomUUID()}`;
-            const addUrl = `${sheetsValuesUrl(trip.sheetId, `${quoteSheetTab(tab)}!A:P`)}:append?valueInputOption=RAW&insertDataOption=INSERT_ROWS`;
-            const addWrite = await fetch(addUrl, { method: "POST", headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" }, body: JSON.stringify({ values: [[id, listType, category, item, quantity, notes, "FALSE", "FALSE", String(appRows.length), "TRUE", now, now, "APP", "", "FALSE", ""]] }) });
+            const addUrl = `${sheetsValuesUrl(trip.sheetId, `${quoteSheetTab(tab)}!A:T`)}:append?valueInputOption=RAW&insertDataOption=INSERT_ROWS`;
+            const addWrite = await fetch(addUrl, { method: "POST", headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" }, body: JSON.stringify({ values: [[id, listType, category, item, quantity, notes, "FALSE", "FALSE", String(appRows.length), "TRUE", now, now, "APP", "", "FALSE", "", "PERSONAL", "FALSE", "FALSE", "FALSE"]] }) });
             if (!addWrite.ok) return jsonResponse({ success: false, error: "Could not add the item to Google Sheets." }, 502);
-            return jsonResponse({ success: true, message: "Item added and synced to Google Sheets.", item: { item_id: id, checklist_type: listType === "GROCERY" ? "grocery" : "packing", category, item, quantity, notes, shared_done: false, to_buy: false } }, 201);
+            return jsonResponse({ success: true, message: "Item added and synced to Google Sheets.", item: { item_id: id, checklist_type: listType === "GROCERY" ? "grocery" : "packing", category, item, quantity, notes, shared_done: false, to_buy: false, completion_mode: "PERSONAL", ralph_done: false, june_done: false, cancelled: false } }, 201);
           }
           const itemId = typeof body.item_id === "string" ? body.item_id.trim() : "";
           const rowIndex = appRows.slice(1).findIndex((row) => String(row[col("checklist_id")] || "") === itemId);
           if (!itemId || rowIndex < 0) return jsonResponse({ success: false, error: "Checklist item not found. Refresh and try again." }, 404);
           const sheetRow = rowIndex + 2;
+          const currentRow = appRows[sheetRow - 1] || [];
+          const currentSharedDone = truthy(currentRow[col("shared_done")]);
+          const currentRalphDone = truthy(currentRow[col("ralph_done")]);
+          const currentJuneDone = truthy(currentRow[col("june_done")]);
+          const currentMode = String(currentRow[col("completion_mode")] || "PERSONAL").toUpperCase() === "SHARED" ? "SHARED" : "PERSONAL";
+          if (action === "set_mode") {
+            const nextMode = String(body.completion_mode || "").toUpperCase();
+            if (nextMode !== "SHARED" && nextMode !== "PERSONAL") return jsonResponse({ success: false, error: "Choose Shared or Personal." }, 400);
+            const nextSharedDone = nextMode === "SHARED" ? (currentMode === "PERSONAL" ? currentRalphDone || currentJuneDone : currentSharedDone) : currentSharedDone;
+            const nextRalphDone = nextMode === "PERSONAL" && currentMode === "SHARED" ? currentSharedDone : currentRalphDone;
+            const nextJuneDone = nextMode === "PERSONAL" && currentMode === "SHARED" ? currentSharedDone : currentJuneDone;
+            const modeWrite = await fetch(`https://sheets.googleapis.com/v4/spreadsheets/${encodeURIComponent(trip.sheetId)}/values:batchUpdate`, { method: "POST", headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" }, body: JSON.stringify({ valueInputOption: "RAW", data: [{ range: `${quoteSheetTab(tab)}!G${sheetRow}`, values: [[nextSharedDone]] }, { range: `${quoteSheetTab(tab)}!Q${sheetRow}:S${sheetRow}`, values: [[nextMode, nextRalphDone, nextJuneDone]] }, { range: `${quoteSheetTab(tab)}!L${sheetRow}`, values: [[now]] }] }) });
+            if (!modeWrite.ok) return jsonResponse({ success: false, error: "Could not save the checklist sharing mode." }, 502);
+            return jsonResponse({ success: true, item_id: itemId, completion_mode: nextMode, message: `Checklist item is now ${nextMode === "SHARED" ? "shared by both travellers" : "personal to each traveller"}.` });
+          }
+          if (action === "set_cancelled") {
+            const cancelled = Boolean(body.cancelled);
+            const cancelWrite = await fetch(`https://sheets.googleapis.com/v4/spreadsheets/${encodeURIComponent(trip.sheetId)}/values:batchUpdate`, { method: "POST", headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" }, body: JSON.stringify({ valueInputOption: "RAW", data: [{ range: `${quoteSheetTab(tab)}!T${sheetRow}`, values: [[cancelled]] }, ...(cancelled ? [{ range: `${quoteSheetTab(tab)}!H${sheetRow}`, values: [[false]] }] : []), { range: `${quoteSheetTab(tab)}!L${sheetRow}`, values: [[now]] }] }) });
+            if (!cancelWrite.ok) return jsonResponse({ success: false, error: "Could not save the cancelled status." }, 502);
+            return jsonResponse({ success: true, item_id: itemId, cancelled, message: cancelled ? "Item cancelled and kept in the checklist." : "Item restored to the active checklist." });
+          }
           if (action === "set_to_buy") {
             const toBuy = Boolean(body.to_buy) && String(appRows[sheetRow - 1][col("list_type")]) === "BEFORE_DEPARTURE";
             const write = await fetch(`${sheetsValuesUrl(trip.sheetId, `${quoteSheetTab(tab)}!H${sheetRow}`)}?valueInputOption=RAW`, { method: "PUT", headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" }, body: JSON.stringify({ values: [[toBuy]] }) });
@@ -1304,9 +1346,19 @@ export default {
             await fetch(`${sheetsValuesUrl(trip.sheetId, `${quoteSheetTab(tab)}!L${sheetRow}`)}?valueInputOption=RAW`, { method: "PUT", headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" }, body: JSON.stringify({ values: [[now]] }) });
             return jsonResponse({ success: true, message: toBuy ? "Added to To Buy." : "Removed from To Buy." });
           }
+          if (currentMode === "PERSONAL") {
+            const person = String(body.person || profile);
+            if (person !== profile) return jsonResponse({ success: false, error: "You can only update your own personal checklist status." }, 403);
+            const done = Boolean(body.done ?? (body.status === "✓"));
+            const targetColumn = profile === "Ralph" ? "R" : "S";
+            const otherDone = profile === "Ralph" ? currentJuneDone : currentRalphDone;
+            const clearToBuy = done && otherDone;
+            const personalWrite = await fetch(`https://sheets.googleapis.com/v4/spreadsheets/${encodeURIComponent(trip.sheetId)}/values:batchUpdate`, { method: "POST", headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" }, body: JSON.stringify({ valueInputOption: "RAW", data: [{ range: `${quoteSheetTab(tab)}!${targetColumn}${sheetRow}`, values: [[done]] }, ...(clearToBuy ? [{ range: `${quoteSheetTab(tab)}!H${sheetRow}`, values: [[false]] }] : []), { range: `${quoteSheetTab(tab)}!L${sheetRow}`, values: [[now]] }] }) });
+            if (!personalWrite.ok) return jsonResponse({ success: false, error: `Google Sheets did not save your personal completion status (HTTP ${personalWrite.status}).` }, 502);
+            return jsonResponse({ success: true, item_id: itemId, person: profile, done, message: `${profile}'s personal completion saved to Google Sheets.` });
+          }
           const sharedDone = Boolean(body.shared_done ?? (body.status === "✓"));
-          const values = [sharedDone, sharedDone ? false : truthy(appRows[sheetRow - 1][col("to_buy")]), now];
-          const write = await fetch(`${sheetsValuesUrl(trip.sheetId, `${quoteSheetTab(tab)}!G${sheetRow}:H${sheetRow}`)}?valueInputOption=RAW`, { method: "PUT", headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" }, body: JSON.stringify({ values: [[values[0], values[1]]] }) });
+          const write = await fetch(`${sheetsValuesUrl(trip.sheetId, `${quoteSheetTab(tab)}!G${sheetRow}:H${sheetRow}`)}?valueInputOption=RAW`, { method: "PUT", headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" }, body: JSON.stringify({ values: [[sharedDone, sharedDone ? false : truthy(currentRow[col("to_buy")])]] }) });
           if (!write.ok) return jsonResponse({ success: false, error: `Google Sheets did not save the shared completion status (HTTP ${write.status}).` }, 502);
           await fetch(`${sheetsValuesUrl(trip.sheetId, `${quoteSheetTab(tab)}!L${sheetRow}`)}?valueInputOption=RAW`, { method: "PUT", headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" }, body: JSON.stringify({ values: [[now]] }) });
           return jsonResponse({ success: true, item_id: itemId, shared_done: sharedDone, message: sharedDone ? `Marked done for both Ralph and June by ${profile}.` : "Shared completion cleared for both travellers." });
@@ -1318,9 +1370,12 @@ export default {
           if (!id || !item || String(row[col("active")] || "TRUE").toUpperCase() === "FALSE") return [];
           const listType = String(row[col("list_type")] || "BEFORE_DEPARTURE");
           const done = truthy(row[col("shared_done")]);
-          return [{ item_id: id, category: String(row[col("category")] || "Other"), item, quantity: String(row[col("quantity")] || ""), notes: String(row[col("notes")] || ""), checklist_type: listType === "GROCERY" ? "grocery" : "packing", list_type: listType, shared_done: done, shared_status: done ? "✓" : "", ralph_status: done ? "✓" : "", june_status: done ? "✓" : "", to_buy: truthy(row[col("to_buy")]), sort_order: Number(row[col("sort_order")] || 0), must_have: truthy(row[col("must_have")]), due_date: String(row[col("due_date")] || "") }];
+          const completionMode = String(row[col("completion_mode")] || "PERSONAL").toUpperCase() === "SHARED" ? "SHARED" : "PERSONAL";
+          const ralphDone = truthy(row[col("ralph_done")]) || (completionMode === "SHARED" && done);
+          const juneDone = truthy(row[col("june_done")]) || (completionMode === "SHARED" && done);
+          return [{ item_id: id, category: String(row[col("category")] || "Other"), item, quantity: String(row[col("quantity")] || ""), notes: String(row[col("notes")] || ""), checklist_type: listType === "GROCERY" ? "grocery" : "packing", list_type: listType, shared_done: done, shared_status: done ? "✓" : "", ralph_status: ralphDone ? "✓" : "", june_status: juneDone ? "✓" : "", ralph_done: ralphDone, june_done: juneDone, completion_mode: completionMode, cancelled: truthy(row[col("cancelled")]), to_buy: truthy(row[col("to_buy")]), sort_order: Number(row[col("sort_order")] || 0), must_have: truthy(row[col("must_have")]), due_date: String(row[col("due_date")] || "") }];
         });
-        return jsonResponse({ success: true, checklistItems: items, tripId: trip.id, sourceTab: tab, migratedCount: migrationRows.length, sharedCompletion: true });
+        return jsonResponse({ success: true, checklistItems: items, tripId: trip.id, sourceTab: tab, migratedCount: migrationRows.length, sharedCompletion: true, personalCompletion: true });
       } catch (error) { return jsonResponse({ success: false, error: error instanceof Error ? error.message : "Could not access the shared checklist." }, 500); }
     }
 
@@ -2295,6 +2350,7 @@ export default {
         if (!read.ok) return jsonResponse({ success: false, error: "Could not read photo comments and reactions." }, 502);
         const data = await read.json() as { values?: unknown[][] };
         const rows = data.values || [];
+        const authorName = session.email.toLowerCase() === "koochanyee@gmail.com" ? "Ralph" : session.email.toLowerCase() === "wookahwai@gmail.com" ? "June" : "Traveller";
         if (request.method === "GET") {
           const interactions = rows.slice(1).filter((row) => String(row[1] || "").trim() && String(row[2] || "").trim() && String(row[4] || "").trim()).map((row) => ({ interaction_id: String(row[0] || ""), memory_id: String(row[1] || ""), photo_id: String(row[2] || ""), kind: String(row[3] || ""), value: String(row[4] || ""), author: String(row[5] || "").toLowerCase() === "koochanyee@gmail.com" ? "Ralph" : String(row[5] || "").toLowerCase() === "wookahwai@gmail.com" ? "June" : "Traveller", created_at: String(row[6] || "") }));
           return jsonResponse({ success: true, interactions });
