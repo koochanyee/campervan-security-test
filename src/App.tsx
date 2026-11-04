@@ -796,7 +796,14 @@ function App() {
     if ((item.completion_mode || "PERSONAL") === mode) return;
     const sharedDone = Boolean(item.ralph_done || item.ralph_status === "✓" || item.june_done || item.june_status === "✓");
     const toPersonal = mode === "PERSONAL";
-    await saveChecklistAction(item, { action: "set_mode", completion_mode: mode }, { ...item, completion_mode: mode, shared_done: toPersonal ? item.shared_done : sharedDone, ralph_done: toPersonal ? Boolean(item.shared_done) : item.ralph_done, june_done: toPersonal ? Boolean(item.shared_done) : item.june_done }, "Could not change checklist sharing mode.");
+    const optimistic: ChecklistItem = {
+      ...item,
+      completion_mode: mode,
+      shared_done: toPersonal ? Boolean(item.shared_done) : sharedDone,
+      ralph_done: toPersonal ? Boolean(item.shared_done) : Boolean(item.ralph_done),
+      june_done: toPersonal ? Boolean(item.shared_done) : Boolean(item.june_done),
+    };
+    await saveChecklistAction(item, { action: "set_mode", completion_mode: mode }, optimistic, "Could not change checklist sharing mode.");
   };
 
   const setChecklistCancelled = async (item: ChecklistItem) => {
@@ -1811,7 +1818,8 @@ function App() {
                         const sharedDone = Boolean(item.shared_done || item.shared_status === "✓");
                         const ralphDone = Boolean(item.ralph_done || item.ralph_status === "✓");
                         const juneDone = Boolean(item.june_done || item.june_status === "✓");
-                        const done = mode === "SHARED" ? sharedDone : (ralphDone && juneDone);                        
+                        const done = mode === "SHARED" ? sharedDone : (ralphDone && juneDone);
+                        const ownDone = welcomeName === "Ralph" ? ralphDone : juneDone;
                         const otherName = welcomeName === "Ralph" ? "June" : "Ralph";
                         const otherDone = welcomeName === "Ralph" ? juneDone : ralphDone;
                         return (
