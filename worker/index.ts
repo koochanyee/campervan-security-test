@@ -1330,8 +1330,14 @@ export default {
             const nextRalphDone = nextMode === "PERSONAL" && currentMode === "SHARED" ? currentSharedDone : currentRalphDone;
             const nextJuneDone = nextMode === "PERSONAL" && currentMode === "SHARED" ? currentSharedDone : currentJuneDone;
             const modeWrite = await fetch(`https://sheets.googleapis.com/v4/spreadsheets/${encodeURIComponent(trip.sheetId)}/values:batchUpdate`, { method: "POST", headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" }, body: JSON.stringify({ valueInputOption: "RAW", data: [{ range: `${quoteSheetTab(tab)}!G${sheetRow}`, values: [[nextSharedDone]] }, { range: `${quoteSheetTab(tab)}!Q${sheetRow}:S${sheetRow}`, values: [[nextMode, nextRalphDone, nextJuneDone]] }, { range: `${quoteSheetTab(tab)}!L${sheetRow}`, values: [[now]] }] }) });
-            if (!modeWrite.ok) return jsonResponse({ success: false, error: "Could not save the checklist sharing mode." }, 502);
-            return jsonResponse({ success: true, item_id: itemId, completion_mode: nextMode, message: `Checklist item is now ${nextMode === "SHARED" ? "shared by both travellers" : "personal to each traveller"}.` });
+            if (!modeWrite.ok) return jsonResponse({ success: false, error: `Could not save the checklist sharing mode (HTTP ${modeWrite.status}).` }, 502);
+            // Verify the persisted value before reporting success. This prevents the UI
+            // from appearing to switch modes when Google Sheets did not retain the write.
+            const verifiedRows = await readAppRows();
+            const verifiedRow = verifiedRows.slice(1).find((row) => String(row[col("checklist_id")] || "").trim() === itemId);
+            const verifiedMode = String(verifiedRow?.[col("completion_mode")] || "").toUpperCase();
+            if (verifiedMode !== nextMode) return jsonResponse({ success: false, error: "Google Sheets did not confirm the new completion mode. Please try again." }, 502);
+            return jsonResponse({ success: true, item_id: itemId, completion_mode: verifiedMode, ralph_done: truthy(verifiedRow?.[col("ralph_done")]), june_done: truthy(verifiedRow?.[col("june_done")]), shared_done: truthy(verifiedRow?.[col("shared_done")]), message: `Checklist item is now ${verifiedMode === "SHARED" ? "shared by both travellers" : "personal to each traveller"}.` });
           }
           if (action === "set_cancelled") {
             const cancelled = Boolean(body.cancelled);
@@ -1364,7 +1370,7 @@ export default {
           return jsonResponse({ success: true, item_id: itemId, shared_done: sharedDone, message: sharedDone ? `Marked done for both Ralph and June by ${profile}.` : "Shared completion cleared for both travellers." });
         }
 
-        const items = appRows.slice(1).flatMap((row) => {
+        const rawItems = appRows.slice(1).flatMap((row) => {
           const id = String(row[col("checklist_id")] || "").trim();
           const item = String(row[col("item")] || "").trim();
           if (!id || !item || String(row[col("active")] || "TRUE").toUpperCase() === "FALSE") return [];
@@ -1375,7 +1381,17 @@ export default {
           const juneDone = truthy(row[col("june_done")]) || (completionMode === "SHARED" && done);
           return [{ item_id: id, category: String(row[col("category")] || "Other"), item, quantity: String(row[col("quantity")] || ""), notes: String(row[col("notes")] || ""), checklist_type: listType === "GROCERY" ? "grocery" : "packing", list_type: listType, shared_done: done, shared_status: done ? "✓" : "", ralph_status: ralphDone ? "✓" : "", june_status: juneDone ? "✓" : "", ralph_done: ralphDone, june_done: juneDone, completion_mode: completionMode, cancelled: truthy(row[col("cancelled")]), to_buy: truthy(row[col("to_buy")]), sort_order: Number(row[col("sort_order")] || 0), must_have: truthy(row[col("must_have")]), due_date: String(row[col("due_date")] || "") }];
         });
-        return jsonResponse({ success: true, checklistItems: items, tripId: trip.id, sourceTab: tab, migratedCount: migrationRows.length, sharedCompletion: true, personalCompletion: true });
+        // Older migration runs could import the same source item more than once
+        // under different row IDs. Hide exact duplicates in the app response while
+        // leaving the original APP_CHECKLIST rows untouched for safe recovery.
+        const uniqueItems = new Map<string, typeof rawItems[number]>();
+        const normaliseDuplicatePart = (value: unknown) => String(value ?? "").toLowerCase().replace(/\s+/g, " ").trim();
+        for (const entry of rawItems) {
+          const signature = [entry.list_type, entry.category, entry.item, entry.quantity, entry.notes].map(normaliseDuplicatePart).join("¦");
+          if (!uniqueItems.has(signature)) uniqueItems.set(signature, entry);
+        }
+        const items = Array.from(uniqueItems.values());
+        return jsonResponse({ success: true, checklistItems: items, tripId: trip.id, sourceTab: tab, migratedCount: migrationRows.length, duplicateRowsHidden: rawItems.length - items.length, sharedCompletion: true, personalCompletion: true });
       } catch (error) { return jsonResponse({ success: false, error: error instanceof Error ? error.message : "Could not access the shared checklist." }, 500); }
     }
 
@@ -2349,7 +2365,8 @@ export default {
         const read = await fetch(sheetsValuesUrl(trip.sheetId, range), { headers: { Authorization: `Bearer ${token}` } });
         if (!read.ok) return jsonResponse({ success: false, error: "Could not read photo comments and reactions." }, 502);
         const data = await read.json() as { values?: unknown[][] };
-        const rows = data.values || [];        
+        const rows = data.values || [];
+        const authorName = session.email.toLowerCase() === "koochanyee@gmail.com" ? "Ralph" : session.email.toLowerCase() === "wookahwai@gmail.com" ? "June" : "Traveller";
         if (request.method === "GET") {
           const interactions = rows.slice(1).filter((row) => String(row[1] || "").trim() && String(row[2] || "").trim() && String(row[4] || "").trim()).map((row) => ({ interaction_id: String(row[0] || ""), memory_id: String(row[1] || ""), photo_id: String(row[2] || ""), kind: String(row[3] || ""), value: String(row[4] || ""), author: String(row[5] || "").toLowerCase() === "koochanyee@gmail.com" ? "Ralph" : String(row[5] || "").toLowerCase() === "wookahwai@gmail.com" ? "June" : "Traveller", created_at: String(row[6] || "") }));
           return jsonResponse({ success: true, interactions });
