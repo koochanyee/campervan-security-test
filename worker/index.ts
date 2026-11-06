@@ -1677,6 +1677,7 @@ export default {
           500,
         );
       }
+    }
     
     // Save a confirmed session location to SESSION LOCATIONS only.
     if (
