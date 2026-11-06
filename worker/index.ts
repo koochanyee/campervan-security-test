@@ -1464,6 +1464,18 @@ export default {
         );
 
         if (!tokenResponse.ok) {
+          const googleError = await tokenResponse.json() as {
+            error?: string;
+            error_description?: string;
+          };
+
+          console.error("[GOOGLE TOKEN REFRESH FAILED]", {
+            status: tokenResponse.status,
+            error: googleError.error || "unknown_error",
+            description: googleError.error_description || "No description",
+            email: session.email,
+          });
+
           return jsonResponse(
             {
               success: false,
