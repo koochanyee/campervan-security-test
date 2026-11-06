@@ -1664,12 +1664,13 @@ export default {
         );
 
       } catch (error) {
-        console.error(
-         "Itinerary read failed:",
-         error instanceof Error ? error.message : String(error),
-       );
+        console.error("[ITINERARY READ FAILED]", {
+          name: error instanceof Error ? error.name : "UnknownError",
+          message: error instanceof Error ? error.message : String(error),
+          stack: error instanceof Error ? error.stack : undefined,
+        });
 
-       return jsonResponse(
+        return jsonResponse(
           {
             success: false,
             error: "An unexpected error occurred while reading the itinerary.",
@@ -1677,7 +1678,6 @@ export default {
           500,
         );
       }
-    }
 
     
     // Save a confirmed session location to SESSION LOCATIONS only.
