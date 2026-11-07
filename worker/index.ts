@@ -466,13 +466,13 @@ async function readSheetRows(accessToken: string, sheetId: string, tabName: stri
 }
 
 
-async function uploadSharedMemoryPhoto(accessToken: string, photo: { name?: unknown; mime_type?: unknown; data_base64?: unknown }): Promise<{ id: string; url: string }> {
+async function uploadSharedMemoryPhoto(accessToken: string, photo: { name?: unknown; mime_type?: unknown; data_base64?: unknown }, maxBytes = 4 * 1024 * 1024): Promise<{ id: string; url: string }> {
   const name = typeof photo.name === "string" ? photo.name.replace(/[^a-zA-Z0-9._-]/g, "_").slice(0, 120) : "travel-memory.jpg";
   const mimeType = typeof photo.mime_type === "string" && /^image\/(jpeg|png|webp|gif|heic|heif)$/.test(photo.mime_type) ? photo.mime_type : "";
   const encoded = typeof photo.data_base64 === "string" ? photo.data_base64.replace(/^data:image\/[^;]+;base64,/, "") : "";
   if (!mimeType || !encoded) throw new Error("A selected photo has an unsupported image format.");
   const binary = atob(encoded);
-  if (binary.length > 4 * 1024 * 1024) throw new Error("Each photo must be 4 MB or smaller.");
+  if (binary.length > maxBytes) throw new Error(`Each photo must be ${Math.floor(maxBytes / (1024 * 1024))} MB or smaller.`);
   const bytes = new Uint8Array(binary.length);
   for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
   const form = new FormData();
@@ -1678,7 +1678,7 @@ export default {
         );
       }
     }
-    
+
     // Save a confirmed session location to SESSION LOCATIONS only.
     if (
       request.method === "POST" &&
@@ -2297,11 +2297,13 @@ export default {
         for (const photo of photos) {
           const encoded = typeof photo.data_base64 === "string" ? photo.data_base64.replace(/^data:image\/[^;]+;base64,/, "") : "";
           encodedTotal += encoded.length;
-          if (!encoded || encoded.length > 5_600_000) return jsonResponse({ success: false, error: "Each photo must be 4 MB or smaller." }, 400);
+          // Base64 adds roughly 33% overhead. This permits up to 10 MiB per photo.
+          if (!encoded || encoded.length > 14_000_000) return jsonResponse({ success: false, error: "Each photo must be 10 MB or smaller." }, 400);
         }
-        if (encodedTotal > 14_000_000) return jsonResponse({ success: false, error: "Total photo size must be under 10 MB per memory." }, 400);
+        // Four photos at the 10 MiB per-photo limit are supported.
+        if (encodedTotal > 56_000_000) return jsonResponse({ success: false, error: "Total photo size must be 40 MB or smaller per memory." }, 400);
         const photoFiles: Array<{ id: string; url: string }> = [];
-        for (const photo of photos) photoFiles.push(await uploadSharedMemoryPhoto(tokenData.access_token, photo));
+        for (const photo of photos) photoFiles.push(await uploadSharedMemoryPhoto(tokenData.access_token, photo, 10 * 1024 * 1024));
         // Store both Drive file IDs and URLs so photos can be located from the sheet later.
         const photoIdsValue = photoFiles.length ? JSON.stringify(photoFiles) : "";
         const createdAt = new Date().toISOString();
