@@ -1862,7 +1862,6 @@ function App() {
                         const ralphDone = Boolean(item.ralph_done || item.ralph_status === "✓");
                         const juneDone = Boolean(item.june_done || item.june_status === "✓");
                         const done = mode === "SHARED" ? sharedDone : (ralphDone && juneDone);
-                        const ownDone = welcomeName === "Ralph" ? ralphDone : juneDone;
                         const otherName = welcomeName === "Ralph" ? "June" : "Ralph";
                         const otherDone = welcomeName === "Ralph" ? juneDone : ralphDone;
                         return (
