@@ -1,2424 +1,2121 @@
-interface Env {
-  GOOGLE_CLIENT_ID: string;
-  APPROVED_EMAILS: string;
-  SESSION_SECRET: string;
+import { useEffect, useMemo, useRef, useState } from "react";
+import type { FormEvent, PointerEvent as ReactPointerEvent } from "react";
 
-  // Google Sheets OAuth — configure these on Preview
-  GOOGLE_CLIENT_SECRET: string;
-  TOKEN_ENCRYPTION_KEY: string;
-  GOOGLE_SHEET_ID: string;
-  GOOGLE_SHEET_TAB: string;
-  OAUTH_TOKEN_STORE: KVNamespace;
-}
+type ItineraryRow = Record<string, string>;
+type ViewName =
+  | "home"
+  | "checklist"
+  | "companion"
+  | "itinerary"
+  | "expenses"
+  | "memories"
+  | "map"
+  | "documents";
 
-interface GoogleTokenInfo {
-  aud?: string;
-  sub?: string;
-  email?: string;
-  email_verified?: string;
-  exp?: string;
-  iss?: string;
-}
-
-interface SessionPayload {
-  email: string;
-  googleId: string;
-  exp: number;
-}
-
-function jsonResponse(
-  body: Record<string, unknown>,
-  status = 200,
-): Response {
-  return Response.json(body, {
-    status,
-    headers: {
-      "Cache-Control": "no-store",
-      "X-Content-Type-Options": "nosniff",
-    },
-  });
-}
-
-function base64UrlEncode(bytes: Uint8Array): string {
-  let binary = "";
-  for (const byte of bytes) {
-    binary += String.fromCharCode(byte);
-  }
-
-  return btoa(binary)
-    .replace(/\+/g, "-")
-    .replace(/\//g, "_")
-    .replace(/=+$/, "");
-}
-
-function base64UrlDecode(value: string): Uint8Array {
-  const base64 = value.replace(/-/g, "+").replace(/_/g, "/");
-  const padded = base64 + "=".repeat((4 - (base64.length % 4)) % 4);
-  const binary = atob(padded);
-
-  return Uint8Array.from(
-    binary,
-    (char) => char.charCodeAt(0),
-  );
-}
-
-async function hmac(
-  value: string,
-  secret: string,
-): Promise<Uint8Array> {
-  const key = await crypto.subtle.importKey(
-    "raw",
-    new TextEncoder().encode(secret),
-    { name: "HMAC", hash: "SHA-256" },
-    false,
-    ["sign"],
-  );
-
-  return new Uint8Array(
-    await crypto.subtle.sign(
-      "HMAC",
-      key,
-      new TextEncoder().encode(value),
-    ),
-  );
-}
-
-function isApprovedEmail(email: string, env: Env): boolean {
-  if (!env.APPROVED_EMAILS) return false;
-
-  const approved = env.APPROVED_EMAILS
-    .split(",")
-    .map((item) => item.trim().toLowerCase())
-    .filter(Boolean);
-
-  return approved.includes(email.trim().toLowerCase());
-}
-
-async function createSessionToken(
-  payload: SessionPayload,
-  secret: string,
-): Promise<string> {
-  const encoded = base64UrlEncode(
-    new TextEncoder().encode(JSON.stringify(payload)),
-  );
-
-  const signature = base64UrlEncode(
-    await hmac(encoded, secret),
-  );
-
-  return `${encoded}.${signature}`;
-}
-
-async function readSession(
-  request: Request,
-  env: Env,
-): Promise<SessionPayload | null> {
-  try {
-    if (
-      !env.SESSION_SECRET ||
-      env.SESSION_SECRET.length < 32 ||
-      !env.APPROVED_EMAILS
-    ) {
-      return null;
-    }
-
-    const cookieHeader = request.headers.get("Cookie") || "";
-
-    const cookie = cookieHeader
-      .split(";")
-      .map((item) => item.trim())
-      .find((item) => item.startsWith("m3_session="));
-
-    if (!cookie) return null;
-
-    const token = cookie.slice("m3_session=".length);
-    const parts = token.split(".");
-
-    if (parts.length !== 2) return null;
-
-    const [encoded, suppliedSignature] = parts;
-
-    if (!encoded || !suppliedSignature) return null;
-
-    const expectedSignature = base64UrlEncode(
-      await hmac(encoded, env.SESSION_SECRET),
-    );
-
-    if (suppliedSignature.length !== expectedSignature.length) {
-      return null;
-    }
-
-    let difference = 0;
-
-    for (let i = 0; i < expectedSignature.length; i++) {
-      difference |=
-        suppliedSignature.charCodeAt(i) ^
-        expectedSignature.charCodeAt(i);
-    }
-
-    if (difference !== 0) return null;
-
-    const payload = JSON.parse(
-      new TextDecoder().decode(base64UrlDecode(encoded)),
-    ) as SessionPayload;
-
-    if (
-      typeof payload.email !== "string" ||
-      typeof payload.googleId !== "string" ||
-      typeof payload.exp !== "number" ||
-      payload.exp <= Math.floor(Date.now() / 1000) ||
-      !isApprovedEmail(payload.email, env)
-    ) {
-      return null;
-    }
-
-    return payload;
-  } catch {
-    return null;
-  }
-}
-
-interface GoogleOAuthState {
-  email: string;
-  nonce: string;
-  exp: number;
-}
-
-interface GoogleOAuthTokenResponse {
-  access_token?: string;
-  refresh_token?: string;
-  expires_in?: number;
-  token_type?: string;
+type ApiResponse = {
+  success?: boolean;
+  user?: { email?: string; googleId?: string };
+  data?: ItineraryRow[];
+  count?: number;
   error?: string;
+  connectUrl?: string;
+  message?: string;
+  supplementaryTabs?: Record<string, string[][]>;
+  supplementaryError?: string;
+  memories?: TripMemory[];
+  expenses?: TripExpense[];
+  checklistItems?: ChecklistItem[];
+  items?: ChecklistItem[];
+  item?: ChecklistItem;
+  trips?: TripConfigSummary[];
+  trip?: TripConfigSummary;
+  photo?: { id: string; url: string; date?: string } | null;
+};
+
+type TripConfigSummary = { id: string; name: string; itineraryTab?: string };
+
+type TripDay = {
+  key: string;
+  weekday: string;
+  date: string;
+  dateObject: Date | null;
+};
+
+type DayEntry = {
+  key: string;
+  label: string;
+  value: string;
+};
+
+type TripMemory = {
+  memory_id: string;
+  trip_date: string;
+  attraction: string;
+  author_email: string;
+  content: string;
+  created_at?: string;
+  updated_at?: string;
+  photo_ids?: string;
+};
+
+type TripDocument = { category: string; title: string; url: string; kind: "drive_folder" | "link" };
+
+type MemoryInteraction = { interaction_id: string; memory_id: string; photo_id: string; kind: "REACTION" | "COMMENT"; value: string; author: string; created_at: string };
+
+type TripExpense = {
+  expense_id: string;
+  date: string;
+  description: string;
+  category: string;
+  amount: number;
+  currency: string;
+  paid_by: string;
+  expense_type: "pre-trip" | "actual-trip";
+  share_type?: "shared" | "personal";
+  latitude?: string;
+  longitude?: string;
+  location?: string;
+  notes?: string;
+  source?: string;
+  split_share?: number;
+  payment_status?: "Paid" | "Estimate" | string;
+};
+
+type ChecklistItem = {
+  item_id: string;
+  category: string;
+  item: string;
+  ralph_status?: string;
+  june_status?: string;
+  shared_status?: string;
+  quantity?: string;
+  notes?: string;
+  due_date?: string;
+  checklist_type?: "packing" | "todo" | "grocery";
+  must_have?: boolean;
+  shared_done?: boolean;
+  to_buy?: boolean;
+  list_type?: "BEFORE_DEPARTURE" | "GROCERY";
+  sort_order?: number;
+  completion_mode?: "SHARED" | "PERSONAL";
+  ralph_done?: boolean;
+  june_done?: boolean;
+  cancelled?: boolean;
+};
+
+declare global {
+  interface Window {
+    google?: {
+      accounts: {
+        id: {
+          initialize: (options: {
+            client_id: string;
+            callback: (response: { credential: string }) => void;
+          }) => void;
+          renderButton: (
+            element: HTMLElement,
+            options: { theme: string; size: string; text: string },
+          ) => void;
+        };
+      };
+    };
+  }
 }
 
-function getCookie(
-  request: Request,
-  name: string,
-): string | null {
-  const cookieHeader = request.headers.get("Cookie") || "";
-
-  const cookie = cookieHeader
-    .split(";")
-    .map((item) => item.trim())
-    .find((item) => item.startsWith(`${name}=`));
-
-  return cookie ? cookie.slice(name.length + 1) : null;
-}
-
-async function createOAuthState(
-  email: string,
-  secret: string,
-): Promise<{ state: string; nonce: string }> {
-  const nonceBytes = crypto.getRandomValues(new Uint8Array(32));
-  const nonce = base64UrlEncode(nonceBytes);
-
-  const payload: GoogleOAuthState = {
-    email,
-    nonce,
-    exp: Math.floor(Date.now() / 1000) + 10 * 60,
-  };
-
-  const encoded = base64UrlEncode(
-    new TextEncoder().encode(JSON.stringify(payload)),
-  );
-
-  const signature = base64UrlEncode(
-    await hmac(encoded, secret),
-  );
-
-  return {
-    state: `${encoded}.${signature}`,
-    nonce,
-  };
-}
-
-async function verifyOAuthState(
-  state: string,
-  secret: string,
-): Promise<GoogleOAuthState | null> {
+function getMemoryPhotoIds(photoIds?: string): string[] {
+  if (!photoIds) return [];
   try {
-    const parts = state.split(".");
-    if (parts.length !== 2) return null;
-
-    const [encoded, suppliedSignature] = parts;
-    if (!encoded || !suppliedSignature) return null;
-
-    const expectedSignature = base64UrlEncode(
-      await hmac(encoded, secret),
-    );
-
-    if (suppliedSignature.length !== expectedSignature.length) {
-      return null;
-    }
-
-    let difference = 0;
-
-    for (let i = 0; i < expectedSignature.length; i++) {
-      difference |=
-        suppliedSignature.charCodeAt(i) ^
-        expectedSignature.charCodeAt(i);
-    }
-
-    if (difference !== 0) return null;
-
-    const payload = JSON.parse(
-      new TextDecoder().decode(base64UrlDecode(encoded)),
-    ) as GoogleOAuthState;
-
-    if (
-      typeof payload.email !== "string" ||
-      typeof payload.nonce !== "string" ||
-      typeof payload.exp !== "number" ||
-      payload.exp <= Math.floor(Date.now() / 1000)
-    ) {
-      return null;
-    }
-
-    return payload;
+    const parsed: unknown = JSON.parse(photoIds);
+    return Array.isArray(parsed) ? parsed.map((entry) => {
+      if (typeof entry === "string") return entry.trim();
+      if (entry && typeof entry === "object" && "id" in entry) return String((entry as { id?: unknown }).id || "").trim();
+      return "";
+    }).filter(Boolean) : [];
   } catch {
-    return null;
+    return photoIds.split(",").map((id) => id.trim()).filter(Boolean);
   }
 }
 
-async function encryptToken(
-  plaintext: string,
-  encodedKey: string,
-): Promise<string> {
-  const rawKey = base64UrlDecode(encodedKey);
-
-  if (rawKey.length !== 32) {
-    throw new Error(
-      "TOKEN_ENCRYPTION_KEY must decode to exactly 32 bytes",
-    );
+function googleMapsUrl(route: string): string {
+  const cleaned = route.replace(/[⭐❤️💙🔌✈️🚐🛣️]/gu, "").trim();
+  const isFlight = /\b(KUL|SIN)\b|flight|airport transfer/i.test(cleaned);
+  const normalisePlace = (place: string) => place.replace(/\bCC\b/gi, "Christchurch").replace(/\bChch\b/gi, "Christchurch").replace(/\bMt\s+Cook\b/gi, "Aoraki / Mount Cook").trim();
+  const parts = cleaned.split(/\s*(?:→|➜|⟶|->|—>|\bto\b)\s*/i).map(normalisePlace).filter(Boolean);
+  if (!isFlight && parts.length >= 2) {
+    const origin = parts[0];
+    const destination = parts[parts.length - 1];
+    const waypoints = parts.slice(1, -1);
+    const params = new URLSearchParams({ api: "1", origin, destination, travelmode: "driving" });
+    if (waypoints.length) params.set("waypoints", waypoints.join("|"));
+    return `https://www.google.com/maps/dir/?${params.toString()}`;
   }
+  return `https://www.google.com/maps/search/?api=1&query=${encodeURIComponent(normalisePlace(cleaned || route))}`;
+}
 
-  const key = await crypto.subtle.importKey(
-    "raw",
-    rawKey,
-    { name: "AES-GCM" },
-    false,
-    ["encrypt"],
+const TRIP_YEAR = 2026;
+const MAX_MEMORY_PHOTOS = 4;
+const MAX_MEMORY_PHOTO_BYTES = 10 * 1024 * 1024;
+const MONTHS = ["jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"];
+function formatMemoryDate(date: Date): string {
+  return `${date.getDate()} ${date.toLocaleDateString("en-GB", { month: "short" })}`;
+}
+
+function MemoryPhotoSelectionPreview({
+  files,
+  onRemove,
+}: {
+  files: File[];
+  onRemove: (index: number) => void;
+}) {
+  const [previewUrls, setPreviewUrls] = useState<string[]>([]);
+
+  useEffect(() => {
+    const urls = files.map((file) => URL.createObjectURL(file));
+    setPreviewUrls(urls);
+    return () => urls.forEach((url) => URL.revokeObjectURL(url));
+  }, [files]);
+
+  if (files.length === 0) return null;
+
+  return (
+    <div className="mt-3 grid grid-cols-2 gap-3 sm:grid-cols-4">
+      {files.map((file, index) => (
+        <div key={`${file.name}-${file.lastModified}-${index}`} className="overflow-hidden rounded-lg border border-slate-200 bg-white">
+          {previewUrls[index] ? (
+            <img src={previewUrls[index]} alt={`Selected upload: ${file.name}`} className="h-28 w-full bg-slate-100 object-cover" />
+          ) : (
+            <div className="flex h-28 items-center justify-center bg-slate-100 text-xs text-slate-500">Loading preview…</div>
+          )}
+          <div className="p-2">
+            <p className="truncate text-xs font-medium text-slate-700" title={file.name}>{file.name}</p>
+            <p className={`mt-1 text-xs ${file.size > MAX_MEMORY_PHOTO_BYTES ? "font-semibold text-rose-700" : "text-slate-500"}`}>
+              {(file.size / (1024 * 1024)).toFixed(2)} MB{file.size > MAX_MEMORY_PHOTO_BYTES ? " · Over 10 MB" : ""}
+            </p>
+            <button type="button" onClick={() => onRemove(index)} className="mt-2 w-full rounded-md border border-rose-200 bg-rose-50 px-2 py-1.5 text-xs font-semibold text-rose-700 hover:bg-rose-100">
+              Remove photo
+            </button>
+          </div>
+        </div>
+      ))}
+    </div>
   );
-
-  const iv = crypto.getRandomValues(new Uint8Array(12));
-
-  const ciphertext = await crypto.subtle.encrypt(
-    { name: "AES-GCM", iv },
-    key,
-    new TextEncoder().encode(plaintext),
-  );
-
-  return `${base64UrlEncode(iv)}.${base64UrlEncode(
-    new Uint8Array(ciphertext),
-  )}`;
 }
 
-async function decryptToken(
-  encrypted: string,
-  encodedKey: string,
-): Promise<string> {
-  const parts = encrypted.split(".");
-  if (parts.length !== 2) {
-    throw new Error("Invalid encrypted token format");
-  }
-
-  const [encodedIv, encodedCiphertext] = parts;
-  if (!encodedIv || !encodedCiphertext) {
-    throw new Error("Encrypted token is incomplete");
-  }
-
-  const rawKey = base64UrlDecode(encodedKey);
-
-  if (rawKey.length !== 32) {
-    throw new Error(
-      "TOKEN_ENCRYPTION_KEY must decode to exactly 32 bytes",
-    );
-  }
-
-  const key = await crypto.subtle.importKey(
-    "raw",
-    rawKey,
-    { name: "AES-GCM" },
-    false,
-    ["decrypt"],
-  );
-
-  const plaintext = await crypto.subtle.decrypt(
-    {
-      name: "AES-GCM",
-      iv: base64UrlDecode(encodedIv),
-    },
-    key,
-    base64UrlDecode(encodedCiphertext),
-  );
-
-  return new TextDecoder().decode(plaintext);
+function parseTripDate(label: string): Date | null {
+  const match = label.trim().match(/^(\d{1,2})\s+([A-Za-z]{3,})/);
+  if (!match) return null;
+  const day = Number(match[1]);
+  const month = MONTHS.indexOf(match[2].slice(0, 3).toLowerCase());
+  if (month < 0 || day < 1 || day > 31) return null;
+  const result = new Date(TRIP_YEAR, month, day);
+  return result.getMonth() === month && result.getDate() === day ? result : null;
 }
 
-
-
-interface TripConfig {
-  id: string;
-  name: string;
-  sheetId: string;
-  itineraryTab: string;
-  createdAt?: string;
+function dateIsSameDay(a: Date, b: Date): boolean {
+  return a.getFullYear() === b.getFullYear() && a.getMonth() === b.getMonth() && a.getDate() === b.getDate();
 }
 
-const TRIP_REGISTRY_KEY = "trip-registry:shared:v1";
-const SOUTH_ISLAND_SHEET_ID = "1L_GUByHbUMIORDakIRutHUwK9pNMYPAsm1H1fe6RMB0";
-const TRIP_MEMORY_FOLDER_ID = "1mvq9t6mrtMnQk1Ug3DN2dl8S7cEDI-97";
-const EXPENSE_HEADERS = ["expense_id", "date", "description", "category", "amount", "currency", "paid_by", "expense_type", "notes", "created_at", "share_type", "latitude", "longitude", "location", "legacy"];
-
-async function getTripRegistry(env: Env): Promise<TripConfig[]> {
-  const saved = await env.OAUTH_TOKEN_STORE.get(TRIP_REGISTRY_KEY);
-  let trips: TripConfig[] = [];
-  if (saved) {
-    try { trips = JSON.parse(saved) as TripConfig[]; } catch { trips = []; }
-  }
-  const southIsland = trips.find((trip) => trip.id === "nz-south-island");
-  if (southIsland) {
-    // This is the workbook explicitly confirmed by the user. Avoid stale KV trip IDs
-    // silently sending itinerary/checklist/expenses to a different spreadsheet.
-    southIsland.sheetId = SOUTH_ISLAND_SHEET_ID;
-    southIsland.itineraryTab = "FINAL ITINERARY";
-  } else {
-    trips.unshift({ id: "nz-south-island", name: "New Zealand — South Island", sheetId: SOUTH_ISLAND_SHEET_ID, itineraryTab: "FINAL ITINERARY" });
-  }
-  return trips;
-}
-
-async function resolveTrip(request: Request, env: Env, bodyTripId?: string): Promise<TripConfig | null> {
-  const url = new URL(request.url);
-  const tripId = (url.searchParams.get("tripId") || bodyTripId || "nz-south-island").trim();
-  const trips = await getTripRegistry(env);
-  return trips.find((trip) => trip.id === tripId) || null;
-}
-
-async function googleAccessToken(session: SessionPayload, env: Env): Promise<string> {
-  if (!env.GOOGLE_CLIENT_ID || !env.GOOGLE_CLIENT_SECRET || !env.TOKEN_ENCRYPTION_KEY || !env.OAUTH_TOKEN_STORE) {
-    throw new Error("Google Sheets is not configured.");
-  }
-  const encrypted = await env.OAUTH_TOKEN_STORE.get(`google-refresh:${session.email.toLowerCase()}`);
-  if (!encrypted) throw new Error("Google Sheets is not connected. Reconnect Google Sheets.");
-  const refreshToken = await decryptToken(encrypted, env.TOKEN_ENCRYPTION_KEY);
-  const response = await fetch("https://oauth2.googleapis.com/token", {
-    method: "POST",
-    headers: { "Content-Type": "application/x-www-form-urlencoded" },
-    body: new URLSearchParams({ client_id: env.GOOGLE_CLIENT_ID, client_secret: env.GOOGLE_CLIENT_SECRET, refresh_token: refreshToken, grant_type: "refresh_token" }).toString(),
+function App() {
+  const [authMessage, setAuthMessage] = useState("");
+  const [isVerifying, setIsVerifying] = useState(false);
+  const [verifiedEmail, setVerifiedEmail] = useState("");
+  const [itineraryRows, setItineraryRows] = useState<ItineraryRow[]>([]);
+  const [supplementaryTabs, setSupplementaryTabs] = useState<Record<string, string[][]>>({});
+  const [isLoadingItinerary, setIsLoadingItinerary] = useState(false);
+  const [itineraryError, setItineraryError] = useState("");
+  const [showDriveAccessModal, setShowDriveAccessModal] = useState(false);
+  const [refreshKey, setRefreshKey] = useState(0);
+  const [activeDayIndex, setActiveDayIndex] = useState(0);
+  const [activeView, setActiveViewState] = useState<ViewName>(() => {
+    try {
+      const saved = window.sessionStorage.getItem("campervan-active-view");
+      return saved && ["home", "checklist", "companion", "itinerary", "expenses", "memories", "map", "documents"].includes(saved) ? saved as ViewName : "home";
+    } catch { return "home"; }
   });
-  if (!response.ok) throw new Error("Google access failed. Reconnect Google Sheets.");
-  const data = await response.json() as { access_token?: string };
-  if (!data.access_token) throw new Error("Google returned no access token.");
-  return data.access_token;
-}
-
-function quoteSheetTab(tab: string): string { return `'${tab.replace(/'/g, "''")}'`; }
-function sheetsValuesUrl(sheetId: string, range: string): string {
-  return `https://sheets.googleapis.com/v4/spreadsheets/${encodeURIComponent(sheetId)}/values/${encodeURIComponent(range)}`;
-}
-
-async function ensureSheetTab(accessToken: string, sheetId: string, tabName: string, headers: string[]): Promise<void> {
-  const metadataResponse = await fetch(`https://sheets.googleapis.com/v4/spreadsheets/${encodeURIComponent(sheetId)}?fields=sheets(properties(title))`, { headers: { Authorization: `Bearer ${accessToken}` } });
-  if (!metadataResponse.ok) throw new Error("Could not inspect the selected Google Sheet. Check access and the spreadsheet ID.");
-  const metadata = await metadataResponse.json() as { sheets?: Array<{ properties?: { title?: string } }> };
-  const exists = (metadata.sheets || []).some((sheet) => sheet.properties?.title === tabName);
-  if (!exists) {
-    const addResponse = await fetch(`https://sheets.googleapis.com/v4/spreadsheets/${encodeURIComponent(sheetId)}:batchUpdate`, {
-      method: "POST", headers: { Authorization: `Bearer ${accessToken}`, "Content-Type": "application/json" },
-      body: JSON.stringify({ requests: [{ addSheet: { properties: { title: tabName } } }] }),
-    });
-    if (!addResponse.ok) {
-      const detail = await addResponse.text().catch(() => "");
-      throw new Error(`Could not create the ${tabName} tab in Google Sheets (HTTP ${addResponse.status}). ${detail.slice(0, 500)}`);
-    }
-  }
-  const range = `${quoteSheetTab(tabName)}!A1:${String.fromCharCode(64 + headers.length)}1`;
-  const readResponse = await fetch(sheetsValuesUrl(sheetId, range), { headers: { Authorization: `Bearer ${accessToken}` } });
-  if (!readResponse.ok) throw new Error(`Could not read the ${tabName} tab.`);
-  const existing = await readResponse.json() as { values?: unknown[][] };
-  if (!existing.values?.[0]?.some((cell) => String(cell ?? "").trim())) {
-    const writeResponse = await fetch(`${sheetsValuesUrl(sheetId, range)}?valueInputOption=RAW`, {
-      method: "PUT", headers: { Authorization: `Bearer ${accessToken}`, "Content-Type": "application/json" }, body: JSON.stringify({ values: [headers] }),
-    });
-    if (!writeResponse.ok) throw new Error(`Could not initialise the ${tabName} headers.`);
-  }
-}
-
-async function findExistingTab(accessToken: string, sheetId: string, candidates: string[], fallback: string): Promise<string> {
-  const response = await fetch(`https://sheets.googleapis.com/v4/spreadsheets/${encodeURIComponent(sheetId)}?fields=sheets(properties(title))`, { headers: { Authorization: `Bearer ${accessToken}` } });
-  if (!response.ok) return fallback;
-  const data = await response.json() as { sheets?: Array<{ properties?: { title?: string } }> };
-  const names = (data.sheets || []).map((sheet) => sheet.properties?.title || "");
-  const exact = candidates.find((candidate) => names.includes(candidate));
-  if (exact) return exact;
-  const normalizeTab = (value: string) => value.toLowerCase().replace(/[^a-z0-9]/g, "");
-  const normalizedMatch = names.find((name) => candidates.some((candidate) => normalizeTab(name) === normalizeTab(candidate)));
-  return normalizedMatch || fallback;
-}
-
-async function readSheetRows(accessToken: string, sheetId: string, tabName: string): Promise<string[][]> {
-  const response = await fetch(sheetsValuesUrl(sheetId, `${quoteSheetTab(tabName)}!A:Z`), { headers: { Authorization: `Bearer ${accessToken}` } });
-  if (!response.ok) throw new Error(`Could not read the ${tabName} tab. Check the tab name and Google Sheets access.`);
-  const data = await response.json() as { values?: unknown[][] };
-  return (data.values || []).map((row) => row.map((cell) => String(cell ?? "")));
-}
-
-
-async function uploadSharedMemoryPhoto(accessToken: string, photo: { name?: unknown; mime_type?: unknown; data_base64?: unknown }, maxBytes = 4 * 1024 * 1024): Promise<{ id: string; url: string }> {
-  const name = typeof photo.name === "string" ? photo.name.replace(/[^a-zA-Z0-9._-]/g, "_").slice(0, 120) : "travel-memory.jpg";
-  const mimeType = typeof photo.mime_type === "string" && /^image\/(jpeg|png|webp|gif|heic|heif)$/.test(photo.mime_type) ? photo.mime_type : "";
-  const encoded = typeof photo.data_base64 === "string" ? photo.data_base64.replace(/^data:image\/[^;]+;base64,/, "") : "";
-  if (!mimeType || !encoded) throw new Error("A selected photo has an unsupported image format.");
-  const binary = atob(encoded);
-  if (binary.length > maxBytes) throw new Error(`Each photo must be ${Math.floor(maxBytes / (1024 * 1024))} MB or smaller.`);
-  const bytes = new Uint8Array(binary.length);
-  for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
-  const form = new FormData();
-  form.append("metadata", new Blob([JSON.stringify({ name, mimeType, parents: [TRIP_MEMORY_FOLDER_ID], description: "Shared campervan travel memory" })], { type: "application/json" }));
-  form.append("file", new Blob([bytes], { type: mimeType }), name);
-  const upload = await fetch("https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart&fields=id,name,mimeType,webViewLink", {
-    method: "POST", headers: { Authorization: `Bearer ${accessToken}` }, body: form,
+  const [selectedTripId, setSelectedTripId] = useState(() => {
+    try { return window.sessionStorage.getItem("campervan-selected-trip") || ""; }
+    catch { return ""; }
   });
-  if (!upload.ok) {
-    const detail = (await upload.text().catch(() => "")).slice(0, 400);
-    if (upload.status === 401 || /insufficient authentication scopes/i.test(detail)) {
-      throw new Error(`Google Drive authorization is missing the required upload scope (HTTP ${upload.status}). Reconnect Google access once to approve Drive permissions. ${detail}`);
+  const [viewHistory, setViewHistory] = useState<ViewName[]>([]);
+  const [showAddTripInfo, setShowAddTripInfo] = useState(false);
+  const [trips, setTrips] = useState<TripConfigSummary[]>([]);
+  const [tripNameDraft, setTripNameDraft] = useState("");
+  const [tripSheetIdDraft, setTripSheetIdDraft] = useState("");
+  const [tripTabDraft, setTripTabDraft] = useState("FINAL ITINERARY");
+  const [tripMessage, setTripMessage] = useState("");
+  const [tripSaving, setTripSaving] = useState(false);
+  const [highlightPhoto, setHighlightPhoto] = useState<{ id: string; url: string; date?: string } | null>(null);
+  const [highlightPhotoSaving, setHighlightPhotoSaving] = useState(false);
+  const [highlightPhotoMessage, setHighlightPhotoMessage] = useState("");
+  const [nearbyPlacesUrl, setNearbyPlacesUrl] = useState("");
+  const [nearbyPlaces, setNearbyPlaces] = useState<Array<{ id: string; name: string; kind: string; lat: number; lon: number }>>([]);
+  const [nearbyPlacesMessage, setNearbyPlacesMessage] = useState("");
+  const [showHighlightPhoto, setShowHighlightPhoto] = useState(() => {
+    try { return typeof window === "undefined" || window.localStorage.getItem("campervan-show-highlight-photo") !== "false"; }
+    catch { return true; }
+  });
+  const [dataSaverMode, setDataSaverMode] = useState(() => {
+    try { return typeof window !== "undefined" && window.localStorage.getItem("campervan-data-saver") === "true"; }
+    catch { return false; }
+  });
+
+  useEffect(() => {
+    try { window.localStorage.setItem("campervan-data-saver", String(dataSaverMode)); }
+    catch { /* Preference remains usable for this session if browser storage is unavailable. */ }
+  }, [dataSaverMode]);
+
+  useEffect(() => {
+    try { window.localStorage.setItem("campervan-show-highlight-photo", String(showHighlightPhoto)); }
+    catch { /* Preference remains usable for this session if browser storage is unavailable. */ }
+  }, [showHighlightPhoto]);
+
+  const setActiveView = (nextView: ViewName) => {
+    if (nextView === activeView) return;
+    setViewHistory((history) => [...history, activeView]);
+    setActiveViewState(nextView);
+    if (typeof window !== "undefined") {
+      window.history.pushState({ campervanView: nextView }, "");
     }
-    if (upload.status === 403 && /has not been used in project|is disabled|enable.*drive\.googleapis\.com/i.test(detail)) throw new Error(`Google Drive API is disabled for Google Cloud project 269076730966. Enable it at https://console.developers.google.com/apis/api/drive.googleapis.com/overview?project=269076730966, wait a few minutes, then retry. ${detail}`);
-    if (upload.status === 403) throw new Error(`Google Drive denied access to the photo folder. Confirm the connected Google account can add files to folder ${TRIP_MEMORY_FOLDER_ID} and that the Drive API is enabled. ${detail}`);
-    if (upload.status === 404) throw new Error(`The configured trip-photo folder could not be found or accessed (${TRIP_MEMORY_FOLDER_ID}). ${detail}`);
-    throw new Error(`Google Drive could not upload the selected photo (HTTP ${upload.status}). ${detail}`);
-  }
-  const file = await upload.json() as { id?: string; webViewLink?: string };
-  if (!file.id) throw new Error("Google Drive did not return a photo ID.");
-  // Files inherit access from the destination folder. Avoid a second per-file
-  // permission call, which can fail under Workspace sharing policies and used
-  // to trigger the reconnect loop (and delete the successfully uploaded photo).
-  return { id: file.id, url: file.webViewLink || `https://drive.google.com/uc?export=view&id=${encodeURIComponent(file.id)}` };
-}
+  };
 
-export default {
-  async fetch(request: Request, env: Env): Promise<Response> {
-    const url = new URL(request.url);
-
-    // Health check
-    if (
-      request.method === "GET" &&
-      url.pathname === "/api/health"
-    ) {
-      return jsonResponse({
-        success: true,
-        service: "campervan-auth-test",
-      });
+  const goBack = () => {
+    if (viewHistory.length === 0) {
+      goToDashboard();
+      return;
     }
+    setActiveViewState(viewHistory[viewHistory.length - 1]);
+    setViewHistory(viewHistory.slice(0, -1));
+  };
 
-    // Google ID token verification and session creation
-    if (
-      url.pathname === "/api/auth/google" &&
-      request.method === "POST"
-    ) {
-      if (!env.GOOGLE_CLIENT_ID) {
-        return jsonResponse(
-          { error: "Google Client ID is not configured" },
-          500,
-        );
+  const goToDashboard = () => {
+    setViewHistory([]);
+    setActiveViewState("home");
+  };
+
+  useEffect(() => {
+    const handlePopState = () => {
+      if (viewHistory.length === 0) {
+        setActiveViewState("home");
+        return;
       }
+      setActiveViewState(viewHistory[viewHistory.length - 1]);
+      setViewHistory(viewHistory.slice(0, -1));
+    };
+    window.addEventListener("popstate", handlePopState);
+    return () => window.removeEventListener("popstate", handlePopState);
+  }, [viewHistory]);
 
-      if (!env.APPROVED_EMAILS) {
-        return jsonResponse(
-          { error: "Preview diagnostic: APPROVED_EMAILS missing" },
-          500,
-        );
+  const returnToTripSelection = () => {
+    setSelectedTripId("");
+    setViewHistory([]);
+    setActiveViewState("home");
+    setItineraryRows([]);
+    setSupplementaryTabs({});
+    setActiveDayIndex(0);
+  };
+  const [checklistItems, setChecklistItems] = useState<ChecklistItem[]>([]);
+  const [checklistCategoryIndex, setChecklistCategoryIndex] = useState(0);
+  const [checklistTab, setChecklistTab] = useState<"before" | "grocery">("before");
+  const [checklistMessage, setChecklistMessage] = useState("");
+  const [checklistSavingId, setChecklistSavingId] = useState("");
+  const [checklistTouchStart, setChecklistTouchStart] = useState<{ x: number; y: number } | null>(null);
+  const checklistLongPressTimer = useRef<number | null>(null);
+  const [showChecklistAddModal, setShowChecklistAddModal] = useState(false);
+  const [newChecklistType, setNewChecklistType] = useState<"BEFORE_DEPARTURE" | "GROCERY">("BEFORE_DEPARTURE");
+  const [newChecklistCategory, setNewChecklistCategory] = useState("");
+  const [newChecklistItem, setNewChecklistItem] = useState("");
+  const [newChecklistQuantity, setNewChecklistQuantity] = useState("");
+  const [newChecklistNotes, setNewChecklistNotes] = useState("");
+  const [expenses, setExpenses] = useState<TripExpense[]>([]);
+  const [expenseMessage, setExpenseMessage] = useState("");
+  const [expenseSaving, setExpenseSaving] = useState(false);
+  const [editingExpenseId, setEditingExpenseId] = useState("");
+  const [expenseDate, setExpenseDate] = useState(() => new Date().toISOString().slice(0, 10));
+  const [expenseType, setExpenseType] = useState<"pre-trip" | "actual-trip">(() => new Date().toISOString().slice(0, 10) >= "2026-11-07" ? "actual-trip" : "pre-trip");
+  const [expenseTab, setExpenseTab] = useState<"pre-trip" | "actual-trip" | "personal">("pre-trip");
+  const [expenseShareType, setExpenseShareType] = useState<"shared" | "personal">("shared");
+  const [expenseLatitude, setExpenseLatitude] = useState("");
+  const [expenseLongitude, setExpenseLongitude] = useState("");
+  const [expenseLocation, setExpenseLocation] = useState("");
+  const [isDetectingExpenseLocation, setIsDetectingExpenseLocation] = useState(false);
+  const [expenseDescription, setExpenseDescription] = useState("");
+  const [expenseCategory, setExpenseCategory] = useState("Other");
+  const [expenseAmount, setExpenseAmount] = useState("");
+  const [expenseCurrency, setExpenseCurrency] = useState("NZD");
+  const [expensePaidBy, setExpensePaidBy] = useState("Ralph");
+  const [expenseNotes, setExpenseNotes] = useState("");
+  const [memories, setMemories] = useState<TripMemory[]>([]);
+  const [tripDocuments, setTripDocuments] = useState<TripDocument[]>([]);
+  const [documentsMessage, setDocumentsMessage] = useState("");
+  const [selectedMemoryPhoto, setSelectedMemoryPhoto] = useState<{ id: string; attraction: string; trip_date: string; memory_id: string } | null>(null);
+  const [memoryInteractions, setMemoryInteractions] = useState<MemoryInteraction[]>([]);
+  const [memoryCommentDraft, setMemoryCommentDraft] = useState("");
+  const [memoryInteractionSaving, setMemoryInteractionSaving] = useState(false);
+  const [memoryInteractionMessage, setMemoryInteractionMessage] = useState("");
+  const [photoTouchStart, setPhotoTouchStart] = useState<{ x: number; y: number } | null>(null);
+  const [memoryAttraction, setMemoryAttraction] = useState(() => {
+    try { return window.sessionStorage.getItem("campervan-memory-attraction") || ""; }
+    catch { return ""; }
+  });
+  const [memoryContent, setMemoryContent] = useState(() => {
+    try { return window.sessionStorage.getItem("campervan-memory-content") || ""; }
+    catch { return ""; }
+  });
+  const [memoryDate, setMemoryDate] = useState(() => formatMemoryDate(new Date()));
+  const [memoryPreviewOpen, setMemoryPreviewOpen] = useState(() => {
+    try { return window.sessionStorage.getItem("campervan-memory-preview") === "true"; }
+    catch { return false; }
+  });
+  const [isSavingMemory, setIsSavingMemory] = useState(false);
+  const [memoryMessage, setMemoryMessage] = useState("");
+  const [locationDrafts, setLocationDrafts] = useState<Record<string, string>>({});
+  const [locationSaving, setLocationSaving] = useState<string>("");
+  const [locationMessage, setLocationMessage] = useState("");
+  const [locationModalSession, setLocationModalSession] = useState<string | null>(null);
+  const [memoryPhotoFiles, setMemoryPhotoFiles] = useState<File[]>([]);
+  const [isDetectingPlace, setIsDetectingPlace] = useState(false);
+  const [touchStart, setTouchStart] = useState<{ x: number; y: number } | null>(null);
+
+  // Preserve the selected trip and internal page across refresh and Google OAuth redirects.
+  useEffect(() => {
+    try {
+      if (selectedTripId) window.sessionStorage.setItem("campervan-selected-trip", selectedTripId);
+      else window.sessionStorage.removeItem("campervan-selected-trip");
+    } catch { /* Session persistence is best-effort. */ }
+  }, [selectedTripId]);
+  useEffect(() => {
+    try { window.sessionStorage.setItem("campervan-active-view", activeView); }
+    catch { /* Session persistence is best-effort. */ }
+  }, [activeView]);
+  useEffect(() => {
+    try {
+      window.sessionStorage.setItem("campervan-memory-attraction", memoryAttraction);
+      window.sessionStorage.setItem("campervan-memory-content", memoryContent);
+      window.sessionStorage.setItem("campervan-memory-preview", String(memoryPreviewOpen));
+    } catch { /* Draft persistence is best-effort. */ }
+  }, [memoryAttraction, memoryContent, memoryPreviewOpen]);
+  useEffect(() => {
+    try {
+      if (window.sessionStorage.getItem("campervan-drive-reconnect-pending") === "1") {
+        window.sessionStorage.removeItem("campervan-drive-reconnect-pending");
+        setShowDriveAccessModal(false);
+        setMemoryMessage("Google access was refreshed. Please select the photo again, then tap Confirm & save. Your memory text has been kept.");
       }
+    } catch { /* Ignore unavailable session storage. */ }
+  }, []);
 
-      if (!env.SESSION_SECRET) {
-        return jsonResponse(
-          { error: "Preview diagnostic: SESSION_SECRET missing" },
-          500,
-        );
-      }
-
-      if (env.SESSION_SECRET.length < 32) {
-        return jsonResponse(
-          { error: "Preview diagnostic: SESSION_SECRET too short" },
-          500,
-        );
-      }
-
-      let body: { credential?: unknown };
-
+  useEffect(() => {
+    let cancelled = false;
+    async function restoreSession() {
       try {
-        body = await request.json() as { credential?: unknown };
-      } catch {
-        return jsonResponse(
-          { error: "Invalid JSON body" },
-          400,
-        );
-      }
-
-      if (
-        typeof body.credential !== "string" ||
-        body.credential.length < 20 ||
-        body.credential.length > 10000
-      ) {
-        return jsonResponse(
-          { error: "Google ID token required" },
-          401,
-        );
-      }
-
-      let tokenResponse: Response;
-
-      try {
-        tokenResponse = await fetch(
-          "https://oauth2.googleapis.com/tokeninfo?id_token=" +
-            encodeURIComponent(body.credential),
-        );
-      } catch {
-        return jsonResponse(
-          { error: "Token verification unavailable" },
-          502,
-        );
-      }
-
-      if (!tokenResponse.ok) {
-        return jsonResponse(
-          { error: "Invalid or expired Google ID token" },
-          401,
-        );
-      }
-
-      let token: GoogleTokenInfo;
-
-      try {
-        token = await tokenResponse.json() as GoogleTokenInfo;
-      } catch {
-        return jsonResponse(
-          { error: "Invalid token response" },
-          502,
-        );
-      }
-
-      const validIssuer =
-        token.iss === "accounts.google.com" ||
-        token.iss === "https://accounts.google.com";
-
-      const expiresAt = Number(token.exp);
-
-      if (
-        token.aud !== env.GOOGLE_CLIENT_ID ||
-        !token.sub ||
-        !token.email ||
-        token.email_verified !== "true" ||
-        !validIssuer ||
-        !Number.isFinite(expiresAt) ||
-        expiresAt <= Math.floor(Date.now() / 1000)
-      ) {
-        return jsonResponse(
-          { error: "Google identity validation failed" },
-          401,
-        );
-      }
-
-      const email = token.email.trim().toLowerCase();
-      console.log("Trip access diagnostic:", {
-        approvedEmailsConfigured: Boolean(env.APPROVED_EMAILS),
-        approvedEmailCount: env.APPROVED_EMAILS
-         ? env.APPROVED_EMAILS.split(",").filter((item) => item.trim()).length
-         : 0,
-        verifiedEmailMatches: isApprovedEmail(email, env),
-      });
-
-      if (!isApprovedEmail(email, env)) {
-        return jsonResponse(
-          {
-            success: false,
-            error: "This Google account is not approved for trip access.",
-          },
-          403,
-        );
-      }
-
-      try {
-        const sessionToken = await createSessionToken(
-          {
-            email,
-            googleId: token.sub,
-            exp: Math.floor(Date.now() / 1000) + 8 * 60 * 60,
-          },
-          env.SESSION_SECRET,
-        );
-
-        const response = jsonResponse({
-          success: true,
-          user: {
-            googleId: token.sub,
-            email,
-          },
-          message: "Google identity verified. Trip access granted.",
+        const response = await fetch("/api/auth/session", {
+          method: "GET",
+          credentials: "same-origin",
+          cache: "no-store",
         });
-
-        response.headers.append(
-          "Set-Cookie",
-          `m3_session=${sessionToken}; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=28800`,
-        );
-
-        return response;
-      } catch {
-        return jsonResponse(
-          { error: "Failed to create authenticated session" },
-          500,
-        );
+        if (!response.ok) return;
+        const result = (await response.json()) as ApiResponse;
+        if (!cancelled && result.success && result.user?.email) {
+          setVerifiedEmail(result.user.email);
+          setAuthMessage("Existing session restored.");
+        }
+      } catch (error) {
+        console.error("Session restoration failed:", error);
       }
     }
+    void restoreSession();
+    return () => { cancelled = true; };
+  }, []);
 
-    // Check whether the current browser has a valid session
-    if (
-      url.pathname === "/api/auth/session" &&
-      request.method === "GET"
-    ) {
-      const session = await readSession(request, env);
+  useEffect(() => {
+    const clientId = import.meta.env.VITE_GOOGLE_CLIENT_ID as string | undefined;
+    if (!clientId) {
+      setAuthMessage("Google sign-in configuration is missing.");
+      return;
+    }
 
-      if (!session) {
-        return jsonResponse(
-          {
-            success: false,
-            error: "Authentication required",
-          },
-          401,
-        );
+    let attempts = 0;
+    let timer: ReturnType<typeof setInterval> | undefined;
+    const setupGoogleSignIn = () => {
+      if (!window.google?.accounts.id) {
+        attempts += 1;
+        if (attempts >= 20 && timer) clearInterval(timer);
+        return;
       }
-
-      return jsonResponse({
-        success: true,
-        user: {
-          email: session.email,
-          googleId: session.googleId,
+      if (timer) clearInterval(timer);
+      const button = document.getElementById("google-sign-in-button");
+      if (!button) return;
+      button.replaceChildren();
+      window.google.accounts.id.initialize({
+        client_id: clientId,
+        callback: async (response) => {
+          setAuthMessage("Verifying Google account…");
+          setIsVerifying(true);
+          try {
+            const result = await fetch("/api/auth/google", {
+              method: "POST",
+              credentials: "same-origin",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ credential: response.credential }),
+            });
+            const data = (await result.json()) as ApiResponse;
+            if (!result.ok || !data.success || !data.user?.email) {
+              throw new Error(data.error || "Google verification failed.");
+            }
+            setVerifiedEmail(data.user.email);
+            setAuthMessage("Google identity verified. Loading trip selection…");
+          } catch (error) {
+            setAuthMessage(error instanceof Error ? error.message : "Google verification failed. Please try again.");
+          } finally {
+            setIsVerifying(false);
+          }
         },
       });
-    }
-    
-    // Start Google Sheets OAuth authorization
-    if (
-      url.pathname === "/api/sheets/connect" &&
-      request.method === "GET"
-    ) {
-      const session = await readSession(request, env);
+      window.google.accounts.id.renderButton(button, { theme: "outline", size: "large", text: "signin_with" });
+    };
 
-      if (!session) {
-        return jsonResponse(
-          { success: false, error: "Authentication required" },
-          401,
-        );
-      }
+    setupGoogleSignIn();
+    if (!window.google?.accounts.id) timer = setInterval(setupGoogleSignIn, 500);
+    return () => { if (timer) clearInterval(timer); };
+  }, []);
 
-      if (
-        !env.GOOGLE_CLIENT_ID ||
-        !env.GOOGLE_CLIENT_SECRET ||
-        !env.SESSION_SECRET ||
-        !env.OAUTH_TOKEN_STORE ||
-        !env.TOKEN_ENCRYPTION_KEY
-      ) {
-        return jsonResponse(
-          { error: "Google Sheets OAuth is not fully configured" },
-          500,
-        );
-      }
-
+  useEffect(() => {
+    if (!verifiedEmail) return;
+    let cancelled = false;
+    async function loadTrips() {
       try {
-        const { state, nonce } = await createOAuthState(
-          session.email,
-          env.SESSION_SECRET,
-        );
-
-        await env.OAUTH_TOKEN_STORE.put(
-          `oauth-state:${nonce}`,
-          session.email,
-          { expirationTtl: 600 },
-        );
-
-        const callbackUrl = `${url.origin}/api/sheets/callback`;
-        const googleUrl = new URL(
-          "https://accounts.google.com/o/oauth2/v2/auth",
-        );
-
-        googleUrl.searchParams.set("client_id", env.GOOGLE_CLIENT_ID);
-        googleUrl.searchParams.set("redirect_uri", callbackUrl);
-        googleUrl.searchParams.set("response_type", "code");
-        googleUrl.searchParams.set(
-          "scope",
-          "https://www.googleapis.com/auth/spreadsheets https://www.googleapis.com/auth/drive",
-        );
-        googleUrl.searchParams.set("access_type", "offline");
-        googleUrl.searchParams.set("prompt", "consent");
-        googleUrl.searchParams.set("state", state);
-
-        return new Response(null, {
-          status: 302,
-          headers: {
-            Location: googleUrl.toString(),
-            "Cache-Control": "no-store",
-            "Set-Cookie":
-              `m3_oauth_state=${nonce}; Path=/api/sheets/callback; ` +
-              "HttpOnly; Secure; SameSite=Lax; Max-Age=600",
-          },
-        });
-      } catch {
-        return jsonResponse(
-          { error: "Could not start Google Sheets authorization" },
-          500,
-        );
+        const response = await fetch("/api/trips", { credentials: "same-origin", cache: "no-store" });
+        const result = await response.json() as ApiResponse;
+        if (!response.ok || !result.success) throw new Error(result.error || "Could not load trips.");
+        if (!cancelled) setTrips(Array.isArray(result.trips) ? result.trips : []);
+      } catch (error) {
+        if (!cancelled) setTripMessage(error instanceof Error ? error.message : "Could not load trips.");
       }
     }
+    void loadTrips();
+    return () => { cancelled = true; };
+  }, [verifiedEmail]);
 
-    // Complete Google Sheets OAuth authorization
-    if (
-      url.pathname === "/api/sheets/callback" &&
-      request.method === "GET"
-    ) {
-      const session = await readSession(request, env);
-      const state = url.searchParams.get("state");
-      const code = url.searchParams.get("code");
-      const oauthError = url.searchParams.get("error");
-      const nonceCookie = getCookie(request, "m3_oauth_state");
+  const addTrip = async (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    setTripSaving(true); setTripMessage("");
+    try {
+      const response = await fetch("/api/trips", { method: "POST", credentials: "same-origin", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ name: tripNameDraft.trim(), sheetId: tripSheetIdDraft.trim(), itineraryTab: tripTabDraft.trim() || "FINAL ITINERARY" }) });
+      const result = await response.json() as ApiResponse;
+      if (!response.ok || !result.success || !result.trip) throw new Error(result.error || "Could not add this trip.");
+      setTrips((current) => [...current, result.trip as TripConfigSummary]);
+      setTripNameDraft(""); setTripSheetIdDraft(""); setTripTabDraft("FINAL ITINERARY"); setShowAddTripInfo(false);
+      setTripMessage("Trip connected successfully.");
+    } catch (error) { setTripMessage(error instanceof Error ? error.message : "Could not add this trip."); }
+    finally { setTripSaving(false); }
+  };
 
-      const clearStateCookie =
-        "m3_oauth_state=; Path=/api/sheets/callback; " +
-        "HttpOnly; Secure; SameSite=Lax; Max-Age=0";
-
-      if (oauthError) {
-        return new Response(
-          "Google Sheets authorization was cancelled or denied. You may return to the app and try again.",
-          {
-            status: 400,
-            headers: {
-              "Cache-Control": "no-store",
-              "Set-Cookie": clearStateCookie,
-            },
-          },
-        );
-      }
-
-      if (!session || !state || !code || !nonceCookie) {
-        return new Response(
-          "Authorization failed. Please sign in again and retry.",
-          {
-            status: 401,
-            headers: {
-              "Cache-Control": "no-store",
-              "Set-Cookie": clearStateCookie,
-            },
-          },
-        );
-      }
-
-      if (
-        !env.GOOGLE_CLIENT_ID ||
-        !env.GOOGLE_CLIENT_SECRET ||
-        !env.SESSION_SECRET ||
-        !env.TOKEN_ENCRYPTION_KEY ||
-        !env.OAUTH_TOKEN_STORE
-      ) {
-        return new Response("OAuth configuration is incomplete.", {
-          status: 500,
-          headers: {
-            "Cache-Control": "no-store",
-            "Set-Cookie": clearStateCookie,
-          },
-        });
-      }
-
+  useEffect(() => {
+    if (!verifiedEmail || !selectedTripId) return;
+    let cancelled = false;
+    async function loadItinerary() {
+      setIsLoadingItinerary(true);
+      setItineraryError("");
       try {
-        const verifiedState = await verifyOAuthState(
-          state,
-          env.SESSION_SECRET,
-        );
-
-        if (
-          !verifiedState ||
-          verifiedState.email !== session.email ||
-          verifiedState.nonce !== nonceCookie
-        ) {
-          return new Response(
-            "Invalid or expired authorization state. Please retry.",
-            {
-              status: 400,
-              headers: {
-                "Cache-Control": "no-store",
-                "Set-Cookie": clearStateCookie,
-              },
-            },
-          );
-        }
-
-        const stateKey = `oauth-state:${verifiedState.nonce}`;
-        const storedEmail = await env.OAUTH_TOKEN_STORE.get(stateKey);
-
-        if (
-          !storedEmail ||
-          storedEmail.toLowerCase() !== session.email.toLowerCase()
-        ) {
-          return new Response(
-            "Authorization state has expired or already been used. Please retry.",
-            {
-              status: 400,
-              headers: {
-                "Cache-Control": "no-store",
-                "Set-Cookie": clearStateCookie,
-              },
-            },
-          );
-        }
-
-        // Consume the state record before exchanging the authorization code.
-        await env.OAUTH_TOKEN_STORE.delete(stateKey);
-
-        const callbackUrl = `${url.origin}/api/sheets/callback`;
-        const form = new URLSearchParams({
-          code,
-          client_id: env.GOOGLE_CLIENT_ID,
-          client_secret: env.GOOGLE_CLIENT_SECRET,
-          redirect_uri: callbackUrl,
-          grant_type: "authorization_code",
+        const response = await fetch(`/api/itinerary?tripId=${encodeURIComponent(selectedTripId)}&lite=${dataSaverMode ? "1" : "0"}`, {
+          method: "GET",
+          credentials: "same-origin",
+          cache: "no-store",
         });
-
-        const tokenResponse = await fetch(
-          "https://oauth2.googleapis.com/token",
-          {
-            method: "POST",
-            headers: {
-              "Content-Type": "application/x-www-form-urlencoded",
-            },
-            body: form.toString(),
-          },
-        );
-
-        if (!tokenResponse.ok) {
-          return new Response(
-            "Google could not complete authorization. Please retry.",
-            {
-              status: 502,
-              headers: {
-                "Cache-Control": "no-store",
-                "Set-Cookie": clearStateCookie,
-              },
-            },
-          );
-        }
-
-        const tokens =
-          (await tokenResponse.json()) as GoogleOAuthTokenResponse;
-
-        if (!tokens.refresh_token) {
-          return new Response(
-            "Google did not return a refresh token. Revoke this app's access in your Google Account and try connecting again.",
-            {
-              status: 400,
-              headers: {
-                "Cache-Control": "no-store",
-                "Set-Cookie": clearStateCookie,
-              },
-            },
-          );
-        }
-
-        const encryptedToken = await encryptToken(
-          tokens.refresh_token,
-          env.TOKEN_ENCRYPTION_KEY,
-        );
-
-        await env.OAUTH_TOKEN_STORE.put(
-          `google-refresh:${session.email.toLowerCase()}`,
-          encryptedToken,
-        );
-
-        return new Response(null, {
-          status: 302,
-          headers: {
-            Location: `${url.origin}/?sheets=connected`,
-            "Cache-Control": "no-store",
-            "Set-Cookie": clearStateCookie,
-          },
-        });
-      } catch {
-        return new Response(
-          "An unexpected error occurred during Google authorization.",
-          {
-            status: 500,
-            headers: {
-              "Cache-Control": "no-store",
-              "Set-Cookie": clearStateCookie,
-            },
-          },
-        );
-      }
-    }
-
-    
-
-    // Shared trip registry. A trip stores its own spreadsheet destination.
-    if (url.pathname === "/api/trips" && (request.method === "GET" || request.method === "POST")) {
-      const session = await readSession(request, env);
-      if (!session) return jsonResponse({ success: false, error: "Authentication required." }, 401);
-      if (request.method === "POST" && request.headers.get("Origin") !== url.origin) return jsonResponse({ success: false, error: "Invalid request origin." }, 403);
-      try {
-        const trips = await getTripRegistry(env);
-        if (request.method === "GET") return jsonResponse({ success: true, trips: trips.map(({ id, name, itineraryTab }) => ({ id, name, itineraryTab })) });
-        const body = await request.json() as { name?: unknown; sheetId?: unknown; itineraryTab?: unknown };
-        const name = typeof body.name === "string" ? body.name.trim() : "";
-        const sheetId = typeof body.sheetId === "string" ? body.sheetId.trim() : "";
-        const itineraryTab = typeof body.itineraryTab === "string" && body.itineraryTab.trim() ? body.itineraryTab.trim() : "FINAL ITINERARY";
-        if (name.length < 2 || name.length > 100 || !/^[A-Za-z0-9_-]{20,}$/.test(sheetId) || itineraryTab.length > 100) return jsonResponse({ success: false, error: "Enter a trip name and a valid Google Sheets spreadsheet ID." }, 400);
-        const accessToken = await googleAccessToken(session, env);
-        const check = await fetch(`https://sheets.googleapis.com/v4/spreadsheets/${encodeURIComponent(sheetId)}?fields=spreadsheetId,properties(title),sheets(properties(title))`, { headers: { Authorization: `Bearer ${accessToken}` } });
-        if (!check.ok) return jsonResponse({ success: false, error: "This Google Sheet could not be opened. Check its ID and share it with the signed-in Google account." }, 400);
-        const metadata = await check.json() as { spreadsheetId?: string; properties?: { title?: string }; sheets?: Array<{ properties?: { title?: string } }> };
-        if (!(metadata.sheets || []).some((sheet) => sheet.properties?.title === itineraryTab)) return jsonResponse({ success: false, error: `The sheet does not contain a tab named “${itineraryTab}”.` }, 400);
-        if (trips.some((trip) => trip.sheetId === sheetId)) return jsonResponse({ success: false, error: "This Google Sheet is already registered as a trip." }, 409);
-        const baseId = name.toLowerCase().normalize("NFKD").replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "").slice(0, 40) || "trip";
-        let id = baseId; let suffix = 2;
-        while (trips.some((trip) => trip.id === id)) id = `${baseId}-${suffix++}`;
-        const trip: TripConfig = { id, name, sheetId, itineraryTab, createdAt: new Date().toISOString() };
-        trips.push(trip);
-        await env.OAUTH_TOKEN_STORE.put(TRIP_REGISTRY_KEY, JSON.stringify(trips));
-        return jsonResponse({ success: true, trip: { id: trip.id, name: trip.name, itineraryTab: trip.itineraryTab } }, 201);
-      } catch (error) { return jsonResponse({ success: false, error: error instanceof Error ? error.message : "Could not manage trips." }, 500); }
-    }
-
-    // Shared trip expenses. Load both the existing FINAL EXPENSES planning rows
-    // and valid app-entered rows from TRIP EXPENSES. Never modify FINAL EXPENSES.
-    if (url.pathname === "/api/expenses" && (request.method === "GET" || request.method === "POST")) {
-      const session = await readSession(request, env);
-      if (!session) return jsonResponse({ success: false, error: "Authentication required." }, 401);
-      if (request.method === "POST" && request.headers.get("Origin") !== url.origin) return jsonResponse({ success: false, error: "Invalid request origin." }, 403);
-      try {
-        let body: Record<string, unknown> = {};
-        if (request.method === "POST") body = await request.json() as Record<string, unknown>;
-        const trip = await resolveTrip(request, env, typeof body.tripId === "string" ? body.tripId : undefined);
-        if (!trip) return jsonResponse({ success: false, error: "Select a valid trip first." }, 404);
-        const token = await googleAccessToken(session, env);
-        const tab = "TRIP EXPENSES";
-        if (request.method === "POST") {
-          await ensureSheetTab(token, trip.sheetId, tab, EXPENSE_HEADERS);
-          const extraHeaderRange = `${quoteSheetTab(tab)}!K1:N1`;
-          const extraHeaderRead = await fetch(sheetsValuesUrl(trip.sheetId, extraHeaderRange), { headers: { Authorization: `Bearer ${token}` } });
-          if (extraHeaderRead.ok) {
-            const extraHeaderData = await extraHeaderRead.json() as { values?: unknown[][] };
-            if (!(extraHeaderData.values?.[0] || []).some((cell) => String(cell ?? "").trim())) {
-              const extraHeaderWrite = await fetch(`${sheetsValuesUrl(trip.sheetId, extraHeaderRange)}?valueInputOption=RAW`, { method: "PUT", headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" }, body: JSON.stringify({ values: [["share_type", "latitude", "longitude", "location"]] }) });
-              if (!extraHeaderWrite.ok) throw new Error("Could not add the new expense metadata headers in columns K:N.");
-            }
+        const result = (await response.json()) as ApiResponse;
+        if (!response.ok || !result.success) {
+          if (!cancelled) {
+            setItineraryRows([]);
+            setItineraryError(result.error || `Could not load itinerary (HTTP ${response.status}).`);
           }
-          const legacyHeaderRead = await fetch(sheetsValuesUrl(trip.sheetId, `${quoteSheetTab(tab)}!O1`), { headers: { Authorization: `Bearer ${token}` } });
-          if (legacyHeaderRead.ok) {
-            const legacyHeaderData = await legacyHeaderRead.json() as { values?: unknown[][] };
-            if (!String(legacyHeaderData.values?.[0]?.[0] ?? "").trim()) {
-              const legacyHeaderWrite = await fetch(`${sheetsValuesUrl(trip.sheetId, `${quoteSheetTab(tab)}!O1`)}?valueInputOption=RAW`, { method: "PUT", headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" }, body: JSON.stringify({ values: [["legacy"]] }) });
-              if (!legacyHeaderWrite.ok) throw new Error("Could not add the legacy flag header in column O.");
-            }
-          }
+          return;
         }
-
-        if (request.method === "GET") {
-          const loggedExpenses: Array<Record<string, unknown>> = [];
-          const existingTab = await findExistingTab(token, trip.sheetId, [tab], "");
-          if (existingTab) {
-            const rows = await readSheetRows(token, trip.sheetId, existingTab);
-            const header = (rows[0] || []).map((cell) => cell.trim().toLowerCase());
-            const idx = (name: string) => header.indexOf(name);
-            const idIdx = idx("expense_id"), dateIdx = idx("date"), descIdx = idx("description");
-            const amountIdx = idx("amount"), currencyIdx = idx("currency"), paidByIdx = idx("paid_by");
-            const categoryIdx = idx("category"), notesIdx = idx("notes"), shareTypeIdx = idx("share_type"), latitudeIdx = idx("latitude"), longitudeIdx = idx("longitude"), locationIdx = idx("location"), legacyIdx = idx("legacy");
-            rows.slice(1).forEach((row, rowOffset) => {
-              const legacyFlag = legacyIdx >= 0 ? String(row[legacyIdx] ?? "").trim().toUpperCase() : "";
-              if (["TRUE", "YES", "LEGACY", "1", "X"].includes(legacyFlag)) return;
-              const expenseId = idIdx >= 0 ? String(row[idIdx] || "").trim() : "";
-              const description = descIdx >= 0 ? String(row[descIdx] || "").trim() : "";
-              const amountText = amountIdx >= 0 ? String(row[amountIdx] || "").replace(/,/g, "").replace(/[^0-9.-]/g, "") : "";
-              const amount = Number(amountText);
-              // Ignore partial/test rows: they are not usable expense records and
-              // otherwise appear as blank cards in the frontend.
-              if (!expenseId || !description || !Number.isFinite(amount) || amount <= 0) return;
-              const date = dateIdx >= 0 ? String(row[dateIdx] || "").trim() : "";
-              const inferredType = date >= "2026-11-07" ? "actual-trip" : "pre-trip";
-              loggedExpenses.push({
-                expense_id: expenseId,
-                date,
-                description,
-                category: categoryIdx >= 0 ? String(row[categoryIdx] || "Other") : "Other",
-                amount,
-                currency: currencyIdx >= 0 ? String(row[currencyIdx] || "NZD") : "NZD",
-                paid_by: paidByIdx >= 0 ? String(row[paidByIdx] || "Ralph") : "Ralph",
-                // Date is the source of truth for the trip boundary: before 7 Nov is
-                // pre-trip; 7 Nov onward is actual-trip, even if an old row has a stale type.
-                expense_type: inferredType,
-                share_type: shareTypeIdx >= 0 && String(row[shareTypeIdx] || "").toLowerCase() === "personal" ? "personal" : "shared",
-                split_share: shareTypeIdx >= 0 && String(row[shareTypeIdx] || "").toLowerCase() === "personal" ? amount : amount / 2,
-                latitude: latitudeIdx >= 0 ? String(row[latitudeIdx] || "") : "",
-                longitude: longitudeIdx >= 0 ? String(row[longitudeIdx] || "") : "",
-                location: locationIdx >= 0 ? String(row[locationIdx] || "") : "",
-                notes: notesIdx >= 0 ? String(row[notesIdx] || "") : "",
-                source: "TRIP EXPENSES",
-                sheet_row: rowOffset + 2,
-              });
-            });
-          }
-
-          const plannedExpenses: Array<Record<string, unknown>> = [];
-          const planningTab = await findExistingTab(token, trip.sheetId, ["FINAL EXPENSES", "Final Expenses"], "");
-          if (planningTab) {
-            const planningRows = await readSheetRows(token, trip.sheetId, planningTab);
-            let group = "Pre-trip";
-            for (let i = 0; i < planningRows.length; i++) {
-              const row = planningRows[i] || [];
-              const description = String(row[0] || "").trim();
-              const amountText = String(row[1] || "").replace(/,/g, "").replace(/[^0-9.-]/g, "");
-              const amount = Number(amountText);
-              const rowLabel = description.toLowerCase().replace(/[^a-z0-9]/g, "");
-              if (rowLabel === "total" || rowLabel === "grandtotal") break;
-              if (!description) continue;
-              if (["item", "itemlist", "description", "category", "expense", "expenses"].includes(rowLabel)) continue;
-              if (!Number.isFinite(amount) || amount <= 0) {
-                // Category title rows have a label in column A and no total cost.
-                group = description;
-                continue;
-              }
-              const splitText = String(row[2] || "").replace(/,/g, "").replace(/[^0-9.-]/g, "");
-              const splitShare = Number(splitText);
-              const paidBy = String(row[3] || "Shared").trim() || "Shared";
-              const paidFlag = String(row[4] ?? "").trim().toUpperCase();
-              const notes = [row[9] ? String(row[9]).trim() : ""].filter(Boolean).join(" · ");
-              const sheetRow = i + 1;
-              plannedExpenses.push({
-                expense_id: `planned-final-expenses-row-${sheetRow}`,
-                date: "",
-                description,
-                category: group,
-                amount,
-                split_share: Number.isFinite(splitShare) && splitText ? splitShare : amount / 2,
-                currency: "MYR",
-                paid_by: paidBy,
-                expense_type: "pre-trip",
-                share_type: "shared",
-                payment_status: ["TRUE", "✓", "☑", "1"].includes(paidFlag) ? "Paid" : "Estimate",
-                notes,
-                source: "FINAL EXPENSES",
-              });
-            }
-          }
-          return jsonResponse({ success: true, expenses: [...plannedExpenses, ...loggedExpenses], tripId: trip.id, sources: { planned: "FINAL EXPENSES", actual: existingTab || null } });
-        }
-
-        const rows = await readSheetRows(token, trip.sheetId, tab);
-        const action = typeof body.action === "string" ? body.action.trim().toLowerCase() : "create";
-        const expenseId = typeof body.expense_id === "string" ? body.expense_id.trim() : "";
-        const existingRowIndex = rows.findIndex((row, index) => index > 0 && String(row[0] ?? "").trim() === expenseId);
-        if (action === "legacy") {
-          if (!expenseId || existingRowIndex < 1) return jsonResponse({ success: false, error: "Could not find that app-entered expense to mark as legacy." }, 404);
-          const legacyRange = `${quoteSheetTab(tab)}!O${existingRowIndex + 1}`;
-          const legacyWrite = await fetch(`${sheetsValuesUrl(trip.sheetId, legacyRange)}?valueInputOption=RAW`, { method: "PUT", headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" }, body: JSON.stringify({ values: [["TRUE"]] }) });
-          if (!legacyWrite.ok) return jsonResponse({ success: false, error: `Could not mark the expense as legacy (HTTP ${legacyWrite.status}).` }, 502);
-          return jsonResponse({ success: true, message: "Expense marked as legacy. The original sheet row was kept; it will no longer appear in the app." });
-        }
-        const date = typeof body.date === "string" ? body.date.trim() : "";
-        const description = typeof body.description === "string" ? body.description.trim() : "";
-        const category = typeof body.category === "string" ? body.category.trim() : "Other";
-        const amount = Number(body.amount);
-        const currency = typeof body.currency === "string" ? body.currency.trim().toUpperCase() : "NZD";
-        const paidBy = typeof body.paid_by === "string" ? body.paid_by.trim() : "";
-        const expenseType = date >= "2026-11-07" ? "actual-trip" : "pre-trip";
-        const shareType = body.share_type === "personal" ? "personal" : body.share_type === "shared" ? "shared" : "shared";
-        const latitude = typeof body.latitude === "string" ? body.latitude.trim() : "";
-        const longitude = typeof body.longitude === "string" ? body.longitude.trim() : "";
-        const location = typeof body.location === "string" ? body.location.trim() : "";
-        const notes = typeof body.notes === "string" ? body.notes.trim() : "";
-        if (!expenseId || expenseId.length > 100 || !date || !description || description.length > 250 || !Number.isFinite(amount) || amount <= 0 || !["pre-trip", "actual-trip"].includes(String(expenseType)) || !["Ralph", "June", "Shared"].includes(paidBy) || !/^[A-Z]{3}$/.test(currency) || category.length > 100 || notes.length > 2000 || latitude.length > 30 || longitude.length > 30 || location.length > 500) return jsonResponse({ success: false, error: "Invalid expense details." }, 400);
-        if (action === "edit") {
-          if (existingRowIndex < 1) return jsonResponse({ success: false, error: "Could not find that app-entered expense to edit." }, 404);
-          const createdAt = String(rows[existingRowIndex][9] || new Date().toISOString());
-          const editRange = `${quoteSheetTab(tab)}!A${existingRowIndex + 1}:O${existingRowIndex + 1}`;
-          const editWrite = await fetch(`${sheetsValuesUrl(trip.sheetId, editRange)}?valueInputOption=RAW`, { method: "PUT", headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" }, body: JSON.stringify({ values: [[expenseId, date, description, category, amount, currency, paidBy, expenseType, notes, createdAt, shareType, latitude, longitude, location, ""]] }) });
-          if (!editWrite.ok) return jsonResponse({ success: false, error: `Could not update the expense in Google Sheets (HTTP ${editWrite.status}).` }, 502);
-          return jsonResponse({ success: true, message: "Expense updated." });
-        }
-        if (action !== "create") return jsonResponse({ success: false, error: "Unknown expense action." }, 400);
-        if (existingRowIndex > 0 || rows.slice(1).some((row) => row[0] === expenseId)) return jsonResponse({ success: true, duplicate: true, message: "Expense already saved." });
-        const appendUrl = `${sheetsValuesUrl(trip.sheetId, `${quoteSheetTab(tab)}!A:O`)}:append?valueInputOption=RAW&insertDataOption=INSERT_ROWS`;
-        const append = await fetch(appendUrl, { method: "POST", headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" }, body: JSON.stringify({ values: [[expenseId, date, description, category, amount, currency, paidBy, expenseType, notes, new Date().toISOString(), shareType, latitude, longitude, location, ""]] }) });
-        if (!append.ok) {
-          const detail = (await append.text().catch(() => "")).slice(0, 400);
-          return jsonResponse({ success: false, error: `Could not save the expense to Google Sheets (HTTP ${append.status}). ${detail}` }, 502);
-        }
-        return jsonResponse({ success: true, message: "Expense saved.", tripId: trip.id }, 201);
-      } catch (error) { return jsonResponse({ success: false, error: error instanceof Error ? error.message : "Could not access trip expenses." }, 500); }
-    }
-
-    // Approved trip documents and reference links. The Password/email rows in
-    // the source Link tab are intentionally excluded server-side.
-    if (request.method === "GET" && url.pathname === "/api/documents") {
-      const session = await readSession(request, env);
-      if (!session) return jsonResponse({ success: false, error: "Authentication required." }, 401);
-      try {
-        const trip = await resolveTrip(request, env);
-        if (!trip) return jsonResponse({ success: false, error: "Select a valid trip first." }, 404);
-        const token = await googleAccessToken(session, env);
-        const linkTab = await findExistingTab(token, trip.sheetId, ["Link", "Links"], "Link");
-        const rows = await readSheetRows(token, trip.sheetId, linkTab);
-        const documents = rows.flatMap((row) => {
-          const sourceCategory = String(row[0] || "Reference").trim();
-          const title = String(row[1] || "").trim();
-          const resourceUrl = String(row[2] || "").trim();
-          const allowedTitles = ["all document", "doc website", "jucy chaser spec", "bus route 29", "bus route 8"];
-          if (!title || !allowedTitles.includes(title.toLowerCase()) || /password|email|login|credential/i.test(title) || /@/.test(title) || !/^https:\/\//i.test(resourceUrl) || /password|email|login|credential/i.test(resourceUrl)) return [];
-          try { const parsed = new URL(resourceUrl); if (!parsed.hostname || parsed.protocol !== "https:") return []; } catch { return []; }
-          const category = title.toLowerCase() === "all document" ? "Documents" : title.toLowerCase() === "doc website" ? "Booking" : /drive/i.test(sourceCategory) ? "Documents" : sourceCategory;
-          return [{ category, title, url: resourceUrl, kind: /drive\.google\.com\/drive\/folders/i.test(resourceUrl) ? "drive_folder" : "link" }];
-        });
-        return jsonResponse({ success: true, documents, tripId: trip.id });
-      } catch (error) { return jsonResponse({ success: false, error: error instanceof Error ? error.message : "Could not load trip documents and links." }, 500); }
-    }
-
-    // Checklist single source of truth. APP_CHECKLIST is created and migrated
-    // automatically; the two original human-readable tabs are never modified.
-    if (url.pathname === "/api/checklist" && (request.method === "GET" || request.method === "POST")) {
-      const session = await readSession(request, env);
-      if (!session) return jsonResponse({ success: false, error: "Authentication required." }, 401);
-      if (request.method === "POST" && request.headers.get("Origin") !== url.origin) return jsonResponse({ success: false, error: "Invalid request origin." }, 403);
-      try {
-        let body: Record<string, unknown> = {};
-        if (request.method === "POST") body = await request.json() as Record<string, unknown>;
-        const trip = await resolveTrip(request, env, typeof body.tripId === "string" ? body.tripId : undefined);
-        if (!trip) return jsonResponse({ success: false, error: "Select a valid trip first." }, 404);
-        const token = await googleAccessToken(session, env);
-        const profile = session.email.toLowerCase() === "koochanyee@gmail.com" ? "Ralph" : session.email.toLowerCase() === "wookahwai@gmail.com" ? "June" : "";
-        if (!profile) return jsonResponse({ success: false, error: "This account is not assigned a checklist profile." }, 403);
-        const tab = "APP_CHECKLIST";
-        const headers = ["checklist_id", "list_type", "category", "item", "quantity", "notes", "shared_done", "to_buy", "sort_order", "active", "created_at", "updated_at", "source_tab", "source_row", "must_have", "due_date", "completion_mode", "ralph_done", "june_done", "cancelled"];
-        await ensureSheetTab(token, trip.sheetId, tab, headers);
-        const readAppRows = async () => readSheetRows(token, trip.sheetId, tab);
-        let appRows = await readAppRows();
-        const headerNorm = (appRows[0] || []).map((cell) => String(cell ?? "").trim().toLowerCase());
-        if (headers.slice(0, 16).some((header, index) => headerNorm[index] !== header)) {
-          return jsonResponse({ success: false, error: "APP_CHECKLIST exists but its original headers do not match the expected schema. No data was changed; please inspect the tab before retrying." }, 409);
-        }
-        // Extend an existing A:P checklist safely; never replace or reorder its data.
-        const extraHeaders = headers.slice(16);
-        if (extraHeaders.some((header, index) => headerNorm[index + 16] !== header)) {
-          const headerWrite = await fetch(`${sheetsValuesUrl(trip.sheetId, `${quoteSheetTab(tab)}!Q1:T1`)}?valueInputOption=RAW`, { method: "PUT", headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" }, body: JSON.stringify({ values: [extraHeaders] }) });
-          if (!headerWrite.ok) return jsonResponse({ success: false, error: "Could not add the Shared/Personal and cancellation columns to APP_CHECKLIST." }, 502);
-          appRows = await readAppRows();
-        }
-        const col = (name: string) => headers.indexOf(name);
-        const now = new Date().toISOString();
-
-        // One-time, idempotent migration. Deterministic IDs mean retries cannot
-        // duplicate legacy rows. Existing source tabs remain untouched.
-        const existingIds = new Set(appRows.slice(1).map((row) => String(row[col("checklist_id")] || "").trim()).filter(Boolean));
-        const migrationRows: string[][] = [];
-        const legacyStatusKey = `checklist-status:${trip.id}`;
-        let legacyStatuses: Record<string, { ralph_status?: string; june_status?: string; shared_status?: string }> = {};
-        const savedLegacyStatuses = await env.OAUTH_TOKEN_STORE.get(legacyStatusKey);
-        if (savedLegacyStatuses) { try { legacyStatuses = JSON.parse(savedLegacyStatuses) as typeof legacyStatuses; } catch { legacyStatuses = {}; } }
-        const truthy = (value: unknown) => [true, "TRUE", "true", "✓", "1", 1].includes(value as never);
-        // Existing checklist rows predate the Personal/Shared choice. Default
-        // them to Personal while carrying their previous shared completion to
-        // both travellers, so no checked state is lost during the upgrade.
-        const defaultsToBackfill = appRows.slice(1).flatMap((row, index) => {
-          const rowId = String(row[col("checklist_id")] || "").trim();
-          if (!rowId || String(row[col("completion_mode")] || "").trim()) return [];
-          const priorDone = truthy(row[col("shared_done")]);
-          return [{ range: `${quoteSheetTab(tab)}!Q${index + 2}:T${index + 2}`, values: [["PERSONAL", priorDone, priorDone, false]] }];
-        });
-        if (defaultsToBackfill.length) {
-          const defaultsWrite = await fetch(`https://sheets.googleapis.com/v4/spreadsheets/${encodeURIComponent(trip.sheetId)}/values:batchUpdate`, { method: "POST", headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" }, body: JSON.stringify({ valueInputOption: "RAW", data: defaultsToBackfill }) });
-          if (!defaultsWrite.ok) return jsonResponse({ success: false, error: "Could not initialise existing checklist items as Personal. No checklist status was changed; please retry." }, 502);
-          appRows = await readAppRows();
-        }
-        const appendLegacy = (id: string, listType: string, category: string, item: string, quantity: string, notes: string, sourceTab: string, sourceRow: number, oldIds: string[], mustHave = false, dueDate = "", sourceDone = false) => {
-          if (!item.trim() || existingIds.has(id) || migrationRows.some((row) => row[0] === id)) return;
-          const prior = oldIds.map((oldId) => legacyStatuses[oldId] || {}).find((status) => status.shared_status === "✓" || status.ralph_status === "✓" || status.june_status === "✓");
-          const done = Boolean(prior) || sourceDone;
-          migrationRows.push([id, listType, category || "Other", item.trim(), quantity, notes, String(done), "FALSE", String(migrationRows.length + 1), "TRUE", now, now, sourceTab, String(sourceRow), String(mustHave), dueDate, "PERSONAL", String(done), String(done), "FALSE"]);
-        };
-        const mainTab = await findExistingTab(token, trip.sheetId, ["Thing to do n bring", "Things to do n bring", "Thing to do & bring", "Things to do & bring", "THINGS TO DO N BRING", "THINGS TO DO & BRING"], "");
-        if (!mainTab) return jsonResponse({ success: false, error: "Could not find the existing pre-trip checklist tab ‘Thing to do n bring’." }, 404);
-        const mainRows = await readSheetRows(token, trip.sheetId, mainTab);
-        const norm = (value: string) => value.toLowerCase().replace(/[^a-z0-9]/g, "");
-        const mainHeader = mainRows[0] || [];
-        const findHeader = (tests: string[]) => mainHeader.findIndex((cell) => tests.includes(norm(String(cell || ""))));
-        const categoryIdx = Math.max(0, findHeader(["category"]));
-        const itemIdx = findHeader(["item"]) >= 0 ? findHeader(["item"]) : 1;
-        const qtyIdx = findHeader(["qty", "quantity"]) >= 0 ? findHeader(["qty", "quantity"]) : 2;
-        const notesIdx = findHeader(["notes"]) >= 0 ? findHeader(["notes"]) : 5;
-        const ralphIdx = findHeader(["ralph"]);
-        const juneIdx = findHeader(["june"]);
-        const todoIdx = findHeader(["thingstodo", "todo", "task"]) >= 0 ? findHeader(["thingstodo", "todo", "task"]) : 9;
-        const dueIdx = findHeader(["duedate", "due", "month"]) >= 0 ? findHeader(["duedate", "due", "month"]) : 8;
-        const mustHaveIdx = String(mainHeader[3] || "").trim() ? -1 : 3;
-        if (norm(String(mainHeader[categoryIdx] || "")) !== "category" || norm(String(mainHeader[itemIdx] || "")) !== "item") return jsonResponse({ success: false, error: `The tab “${mainTab}” does not have the expected Category / Item headers.` }, 409);
-        let currentCategory = "Other";
-        mainRows.slice(1).forEach((row, index) => {
-          const sourceRow = index + 2;
-          if (String(row[categoryIdx] || "").trim()) currentCategory = String(row[categoryIdx]).trim();
-          const packing = String(row[itemIdx] || "").trim();
-          if (packing) appendLegacy(`legacy:packing:${sourceRow}`, "BEFORE_DEPARTURE", currentCategory, packing, String(row[qtyIdx] || "").trim(), String(row[notesIdx] || "").trim(), mainTab, sourceRow, [`pack-${sourceRow}`], mustHaveIdx >= 0 && truthy(row[mustHaveIdx]), "", (ralphIdx >= 0 && truthy(row[ralphIdx])) || (juneIdx >= 0 && truthy(row[juneIdx])));
-          const todo = String(row[todoIdx] || "").trim();
-          if (todo) appendLegacy(`legacy:todo:${sourceRow}`, "BEFORE_DEPARTURE", "Things to do", todo, "", "", mainTab, sourceRow, [`todo-${sourceRow}`], false, String(row[dueIdx] || "").trim(), truthy(row[7]));
-        });
-        const groceryTab = await findExistingTab(token, trip.sheetId, ["Shopping List or Things to Brin", "Shopping List or Things to Bring"], "");
-        if (groceryTab) {
-          const groceryRows = await readSheetRows(token, trip.sheetId, groceryTab);
-          let groceryCategory = "Pack ’n Save";
-          groceryRows.slice(2).forEach((row, index) => {
-            const sourceRow = index + 3;
-            const malaysiaItem = String(row[0] || "").trim();
-            const malaysiaQty = String(row[1] || "").trim();
-            if (malaysiaItem && norm(malaysiaItem) !== "tobringfrommalaysia") appendLegacy(`legacy:grocery-malaysia:${sourceRow}`, "GROCERY", "🧳 To bring from Malaysia", malaysiaItem, malaysiaQty, "", groceryTab, sourceRow, [`grocery-malaysia-${sourceRow}`]);
-            const categoryCell = String(row[3] || "").trim();
-            if (categoryCell && norm(categoryCell) !== "category") groceryCategory = categoryCell;
-            const buyItem = String(row[4] || "").trim();
-            if (buyItem && norm(buyItem) !== "whatidbuy") appendLegacy(`legacy:grocery-pns:${sourceRow}`, "GROCERY", `🛒 ${groceryCategory}`, buyItem, String(row[5] || "").trim(), String(row[6] || "").trim(), groceryTab, sourceRow, [`grocery-pns-${sourceRow}`]);
-            const quickItem = String(row[9] || "").trim();
-            if (quickItem) appendLegacy(`legacy:grocery-list:${sourceRow}`, "GROCERY", "🛒 Grocery quick list", quickItem, "", "", groceryTab, sourceRow, [`grocery-list-${sourceRow}`]);
+        if (!cancelled) {
+          const rows = Array.isArray(result.data) ? result.data : [];
+          setItineraryRows(rows);
+          setSupplementaryTabs(result.supplementaryTabs ?? {});
+          const dateRow = rows[0] ?? {};
+          const dateKeys = Object.keys(dateRow).slice(1);
+          const now = new Date();
+          const todayIndex = dateKeys.findIndex((key) => {
+            const parsed = parseTripDate(String(dateRow[key] ?? ""));
+            return Boolean(parsed && dateIsSameDay(parsed, now));
           });
+          setActiveDayIndex(todayIndex >= 0 ? todayIndex : 0);
+          setItineraryError("");
+              setAuthMessage("Signed in. Itinerary loaded from Google Sheets.");
         }
-        if (migrationRows.length) {
-          const appendUrl = `${sheetsValuesUrl(trip.sheetId, `${quoteSheetTab(tab)}!A:T`)}:append?valueInputOption=RAW&insertDataOption=INSERT_ROWS`;
-          const migrationWrite = await fetch(appendUrl, { method: "POST", headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" }, body: JSON.stringify({ values: migrationRows }) });
-          if (!migrationWrite.ok) return jsonResponse({ success: false, error: `Could not migrate existing checklist items to APP_CHECKLIST (HTTP ${migrationWrite.status}).` }, 502);
-          appRows = await readAppRows();
-        }
-
-        if (request.method === "POST") {
-          const action = String(body.action || "set_status");
-          if (action === "reset_grocery") {
-            const updates = appRows.slice(1).flatMap((row, index) => String(row[col("list_type")] || "") === "GROCERY" && String(row[col("active")] || "TRUE").toUpperCase() !== "FALSE" ? [{ range: `${quoteSheetTab(tab)}!G${index + 2}:H${index + 2}`, values: [[false, false]] }, { range: `${quoteSheetTab(tab)}!R${index + 2}:S${index + 2}`, values: [[false, false]] }] : []);
-            if (updates.length) {
-              const write = await fetch(`https://sheets.googleapis.com/v4/spreadsheets/${encodeURIComponent(trip.sheetId)}/values:batchUpdate`, { method: "POST", headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" }, body: JSON.stringify({ valueInputOption: "RAW", data: updates }) });
-              if (!write.ok) return jsonResponse({ success: false, error: "Google Sheets could not reset grocery completion." }, 502);
-            }
-            return jsonResponse({ success: true, message: "Grocery checkboxes reset for both travellers." });
-          }
-          if (action === "add") {
-            const listType = body.list_type === "GROCERY" ? "GROCERY" : "BEFORE_DEPARTURE";
-            const category = typeof body.category === "string" ? body.category.trim().slice(0, 100) : "";
-            const item = typeof body.item === "string" ? body.item.trim().slice(0, 250) : "";
-            const quantity = typeof body.quantity === "string" ? body.quantity.trim().slice(0, 80) : "";
-            const notes = typeof body.notes === "string" ? body.notes.trim().slice(0, 500) : "";
-            if (!category || !item) return jsonResponse({ success: false, error: "Choose a category and enter an item." }, 400);
-            const id = `custom:${crypto.randomUUID()}`;
-            const addUrl = `${sheetsValuesUrl(trip.sheetId, `${quoteSheetTab(tab)}!A:T`)}:append?valueInputOption=RAW&insertDataOption=INSERT_ROWS`;
-            const addWrite = await fetch(addUrl, { method: "POST", headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" }, body: JSON.stringify({ values: [[id, listType, category, item, quantity, notes, "FALSE", "FALSE", String(appRows.length), "TRUE", now, now, "APP", "", "FALSE", "", "PERSONAL", "FALSE", "FALSE", "FALSE"]] }) });
-            if (!addWrite.ok) return jsonResponse({ success: false, error: "Could not add the item to Google Sheets." }, 502);
-            return jsonResponse({ success: true, message: "Item added and synced to Google Sheets.", item: { item_id: id, checklist_type: listType === "GROCERY" ? "grocery" : "packing", category, item, quantity, notes, shared_done: false, to_buy: false, completion_mode: "PERSONAL", ralph_done: false, june_done: false, cancelled: false } }, 201);
-          }
-          const itemId = typeof body.item_id === "string" ? body.item_id.trim() : "";
-          const rowIndex = appRows.slice(1).findIndex((row) => String(row[col("checklist_id")] || "") === itemId);
-          if (!itemId || rowIndex < 0) return jsonResponse({ success: false, error: "Checklist item not found. Refresh and try again." }, 404);
-          const sheetRow = rowIndex + 2;
-          const currentRow = appRows[sheetRow - 1] || [];
-          const currentSharedDone = truthy(currentRow[col("shared_done")]);
-          const currentRalphDone = truthy(currentRow[col("ralph_done")]);
-          const currentJuneDone = truthy(currentRow[col("june_done")]);
-          const currentMode = String(currentRow[col("completion_mode")] || "PERSONAL").toUpperCase() === "SHARED" ? "SHARED" : "PERSONAL";
-          if (action === "set_mode") {
-            const nextMode = String(body.completion_mode || "").toUpperCase();
-            if (nextMode !== "SHARED" && nextMode !== "PERSONAL") return jsonResponse({ success: false, error: "Choose Shared or Personal." }, 400);
-            const nextSharedDone = nextMode === "SHARED" ? (currentMode === "PERSONAL" ? currentRalphDone || currentJuneDone : currentSharedDone) : currentSharedDone;
-            const nextRalphDone = nextMode === "PERSONAL" && currentMode === "SHARED" ? currentSharedDone : currentRalphDone;
-            const nextJuneDone = nextMode === "PERSONAL" && currentMode === "SHARED" ? currentSharedDone : currentJuneDone;
-            const modeWrite = await fetch(`https://sheets.googleapis.com/v4/spreadsheets/${encodeURIComponent(trip.sheetId)}/values:batchUpdate`, { method: "POST", headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" }, body: JSON.stringify({ valueInputOption: "RAW", data: [{ range: `${quoteSheetTab(tab)}!G${sheetRow}`, values: [[nextSharedDone]] }, { range: `${quoteSheetTab(tab)}!Q${sheetRow}:S${sheetRow}`, values: [[nextMode, nextRalphDone, nextJuneDone]] }, { range: `${quoteSheetTab(tab)}!L${sheetRow}`, values: [[now]] }] }) });
-            if (!modeWrite.ok) return jsonResponse({ success: false, error: `Could not save the checklist sharing mode (HTTP ${modeWrite.status}).` }, 502);
-            // Verify the persisted value before reporting success. This prevents the UI
-            // from appearing to switch modes when Google Sheets did not retain the write.
-            const verifiedRows = await readAppRows();
-            const verifiedRow = verifiedRows.slice(1).find((row) => String(row[col("checklist_id")] || "").trim() === itemId);
-            const verifiedMode = String(verifiedRow?.[col("completion_mode")] || "").toUpperCase();
-            if (verifiedMode !== nextMode) return jsonResponse({ success: false, error: "Google Sheets did not confirm the new completion mode. Please try again." }, 502);
-            return jsonResponse({ success: true, item_id: itemId, completion_mode: verifiedMode, ralph_done: truthy(verifiedRow?.[col("ralph_done")]), june_done: truthy(verifiedRow?.[col("june_done")]), shared_done: truthy(verifiedRow?.[col("shared_done")]), message: `Checklist item is now ${verifiedMode === "SHARED" ? "shared by both travellers" : "personal to each traveller"}.` });
-          }
-          if (action === "set_cancelled") {
-            const cancelled = Boolean(body.cancelled);
-            const cancelWrite = await fetch(`https://sheets.googleapis.com/v4/spreadsheets/${encodeURIComponent(trip.sheetId)}/values:batchUpdate`, { method: "POST", headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" }, body: JSON.stringify({ valueInputOption: "RAW", data: [{ range: `${quoteSheetTab(tab)}!T${sheetRow}`, values: [[cancelled]] }, ...(cancelled ? [{ range: `${quoteSheetTab(tab)}!H${sheetRow}`, values: [[false]] }] : []), { range: `${quoteSheetTab(tab)}!L${sheetRow}`, values: [[now]] }] }) });
-            if (!cancelWrite.ok) return jsonResponse({ success: false, error: "Could not save the cancelled status." }, 502);
-            return jsonResponse({ success: true, item_id: itemId, cancelled, message: cancelled ? "Item cancelled and kept in the checklist." : "Item restored to the active checklist." });
-          }
-          if (action === "set_to_buy") {
-            const toBuy = Boolean(body.to_buy) && String(appRows[sheetRow - 1][col("list_type")]) === "BEFORE_DEPARTURE";
-            const write = await fetch(`${sheetsValuesUrl(trip.sheetId, `${quoteSheetTab(tab)}!H${sheetRow}`)}?valueInputOption=RAW`, { method: "PUT", headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" }, body: JSON.stringify({ values: [[toBuy]] }) });
-            if (!write.ok) return jsonResponse({ success: false, error: "Could not update To Buy status in Google Sheets." }, 502);
-            await fetch(`${sheetsValuesUrl(trip.sheetId, `${quoteSheetTab(tab)}!L${sheetRow}`)}?valueInputOption=RAW`, { method: "PUT", headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" }, body: JSON.stringify({ values: [[now]] }) });
-            return jsonResponse({ success: true, message: toBuy ? "Added to To Buy." : "Removed from To Buy." });
-          }
-          if (currentMode === "PERSONAL") {
-            const person = String(body.person || profile);
-            if (person !== profile) return jsonResponse({ success: false, error: "You can only update your own personal checklist status." }, 403);
-            const done = Boolean(body.done ?? (body.status === "✓"));
-            const targetColumn = profile === "Ralph" ? "R" : "S";
-            const otherDone = profile === "Ralph" ? currentJuneDone : currentRalphDone;
-            const clearToBuy = done && otherDone;
-            const personalWrite = await fetch(`https://sheets.googleapis.com/v4/spreadsheets/${encodeURIComponent(trip.sheetId)}/values:batchUpdate`, { method: "POST", headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" }, body: JSON.stringify({ valueInputOption: "RAW", data: [{ range: `${quoteSheetTab(tab)}!${targetColumn}${sheetRow}`, values: [[done]] }, ...(clearToBuy ? [{ range: `${quoteSheetTab(tab)}!H${sheetRow}`, values: [[false]] }] : []), { range: `${quoteSheetTab(tab)}!L${sheetRow}`, values: [[now]] }] }) });
-            if (!personalWrite.ok) return jsonResponse({ success: false, error: `Google Sheets did not save your personal completion status (HTTP ${personalWrite.status}).` }, 502);
-            return jsonResponse({ success: true, item_id: itemId, person: profile, done, message: `${profile}'s personal completion saved to Google Sheets.` });
-          }
-          const sharedDone = Boolean(body.shared_done ?? (body.status === "✓"));
-          const write = await fetch(`${sheetsValuesUrl(trip.sheetId, `${quoteSheetTab(tab)}!G${sheetRow}:H${sheetRow}`)}?valueInputOption=RAW`, { method: "PUT", headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" }, body: JSON.stringify({ values: [[sharedDone, sharedDone ? false : truthy(currentRow[col("to_buy")])]] }) });
-          if (!write.ok) return jsonResponse({ success: false, error: `Google Sheets did not save the shared completion status (HTTP ${write.status}).` }, 502);
-          await fetch(`${sheetsValuesUrl(trip.sheetId, `${quoteSheetTab(tab)}!L${sheetRow}`)}?valueInputOption=RAW`, { method: "PUT", headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" }, body: JSON.stringify({ values: [[now]] }) });
-          return jsonResponse({ success: true, item_id: itemId, shared_done: sharedDone, message: sharedDone ? `Marked done for both Ralph and June by ${profile}.` : "Shared completion cleared for both travellers." });
-        }
-
-        const rawItems = appRows.slice(1).flatMap((row) => {
-          const id = String(row[col("checklist_id")] || "").trim();
-          const item = String(row[col("item")] || "").trim();
-          if (!id || !item || String(row[col("active")] || "TRUE").toUpperCase() === "FALSE") return [];
-          const listType = String(row[col("list_type")] || "BEFORE_DEPARTURE");
-          const done = truthy(row[col("shared_done")]);
-          const completionMode = String(row[col("completion_mode")] || "PERSONAL").toUpperCase() === "SHARED" ? "SHARED" : "PERSONAL";
-          const ralphDone = truthy(row[col("ralph_done")]) || (completionMode === "SHARED" && done);
-          const juneDone = truthy(row[col("june_done")]) || (completionMode === "SHARED" && done);
-          return [{ item_id: id, category: String(row[col("category")] || "Other"), item, quantity: String(row[col("quantity")] || ""), notes: String(row[col("notes")] || ""), checklist_type: listType === "GROCERY" ? "grocery" : "packing", list_type: listType, shared_done: done, shared_status: done ? "✓" : "", ralph_status: ralphDone ? "✓" : "", june_status: juneDone ? "✓" : "", ralph_done: ralphDone, june_done: juneDone, completion_mode: completionMode, cancelled: truthy(row[col("cancelled")]), to_buy: truthy(row[col("to_buy")]), sort_order: Number(row[col("sort_order")] || 0), must_have: truthy(row[col("must_have")]), due_date: String(row[col("due_date")] || "") }];
-        });
-        // Older migration runs could import the same source item more than once
-        // under different row IDs. Hide exact duplicates in the app response while
-        // leaving the original APP_CHECKLIST rows untouched for safe recovery.
-        const uniqueItems = new Map<string, typeof rawItems[number]>();
-        const normaliseDuplicatePart = (value: unknown) => String(value ?? "").toLowerCase().replace(/\s+/g, " ").trim();
-        for (const entry of rawItems) {
-          const signature = [entry.list_type, entry.category, entry.item, entry.quantity, entry.notes].map(normaliseDuplicatePart).join("¦");
-          if (!uniqueItems.has(signature)) uniqueItems.set(signature, entry);
-        }
-        const items = Array.from(uniqueItems.values());
-        return jsonResponse({ success: true, checklistItems: items, tripId: trip.id, sourceTab: tab, migratedCount: migrationRows.length, duplicateRowsHidden: rawItems.length - items.length, sharedCompletion: true, personalCompletion: true });
-      } catch (error) { return jsonResponse({ success: false, error: error instanceof Error ? error.message : "Could not access the shared checklist." }, 500); }
+      } catch (error) {
+        if (!cancelled) setItineraryError(error instanceof Error ? error.message : "Could not load itinerary.");
+      } finally {
+        if (!cancelled) setIsLoadingItinerary(false);
+      }
     }
+    void loadItinerary();
+    return () => { cancelled = true; };
+  }, [verifiedEmail, selectedTripId, refreshKey]);
 
-    // Read the signed-in user's Google Sheets itinerary.
-    if (request.method === "GET" && url.pathname === "/api/itinerary") {
-      const session = await readSession(request, env);
-      const trip = await resolveTrip(request, env);
-      if (!trip) return jsonResponse({ success: false, error: "Select a valid trip first." }, 404);
-      const activeSheetId = trip.sheetId;
-      const activeItineraryTab = trip.itineraryTab;
-
-      if (!session) {
-        return jsonResponse(
-          { success: false, error: "Authentication required." },
-          401,
-        );
-      }
-
-      if (
-        !env.GOOGLE_CLIENT_ID ||
-        !env.GOOGLE_CLIENT_SECRET ||
-        !env.TOKEN_ENCRYPTION_KEY ||
-        !activeSheetId ||
-        !activeItineraryTab ||
-        !env.OAUTH_TOKEN_STORE
-      ) {
-        return jsonResponse(
-          { success: false, error: "Itinerary service is not configured." },
-          500,
-        );
-      }
-
+  useEffect(() => {
+    if (!verifiedEmail || !selectedTripId) return;
+    let cancelled = false;
+    async function loadMemories() {
       try {
-        const tokenKey =
-          `google-refresh:${session.email.toLowerCase()}`;
-
-        const encryptedRefreshToken =
-          await env.OAUTH_TOKEN_STORE.get(tokenKey);
-
-        if (!encryptedRefreshToken) {
-          return jsonResponse(
-            {
-              success: false,
-              error: "Google Sheets is not connected.",
-              connectUrl: "/api/sheets/connect",
-            },
-            403,
-          );
-        }
-
-        const refreshToken = await decryptToken(
-          encryptedRefreshToken,
-          env.TOKEN_ENCRYPTION_KEY,
-        );
-
-        const tokenResponse = await fetch(
-          "https://oauth2.googleapis.com/token",
-          {
-            method: "POST",
-            headers: {
-              "Content-Type": "application/x-www-form-urlencoded",
-            },
-            body: new URLSearchParams({
-              client_id: env.GOOGLE_CLIENT_ID,
-              client_secret: env.GOOGLE_CLIENT_SECRET,
-              refresh_token: refreshToken,
-              grant_type: "refresh_token",
-            }).toString(),
-          },
-        );
-
-        if (!tokenResponse.ok) {
-          const googleError = await tokenResponse.json() as {
-            error?: string;
-            error_description?: string;
-          };
-
-          console.error("[GOOGLE TOKEN REFRESH FAILED]", {
-            status: tokenResponse.status,
-            error: googleError.error || "unknown_error",
-            description: googleError.error_description || "No description",
-            email: session.email,
-          });
-
-          return jsonResponse(
-            {
-              success: false,
-              error: "Could not refresh Google access. Please reconnect Google Sheets.",
-              connectUrl: "/api/sheets/connect",
-            },
-            502,
-          );
-        }
-
-        const tokenData = (await tokenResponse.json()) as {
-          access_token?: string;
-        };
-
-        if (!tokenData.access_token) {
-          return jsonResponse(
-            { success: false, error: "Google returned no access token." },
-            502,
-          );
-        }
-
-        const range =
-          `'${activeItineraryTab.replace(/'/g, "''")}'!A:ZZZ`;
-
-        const sheetUrl =
-          `https://sheets.googleapis.com/v4/spreadsheets/` +
-          `${encodeURIComponent(activeSheetId)}/values/` +
-          `${encodeURIComponent(range)}`;
-
-        const sheetResponse = await fetch(sheetUrl, {
-          headers: {
-            Authorization: `Bearer ${tokenData.access_token}`,
-          },
+        const response = await fetch(`/api/memories?tripId=${encodeURIComponent(selectedTripId)}`, {
+          method: "GET", credentials: "same-origin", cache: "no-store",
         });
+        const result = (await response.json()) as ApiResponse;
+        if (!response.ok || !result.success) throw new Error(result.error || "Could not load travel memories.");
+        if (!cancelled) setMemories(Array.isArray(result.memories) ? result.memories : []);
+        const interactionsResponse = await fetch(`/api/memory-interactions?tripId=${encodeURIComponent(selectedTripId)}`, { credentials: "same-origin", cache: "no-store" });
+        const interactionsResult = await interactionsResponse.json() as { success?: boolean; interactions?: MemoryInteraction[]; error?: string };
+        if (!interactionsResponse.ok || !interactionsResult.success) throw new Error(interactionsResult.error || "Could not load photo comments and reactions.");
+        if (!cancelled) setMemoryInteractions(Array.isArray(interactionsResult.interactions) ? interactionsResult.interactions : []);
+      } catch (error) {
+        if (!cancelled) setMemoryMessage(error instanceof Error ? error.message : "Could not load travel memories.");
+      }
+    }
+    void loadMemories();
+    return () => { cancelled = true; };
+  }, [verifiedEmail, selectedTripId]);
 
-        if (!sheetResponse.ok) {
-          return jsonResponse(
-            {
-              success: false,
-              error: "Could not read the Google Sheet. Check the sheet permissions and configuration.",
-            },
-            502,
-          );
+  useEffect(() => {
+    if (!verifiedEmail || !selectedTripId) return;
+    let cancelled = false;
+    fetch(`/api/documents?tripId=${encodeURIComponent(selectedTripId)}`, { credentials: "same-origin", cache: "no-store" })
+      .then(async (response) => ({ response, result: await response.json() as { success?: boolean; documents?: TripDocument[]; error?: string } }))
+      .then(({ response, result }) => {
+        if (!response.ok || !result.success) throw new Error(result.error || "Could not load trip documents.");
+        if (!cancelled) { setTripDocuments(Array.isArray(result.documents) ? result.documents : []); setDocumentsMessage(""); }
+      })
+      .catch((error) => { if (!cancelled) setDocumentsMessage(error instanceof Error ? error.message : "Could not load trip documents."); });
+    return () => { cancelled = true; };
+  }, [verifiedEmail, selectedTripId]);
+
+  useEffect(() => {
+    if (!verifiedEmail || !selectedTripId) return;
+    let cancelled = false;
+    async function loadExpensesAndChecklist() {
+      const [expenseLoad, checklistLoad] = await Promise.allSettled([
+        fetch(`/api/expenses?tripId=${encodeURIComponent(selectedTripId)}`, { credentials: "same-origin", cache: "no-store" })
+          .then(async (response) => ({ response, result: await response.json() as ApiResponse })),
+        fetch(`/api/checklist?tripId=${encodeURIComponent(selectedTripId)}`, { credentials: "same-origin", cache: "no-store" })
+          .then(async (response) => ({ response, result: await response.json() as ApiResponse })),
+      ]);
+      if (cancelled) return;
+      if (expenseLoad.status === "fulfilled" && expenseLoad.value.response.ok && expenseLoad.value.result.success) {
+        setExpenses(Array.isArray(expenseLoad.value.result.expenses) ? expenseLoad.value.result.expenses : []);
+        setExpenseMessage("");
+      } else {
+        const message = expenseLoad.status === "rejected"
+          ? (expenseLoad.reason instanceof Error ? expenseLoad.reason.message : "Could not load expenses.")
+          : expenseLoad.value.result.error || `Could not load expenses (HTTP ${expenseLoad.value.response.status}).`;
+        setExpenseMessage(message);
+      }
+      if (checklistLoad.status === "fulfilled" && checklistLoad.value.response.ok && checklistLoad.value.result.success) {
+        setChecklistItems(Array.isArray(checklistLoad.value.result.checklistItems) ? checklistLoad.value.result.checklistItems : Array.isArray(checklistLoad.value.result.items) ? checklistLoad.value.result.items : []);
+        setChecklistMessage("");
+      } else {
+        const message = checklistLoad.status === "rejected"
+          ? (checklistLoad.reason instanceof Error ? checklistLoad.reason.message : "Could not load the shared checklist.")
+          : checklistLoad.value.result.error || `Could not load the shared checklist (HTTP ${checklistLoad.value.response.status}).`;
+        setChecklistMessage(message);
+      }
+    }
+    void loadExpensesAndChecklist();
+    return () => { cancelled = true; };
+  }, [verifiedEmail, selectedTripId, activeView, refreshKey]);
+
+  // Keep both travellers' shared checklist views in sync without requiring a manual refresh.
+  useEffect(() => {
+    if (!verifiedEmail || !selectedTripId || activeView !== "checklist") return;
+    const pollId = window.setInterval(async () => {
+      if (checklistSavingId) return;
+      try {
+        const response = await fetch(`/api/checklist?tripId=${encodeURIComponent(selectedTripId)}`, { credentials: "same-origin", cache: "no-store" });
+        const result = await response.json() as ApiResponse;
+        if (response.ok && result.success) setChecklistItems(Array.isArray(result.checklistItems) ? result.checklistItems : []);
+      } catch { /* The next poll retries; preserve the last successfully loaded list. */ }
+    }, 7000);
+    return () => window.clearInterval(pollId);
+  }, [verifiedEmail, selectedTripId, activeView, checklistSavingId]);
+
+  const saveExpense = async (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    const amount = Number(expenseAmount);
+    if (!expenseDate || !expenseDescription.trim() || !Number.isFinite(amount) || amount <= 0) {
+      setExpenseMessage("Enter a date, description and amount greater than zero.");
+      return;
+    }
+    setExpenseSaving(true);
+    setExpenseMessage("");
+    const record: TripExpense = {
+      expense_id: editingExpenseId || (typeof crypto !== "undefined" && "randomUUID" in crypto ? crypto.randomUUID() : `${Date.now()}`),
+      date: expenseDate,
+      description: expenseDescription.trim(),
+      category: expenseCategory,
+      amount,
+      currency: expenseCurrency,
+      paid_by: expensePaidBy,
+      expense_type: expenseType,
+      share_type: expenseShareType,
+      latitude: expenseLatitude,
+      longitude: expenseLongitude,
+      location: expenseLocation,
+      notes: expenseNotes.trim(),
+    };
+    try {
+      const response = await fetch(`/api/expenses?tripId=${encodeURIComponent(selectedTripId)}`, {
+        method: "POST", credentials: "same-origin",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ ...record, action: editingExpenseId ? "edit" : "create", tripId: selectedTripId }),
+      });
+      const result = await response.json() as ApiResponse;
+      if (!response.ok || !result.success) throw new Error(result.error || "Could not save the expense.");
+      const refreshed = await fetch(`/api/expenses?tripId=${encodeURIComponent(selectedTripId)}`, { credentials: "same-origin", cache: "no-store" });
+      const refreshedResult = await refreshed.json() as ApiResponse;
+      if (refreshed.ok && refreshedResult.success) setExpenses(Array.isArray(refreshedResult.expenses) ? refreshedResult.expenses : [...expenses, record]);
+      setExpenseDescription(""); setExpenseAmount(""); setExpenseNotes("");
+      setExpenseLatitude(""); setExpenseLongitude(""); setExpenseLocation("");
+      setEditingExpenseId("");
+      setExpenseMessage(editingExpenseId ? "Expense updated in Google Sheets." : expenseShareType === "personal" ? "Personal expense saved to the trip sheet." : "Shared expense saved to the trip sheet. Split share: 50:50.");
+    } catch (error) {
+      setExpenseMessage(error instanceof Error ? error.message : "Could not save the expense.");
+    } finally { setExpenseSaving(false); }
+  };
+
+  const beginEditExpense = (expense: TripExpense) => {
+    if (expense.source !== "TRIP EXPENSES") return;
+    setEditingExpenseId(expense.expense_id);
+    setExpenseDate(expense.date || new Date().toISOString().slice(0, 10));
+    setExpenseType(expense.expense_type);
+    setExpenseTab(expense.share_type === "personal" ? "personal" : expense.expense_type);
+    setExpenseShareType(expense.share_type || "shared");
+    setExpenseLatitude(expense.latitude || "");
+    setExpenseLongitude(expense.longitude || "");
+    setExpenseLocation(expense.location || "");
+    setExpenseDescription(expense.description);
+    setExpenseCategory(expense.category || "Other");
+    setExpenseAmount(String(expense.amount));
+    setExpenseCurrency(expense.currency || "NZD");
+    setExpensePaidBy(expense.paid_by || "Ralph");
+    setExpenseNotes(expense.notes || "");
+    setExpenseMessage("Editing this app-entered expense. Save changes to update the existing row.");
+    window.scrollTo({ top: 0, behavior: "smooth" });
+  };
+
+  const markExpenseLegacy = async (expense: TripExpense) => {
+    if (expense.source !== "TRIP EXPENSES") return;
+    if (!window.confirm(`Mark “${expense.description}” as legacy? The Google Sheet row will be kept, but the expense will disappear from the app.`)) return;
+    setExpenseSaving(true); setExpenseMessage("");
+    try {
+      const response = await fetch(`/api/expenses?tripId=${encodeURIComponent(selectedTripId)}`, { method: "POST", credentials: "same-origin", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ action: "legacy", expense_id: expense.expense_id, tripId: selectedTripId }) });
+      const result = await response.json() as ApiResponse;
+      if (!response.ok || !result.success) throw new Error(result.error || "Could not mark this expense as legacy.");
+      const refreshed = await fetch(`/api/expenses?tripId=${encodeURIComponent(selectedTripId)}`, { credentials: "same-origin", cache: "no-store" });
+      const refreshedResult = await refreshed.json() as ApiResponse;
+      if (refreshed.ok && refreshedResult.success) setExpenses(Array.isArray(refreshedResult.expenses) ? refreshedResult.expenses : []);
+      setExpenseMessage("Expense marked as legacy. The Google Sheet row remains for history.");
+      if (editingExpenseId === expense.expense_id) setEditingExpenseId("");
+    } catch (error) { setExpenseMessage(error instanceof Error ? error.message : "Could not mark this expense as legacy."); }
+    finally { setExpenseSaving(false); }
+  };
+
+  const uploadHighlightPhoto = async (file: File) => {
+    if (!selectedDay) { setHighlightPhotoMessage("Select an itinerary date first."); return; }
+    if (!file.type.startsWith("image/")) { setHighlightPhotoMessage("Please select an image file."); return; }
+    if (file.size > 4 * 1024 * 1024) { setHighlightPhotoMessage("Choose an image 4 MB or smaller."); return; }
+    setHighlightPhotoSaving(true); setHighlightPhotoMessage("");
+    try {
+      const dataUrl = await new Promise<string>((resolve, reject) => { const reader = new FileReader(); reader.onload = () => resolve(String(reader.result || "")); reader.onerror = () => reject(new Error(`Could not read ${file.name}.`)); reader.readAsDataURL(file); });
+      const response = await fetch(`/api/highlight-photo?tripId=${encodeURIComponent(selectedTripId)}`, { method: "POST", credentials: "same-origin", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ tripId: selectedTripId, date: selectedDay.date, photo: { name: file.name, mime_type: file.type, data_base64: dataUrl.split(",")[1] || "" } }) });
+      const result = await response.json() as ApiResponse;
+      if (!response.ok || !result.success) throw new Error(result.error || "Could not upload the Today Highlight photo.");
+      setHighlightPhoto(result.photo as { id: string; url: string; date?: string });
+      setShowHighlightPhoto(true);
+      setHighlightPhotoMessage("Photo saved to the shared trip folder for this date.");
+    } catch (error) { setHighlightPhotoMessage(error instanceof Error ? error.message : "Could not upload the Today Highlight photo."); }
+    finally { setHighlightPhotoSaving(false); }
+  };
+
+  const findNearbyAttractions = () => {
+    setNearbyPlacesMessage("Requesting your location…"); setNearbyPlacesUrl(""); setNearbyPlaces([]);
+    if (!navigator.geolocation) { setNearbyPlacesMessage("GPS is not supported by this browser. Open Google Maps and search for attractions nearby."); return; }
+    navigator.geolocation.getCurrentPosition((position) => {
+      const { latitude, longitude } = position.coords;
+      setNearbyPlacesUrl(`https://www.google.com/maps/search/attractions/@${latitude},${longitude},14z`);
+      setNearbyPlacesMessage("Searching for nearby attractions…");
+      const query = `[out:json][timeout:18];(node(around:10000,${latitude},${longitude})["tourism"~"attraction|museum|viewpoint|zoo|gallery|theme_park"];way(around:10000,${latitude},${longitude})["tourism"~"attraction|museum|viewpoint|zoo|gallery|theme_park"];relation(around:10000,${latitude},${longitude})["tourism"~"attraction|museum|viewpoint|zoo|gallery|theme_park"];);out center tags 20;`;
+      void fetch("https://overpass-api.de/api/interpreter", { method: "POST", headers: { "Content-Type": "application/x-www-form-urlencoded;charset=UTF-8" }, body: new URLSearchParams({ data: query }).toString() })
+        .then(async (response) => { if (!response.ok) throw new Error("Nearby search service is temporarily unavailable."); return await response.json() as { elements?: Array<{ id: number; type: string; lat?: number; lon?: number; center?: { lat: number; lon: number }; tags?: Record<string, string> }> }; })
+        .then((result) => {
+          const places = (result.elements || []).map((item) => ({ id: `${item.type}-${item.id}`, name: item.tags?.name || item.tags?.["name:en"] || "Unnamed attraction", kind: item.tags?.tourism || item.tags?.historic || "Attraction", lat: item.lat ?? item.center?.lat ?? latitude, lon: item.lon ?? item.center?.lon ?? longitude })).filter((item) => item.name !== "Unnamed attraction").slice(0, 12);
+          setNearbyPlaces(places);
+          setNearbyPlacesMessage(places.length ? `Found ${places.length} nearby places within about 10 km.` : "No named attractions found nearby. Use Google Maps for a broader search.");
+        })
+        .catch((error) => setNearbyPlacesMessage(error instanceof Error ? `${error.message} Use Google Maps for nearby results.` : "Nearby search failed. Use Google Maps for nearby results."));
+    }, (error) => setNearbyPlacesMessage(error.message || "Location permission was denied. Enable location access and try again."), { enableHighAccuracy: false, timeout: 10000, maximumAge: 120000 });
+  };
+
+  const detectExpenseLocation = () => {
+    if (!navigator.geolocation) { setExpenseMessage("GPS location is not supported by this browser."); return; }
+    setIsDetectingExpenseLocation(true);
+    setExpenseMessage("Requesting GPS permission…");
+    navigator.geolocation.getCurrentPosition(async (position) => {
+      const latitude = position.coords.latitude.toFixed(6);
+      const longitude = position.coords.longitude.toFixed(6);
+      setExpenseLatitude(latitude); setExpenseLongitude(longitude);
+      setExpenseLocation(`GPS ${latitude}, ${longitude}`);
+      try {
+        const response = await fetch(`https://nominatim.openstreetmap.org/reverse?format=jsonv2&lat=${latitude}&lon=${longitude}`);
+        if (response.ok) {
+          const result = await response.json() as { name?: string; display_name?: string };
+          const label = result.name || result.display_name;
+          if (label) setExpenseLocation(`${label} (${latitude}, ${longitude})`);
         }
+      } catch { /* GPS coordinates are still saved if reverse geocoding is unavailable. */ }
+      setIsDetectingExpenseLocation(false);
+      setExpenseMessage("GPS location attached to this expense.");
+    }, (error) => {
+      setIsDetectingExpenseLocation(false);
+      setExpenseMessage(error.message || "Could not access GPS location. Check browser location permission.");
+    }, { enableHighAccuracy: true, timeout: 10000, maximumAge: 60000 });
+  };
 
-        const sheetData = (await sheetResponse.json()) as {
-          values?: unknown[][];
-        };
+  const refreshChecklist = async () => {
+    const response = await fetch(`/api/checklist?tripId=${encodeURIComponent(selectedTripId)}`, { credentials: "same-origin", cache: "no-store" });
+    const result = await response.json() as ApiResponse;
+    if (!response.ok || !result.success) throw new Error(result.error || "Could not refresh the shared checklist.");
+    const items = Array.isArray(result.checklistItems) ? result.checklistItems : [];
+    setChecklistItems(items);
+    return items;
+  };
 
-        const rows = sheetData.values ?? [];
+  const resetGroceryChecklist = async () => {
+    if (!window.confirm("Reset all grocery completion checkboxes for the next shopping trip? The grocery items will remain in Google Sheets.")) return;
+    setChecklistSavingId("__grocery_reset__"); setChecklistMessage("");
+    try {
+      const response = await fetch(`/api/checklist?tripId=${encodeURIComponent(selectedTripId)}`, { method: "POST", credentials: "same-origin", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ action: "reset_grocery", tripId: selectedTripId }) });
+      const result = await response.json() as ApiResponse;
+      if (!response.ok || !result.success) throw new Error(result.error || "Could not reset grocery checkboxes.");
+      await refreshChecklist();
+      setChecklistCategoryIndex(0); setChecklistMessage("Grocery checkboxes reset for both travellers.");
+    } catch (error) { setChecklistMessage(error instanceof Error ? error.message : "Could not reset grocery checkboxes."); }
+    finally { setChecklistSavingId(""); }
+  };
 
-        if (rows.length === 0) {
-          return jsonResponse(
-            { success: true, data: [], count: 0 },
-            200,
-          );
-        }
+  const saveChecklistAction = async (item: ChecklistItem, payload: Record<string, unknown>, optimistic: ChecklistItem, fallbackMessage: string) => {
+    const previous = item;
+    setChecklistSavingId(item.item_id);
+    setChecklistMessage("");
+    setChecklistItems((current) => current.map((entry) => entry.item_id === item.item_id ? optimistic : entry));
+    let savedToSheet = false;
+    try {
+      const response = await fetch(`/api/checklist?tripId=${encodeURIComponent(selectedTripId)}`, { method: "POST", credentials: "same-origin", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ ...payload, item_id: item.item_id, tripId: selectedTripId }) });
+      const result = await response.json() as ApiResponse;
+      if (!response.ok || !result.success) throw new Error(result.error || fallbackMessage);
+      savedToSheet = true;
+      setChecklistMessage(typeof result.message === "string" ? result.message : fallbackMessage);
+      try { await refreshChecklist(); } catch { setChecklistMessage("Saved to Google Sheets. The other device will receive the update on its next sync."); }
+    } catch (error) {
+      if (!savedToSheet) setChecklistItems((current) => current.map((entry) => entry.item_id === item.item_id ? previous : entry));
+      setChecklistMessage(error instanceof Error ? error.message : fallbackMessage);
+    } finally { setChecklistSavingId(""); }
+  };
 
-        const rawHeaders = rows[0].map((value) =>
-          String(value ?? "").trim(),
-        );
+  const setChecklistStatus = async (item: ChecklistItem, person: "Ralph" | "June" | "Shared", status: "✓" | "") => {
+    const done = status === "✓";
+    if (person === "Shared") {
+      const updated = { ...item, shared_done: done, shared_status: status, ralph_status: status, june_status: status, ralph_done: done, june_done: done, to_buy: done ? false : Boolean(item.to_buy) };
+      await saveChecklistAction(item, { action: "set_status", shared_done: done }, updated, "Could not sync shared checklist status.");
+    } else {
+      const nextRalphDone = person === "Ralph" ? done : Boolean(item.ralph_done || item.ralph_status === "✓");
+      const nextJuneDone = person === "June" ? done : Boolean(item.june_done || item.june_status === "✓");
+      const updated = { ...item, [person === "Ralph" ? "ralph_done" : "june_done"]: done, [person === "Ralph" ? "ralph_status" : "june_status"]: status, to_buy: nextRalphDone && nextJuneDone ? false : Boolean(item.to_buy) };
+      await saveChecklistAction(item, { action: "set_status", person, done }, updated, "Could not sync personal checklist status.");
+    }
+  };
 
-        const headers: string[] = [];
+  const setChecklistMode = async (item: ChecklistItem, mode: "SHARED" | "PERSONAL") => {
+    if ((item.completion_mode || "PERSONAL") === mode) return;
+    const sharedDone = Boolean(item.ralph_done || item.ralph_status === "✓" || item.june_done || item.june_status === "✓");
+    const toPersonal = mode === "PERSONAL";
+    const optimistic: ChecklistItem = {
+      ...item,
+      completion_mode: mode,
+      shared_done: toPersonal ? Boolean(item.shared_done) : sharedDone,
+      ralph_done: toPersonal ? Boolean(item.shared_done) : Boolean(item.ralph_done),
+      june_done: toPersonal ? Boolean(item.shared_done) : Boolean(item.june_done),
+    };
+    await saveChecklistAction(item, { action: "set_mode", completion_mode: mode }, optimistic, "Could not change checklist sharing mode.");
+  };
 
-        rawHeaders.forEach((header, index) => {
-          const base = header || `column_${index + 1}`;
-          let key = base;
-          let suffix = 2;
+  const setChecklistCancelled = async (item: ChecklistItem) => {
+    if (!window.confirm(item.cancelled ? `Restore “${item.item}” to the active checklist?` : `Cancel “${item.item}”? It will remain visible in grey with a strikethrough.`)) return;
+    await saveChecklistAction(item, { action: "set_cancelled", cancelled: !item.cancelled }, { ...item, cancelled: !item.cancelled, to_buy: item.cancelled ? item.to_buy : false }, "Could not update cancelled status.");
+  };
 
-          while (headers.includes(key)) {
-            key = `${base}_${suffix++}`;
-          }
+  const startChecklistLongPress = (event: ReactPointerEvent<HTMLElement>, item: ChecklistItem) => {
+    if (event.pointerType === "mouse" && event.button !== 0) return;
+    if ((event.target as HTMLElement).closest("button, a, input, select, textarea")) return;
+    if (checklistLongPressTimer.current !== null) window.clearTimeout(checklistLongPressTimer.current);
+    checklistLongPressTimer.current = window.setTimeout(() => { checklistLongPressTimer.current = null; void setChecklistCancelled(item); }, 700);
+  };
+  const clearChecklistLongPress = () => { if (checklistLongPressTimer.current !== null) window.clearTimeout(checklistLongPressTimer.current); checklistLongPressTimer.current = null; };
 
-          headers.push(key);
+  const toggleChecklistToBuy = async (item: ChecklistItem) => {
+    const toBuy = !item.to_buy;
+    setChecklistSavingId(item.item_id);
+    setChecklistMessage("");
+    setChecklistItems((current) => current.map((entry) => entry.item_id === item.item_id ? { ...entry, to_buy: toBuy } : entry));
+    let savedToSheet = false;
+    try {
+      const response = await fetch(`/api/checklist?tripId=${encodeURIComponent(selectedTripId)}`, { method: "POST", credentials: "same-origin", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ action: "set_to_buy", item_id: item.item_id, to_buy: toBuy, tripId: selectedTripId }) });
+      const result = await response.json() as ApiResponse;
+      if (!response.ok || !result.success) throw new Error(result.error || "Could not update To Buy status.");
+      savedToSheet = true;
+      try { await refreshChecklist(); } catch { setChecklistMessage("To Buy status saved. The list will refresh on its next sync."); }
+    } catch (error) {
+      if (!savedToSheet) setChecklistItems((current) => current.map((entry) => entry.item_id === item.item_id ? { ...entry, to_buy: !toBuy } : entry));
+      setChecklistMessage(error instanceof Error ? error.message : "Could not update To Buy status.");
+    } finally { setChecklistSavingId(""); }
+  };
+
+  const addChecklistItem = async (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    const category = newChecklistCategory || checklistItems.find((item) => (item.list_type || (item.checklist_type === "grocery" ? "GROCERY" : "BEFORE_DEPARTURE")) === newChecklistType)?.category || "Other";
+    if (!newChecklistItem.trim()) { setChecklistMessage("Enter an item name."); return; }
+    setChecklistSavingId("__add__"); setChecklistMessage("");
+    try {
+      const response = await fetch(`/api/checklist?tripId=${encodeURIComponent(selectedTripId)}`, { method: "POST", credentials: "same-origin", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ action: "add", tripId: selectedTripId, list_type: newChecklistType, category, item: newChecklistItem.trim(), quantity: newChecklistQuantity.trim(), notes: newChecklistNotes.trim() }) });
+      const result = await response.json() as ApiResponse;
+      if (!response.ok || !result.success) throw new Error(result.error || "Could not add checklist item.");
+      const refreshedItems = await refreshChecklist();
+      setChecklistTab(newChecklistType === "GROCERY" ? "grocery" : "before");
+      const refreshedCategories = Array.from(new Set(refreshedItems.filter((entry) => (entry.list_type || (entry.checklist_type === "grocery" ? "GROCERY" : "BEFORE_DEPARTURE")) === newChecklistType).map((entry) => entry.category.trim()).filter(Boolean)));
+      setChecklistCategoryIndex(Math.max(0, refreshedCategories.indexOf(category)));
+      setNewChecklistItem(""); setNewChecklistQuantity(""); setNewChecklistNotes(""); setNewChecklistCategory("");
+      setShowChecklistAddModal(false);
+      setChecklistMessage("New item saved to Google Sheets and shared with both travellers.");
+    } catch (error) { setChecklistMessage(error instanceof Error ? error.message : "Could not add checklist item."); }
+    finally { setChecklistSavingId(""); }
+  };
+
+  const saveMemory = async () => {
+    if (!memoryDate || !memoryAttraction.trim() || !memoryContent.trim()) {
+      setMemoryMessage("Please enter the trip date, attraction and memory.");
+      return;
+    }
+    setIsSavingMemory(true);
+    setMemoryMessage("");
+    try {
+      if (memoryPhotoFiles.length > MAX_MEMORY_PHOTOS) throw new Error(`Choose up to ${MAX_MEMORY_PHOTOS} photos per memory.`);
+      const photos = await Promise.all(memoryPhotoFiles.map(async (file) => {
+        if (!file.type.startsWith("image/")) throw new Error(`${file.name} is not an image.`);
+        if (file.size > MAX_MEMORY_PHOTO_BYTES) throw new Error(`${file.name} is larger than 10 MB. Remove it or choose a smaller photo.`);
+        const dataBase64 = await new Promise<string>((resolve, reject) => {
+          const reader = new FileReader();
+          reader.onload = () => resolve(String(reader.result || "").split(",")[1] || "");
+          reader.onerror = () => reject(new Error(`Could not read ${file.name}.`));
+          reader.readAsDataURL(file);
         });
+        return { name: file.name, mime_type: file.type, data_base64: dataBase64 };
+      }));
+      const response = await fetch(`/api/memories?tripId=${encodeURIComponent(selectedTripId)}`, {
+        method: "POST", credentials: "same-origin",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          tripId: selectedTripId,
+          memory_id: typeof crypto !== "undefined" && "randomUUID" in crypto ? crypto.randomUUID() : `${Date.now()}-${Math.random().toString(36).slice(2)}`,
+          trip_date: memoryDate,
+          attraction: memoryAttraction.trim(),
+          content: memoryContent.trim(),
+          photos,
+        }),
+      });
+      const result = (await response.json()) as ApiResponse;
+      if (!response.ok || !result.success) throw new Error(result.error || "Could not save this memory.");
+      const refreshed = await fetch(`/api/memories?tripId=${encodeURIComponent(selectedTripId)}`, { credentials: "same-origin", cache: "no-store" });
+      const refreshedResult = (await refreshed.json()) as ApiResponse;
+      if (refreshed.ok && refreshedResult.success) setMemories(Array.isArray(refreshedResult.memories) ? refreshedResult.memories : []);
+      setMemoryAttraction("");
+      setMemoryContent("");
+      setMemoryPhotoFiles([]);
+      try {
+        window.sessionStorage.removeItem("campervan-memory-attraction");
+        window.sessionStorage.removeItem("campervan-memory-content");
+        window.sessionStorage.removeItem("campervan-memory-preview");
+      } catch { /* Ignore unavailable session storage. */ }
+      setMemoryPreviewOpen(false);
+      setMemoryMessage("Memory saved and shared with your travel companion.");
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "Could not save this memory.";
+      setMemoryMessage(message);
+      // Only start OAuth for explicit authentication/scope failures. Folder sharing
+      // or ordinary Drive API errors must not send the user through reconnect again.
+      if (memoryPhotoFiles.length > 0 && /Google Sheets is not connected|Google access failed|authorization is missing the required upload scope|invalid_grant/i.test(message)) {
+        setShowDriveAccessModal(true);
+      }
+    } finally {
+      setIsSavingMemory(false);
+    }
+  };
 
-        const data = rows.slice(1)
-          .filter((row) =>
-            row.some((value) => String(value ?? "").trim() !== ""),
+  const memoryGalleryPhotos = useMemo(() => memories.flatMap((memory) =>
+    getMemoryPhotoIds(memory.photo_ids).map((id) => ({
+      id,
+      attraction: memory.attraction || "Trip memory",
+      trip_date: memory.trip_date || "",
+      memory_id: memory.memory_id,
+    }))
+  ), [memories]);
+  const getMemoryPhotoUrl = (fileId: string) => `/api/memory-photo?tripId=${encodeURIComponent(selectedTripId)}&fileId=${encodeURIComponent(fileId)}`;
+  const selectedMemoryPhotoIndex = selectedMemoryPhoto ? memoryGalleryPhotos.findIndex((photo) => photo.id === selectedMemoryPhoto.id && photo.memory_id === selectedMemoryPhoto.memory_id) : -1;
+  const selectedPhotoInteractions = selectedMemoryPhoto ? memoryInteractions.filter((entry) => entry.photo_id === selectedMemoryPhoto.id && entry.memory_id === selectedMemoryPhoto.memory_id) : [];
+  const refreshMemoryInteractions = async () => {
+    const response = await fetch(`/api/memory-interactions?tripId=${encodeURIComponent(selectedTripId)}`, { credentials: "same-origin", cache: "no-store" });
+    const result = await response.json() as { success?: boolean; interactions?: MemoryInteraction[]; error?: string };
+    if (!response.ok || !result.success) throw new Error(result.error || "Could not refresh comments and reactions.");
+    setMemoryInteractions(Array.isArray(result.interactions) ? result.interactions : []);
+  };
+  const saveMemoryInteraction = async (action: "reaction" | "comment", value: string) => {
+    if (!selectedMemoryPhoto || !value.trim()) return;
+    setMemoryInteractionSaving(true); setMemoryInteractionMessage("");
+    try {
+      const response = await fetch(`/api/memory-interactions?tripId=${encodeURIComponent(selectedTripId)}`, { method: "POST", credentials: "same-origin", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ action, tripId: selectedTripId, memory_id: selectedMemoryPhoto.memory_id, photo_id: selectedMemoryPhoto.id, value }) });
+      const result = await response.json() as ApiResponse;
+      if (!response.ok || !result.success) throw new Error(result.error || "Could not save this photo interaction.");
+      if (action === "comment") setMemoryCommentDraft("");
+      await refreshMemoryInteractions();
+    } catch (error) { setMemoryInteractionMessage(error instanceof Error ? error.message : "Could not save this interaction."); }
+    finally { setMemoryInteractionSaving(false); }
+  };
+
+  useEffect(() => {
+    if (!verifiedEmail || !selectedTripId || (activeView !== "memories" && !selectedMemoryPhoto)) return;
+    void refreshMemoryInteractions().catch(() => { /* The interval below retries. */ });
+    const pollId = window.setInterval(() => { void refreshMemoryInteractions().catch(() => { /* Retry on the next poll. */ }); }, 8000);
+    return () => window.clearInterval(pollId);
+  }, [verifiedEmail, selectedTripId, activeView, selectedMemoryPhoto?.id, selectedMemoryPhoto?.memory_id]);
+
+  const headerKeys = useMemo(() => (itineraryRows.length > 0 ? Object.keys(itineraryRows[0]) : []), [itineraryRows]);
+  const labelKey = headerKeys[0] || "DAY";
+
+  const tripDays = useMemo<TripDay[]>(() => {
+    if (itineraryRows.length === 0 || headerKeys.length < 2) return [];
+    const dateRow = itineraryRows[0];
+    return headerKeys.slice(1).flatMap((key) => {
+      const date = String(dateRow[key] ?? "").trim();
+      if (!date) return [];
+      return [{
+        key,
+        weekday: key.replace(/_\d+$/, "").replace(/_/g, " ").toUpperCase(),
+        date,
+        dateObject: parseTripDate(date),
+      }];
+    });
+  }, [headerKeys, itineraryRows]);
+
+  const safeDayIndex = tripDays.length > 0 ? Math.min(activeDayIndex, tripDays.length - 1) : 0;
+  const selectedDay = tripDays[safeDayIndex];
+
+  useEffect(() => {
+    if (!selectedTripId || !selectedDay?.date) { setHighlightPhoto(null); return; }
+    let cancelled = false;
+    fetch(`/api/highlight-photo?tripId=${encodeURIComponent(selectedTripId)}&date=${encodeURIComponent(selectedDay.date)}`, { credentials: "same-origin", cache: "no-store" })
+      .then(async (response) => { const result = await response.json() as ApiResponse; if (!response.ok || !result.success) throw new Error(result.error || "Could not load the highlight photo."); if (!cancelled) setHighlightPhoto(result.photo as { id: string; url: string; date?: string } | null); })
+      .catch(() => { if (!cancelled) setHighlightPhoto(null); });
+    return () => { cancelled = true; };
+  }, [selectedTripId, selectedDay?.date]);
+  const today = new Date();
+  const liveDayIndex = tripDays.findIndex((day) => day.dateObject && dateIsSameDay(day.dateObject, today));
+  const dashboardDayIndex = liveDayIndex >= 0 ? liveDayIndex : safeDayIndex;
+  const tripStart = tripDays[0]?.dateObject;
+  const tripEnd = tripDays[tripDays.length - 1]?.dateObject;
+  const isTripOngoing = Boolean(tripStart && tripEnd && today >= tripStart && today <= tripEnd);
+  const isTripUpcoming = Boolean(tripStart && today < tripStart);
+  const dateRange = tripDays.length > 0
+    ? `${tripDays[0].date}–${tripDays[tripDays.length - 1].date} ${TRIP_YEAR}`
+    : "Trip dates will appear here";
+
+  const welcomeName = verifiedEmail.toLowerCase() === "koochanyee@gmail.com" ? "Ralph" : verifiedEmail.toLowerCase() === "wookahwai@gmail.com" ? "June" : "there";
+  const beforeDepartureItems = checklistItems.filter((item) => item.checklist_type !== "grocery");
+  const groceryItems = checklistItems.filter((item) => item.checklist_type === "grocery");
+  const beforeDepartureVisible = !tripStart || today <= tripStart;
+  const activeChecklistTab = checklistTab === "before" && !beforeDepartureVisible ? "grocery" : checklistTab;
+  const activeChecklistItems = activeChecklistTab === "before" ? beforeDepartureItems : groceryItems;
+  const checklistCategories = Array.from(new Set(activeChecklistItems.map((item) => item.category.trim()).filter(Boolean)));
+  const safeChecklistCategoryIndex = checklistCategories.length ? Math.min(checklistCategoryIndex, checklistCategories.length - 1) : 0;
+  const selectedChecklistCategory = checklistCategories[safeChecklistCategoryIndex] ?? "";
+  const itemIsDone = (item: ChecklistItem) => (item.completion_mode || "PERSONAL") === "SHARED" ? Boolean(item.shared_done || item.shared_status === "✓") : Boolean(item.ralph_done || item.ralph_status === "✓") && Boolean(item.june_done || item.june_status === "✓");
+  const selectedChecklistItems = activeChecklistItems.filter((item) => item.category === selectedChecklistCategory).sort((a, b) => Number(Boolean(b.to_buy)) - Number(Boolean(a.to_buy)) || Number(itemIsDone(a)) - Number(itemIsDone(b)) || Number(Boolean(a.cancelled)) - Number(Boolean(b.cancelled)) || Number(a.sort_order || 0) - Number(b.sort_order || 0));
+  const checklistActiveCount = activeChecklistItems.filter((item) => !item.cancelled).length;
+  const checklistCompletedCount = activeChecklistItems.filter((item) => !item.cancelled && ((item.completion_mode || "PERSONAL") === "SHARED" ? Boolean(item.shared_done || item.shared_status === "✓") : Boolean(item.ralph_done || item.ralph_status === "✓") && Boolean(item.june_done || item.june_status === "✓"))).length;
+  const addChecklistCategories = Array.from(new Set(checklistItems.filter((item) => (item.list_type || (item.checklist_type === "grocery" ? "GROCERY" : "BEFORE_DEPARTURE")) === newChecklistType).map((item) => item.category.trim()).filter(Boolean)));
+  const paidOrActualExpenses = expenses.filter((expense) => expense.source !== "FINAL EXPENSES" || expense.payment_status === "Paid");
+  const paidPreTripExpenses = paidOrActualExpenses.filter((expense) => expense.expense_type === "pre-trip");
+  const formatMoney = (amount: number, currency: string) => `${currency || "NZD"} ${Number(amount || 0).toFixed(2)}`;
+  const formatExpenseTotal = (records: TripExpense[]) => {
+    const totals = records.reduce<Record<string, number>>((acc, item) => {
+      const currency = item.currency || "NZD";
+      acc[currency] = (acc[currency] ?? 0) + Number(item.amount || 0);
+      return acc;
+    }, {});
+    return Object.keys(totals).length ? Object.entries(totals).map(([currency, total]) => formatMoney(total, currency)).join(" · ") : formatMoney(0, "NZD");
+  };
+
+  const getEntriesForDay = (day: TripDay | undefined): DayEntry[] => {
+    if (!day || itineraryRows.length < 2) return [];
+    return itineraryRows.slice(1).flatMap((row, index) => {
+      const value = String(row[day.key] ?? "").trim();
+      if (!value) return [];
+      const label = String(row[labelKey] ?? "").trim() || `Itinerary item ${index + 1}`;
+      return [{ key: `${day.key}-${index}`, label, value }];
+    });
+  };
+
+  const dayEntries = useMemo<DayEntry[]>(() => {
+    if (!selectedDay || itineraryRows.length < 2) return [];
+    return itineraryRows.slice(1).flatMap((row, index) => {
+      const value = String(row[selectedDay.key] ?? "").trim();
+      if (!value) return [];
+      const label = String(row[labelKey] ?? "").trim() || `Itinerary item ${index + 1}`;
+      return [{ key: `${selectedDay.key}-${index}`, label, value }];
+    });
+  }, [selectedDay, itineraryRows, labelKey]);
+   
+  const dashboardPreviewDays = tripDays
+  .slice(dashboardDayIndex, dashboardDayIndex + 3)
+  .map((day) => {
+    const entries = getEntriesForDay(day);
+
+    const route =
+      entries.find((entry) => /^route$/i.test(entry.label))?.value ?? "";
+
+    const highlights = entries
+      .filter((entry) =>
+        /^(morning|afternoon|evening)$/i.test(entry.label)
+      )
+      .flatMap((entry) =>
+        entry.value
+          .split(/\n+/)
+          .map((line) =>
+            line
+              .trim()
+              .replace(/^\d{1,2}(?:[:.]\d{2})?\s*(?:a\.?m\.?|p\.?m\.?)?\s*[-–:,]?\s*/i, "")
           )
-          .map((row) => {
-            const item: Record<string, string> = {};
+          .filter(
+            (line) =>
+              line.length > 4 &&
+              !/^(breakfast|lunch|dinner|self cook|rest|free and easy|sleep|depart|continue|drive to|drive toward|arrive|check in|check out|pack|refuel)/i.test(line)
+          )
+      )
+      .slice(0, 3);
 
-            headers.forEach((header, index) => {
-              item[header] = String(row[index] ?? "");
-            });
-
-            return item;
-          });
-        
-        // Lite mode returns the main itinerary only to reduce mobile data usage.
-        // Normal mode retains the existing supplementary worksheet behavior.
-        const supplementaryTabs: Record<string, string[][]> = {};
-        let supplementaryError: string | undefined;
-
-        if (url.searchParams.get("lite") !== "1") {
-        try {
-          const metadataUrl =
-            `https://sheets.googleapis.com/v4/spreadsheets/` +
-            `${encodeURIComponent(activeSheetId)}` +
-            `?fields=sheets(properties(title))`;
-
-          const metadataResponse = await fetch(metadataUrl, {
-            headers: {
-              Authorization: `Bearer ${tokenData.access_token}`,
-            },
-          });
-
-          if (!metadataResponse.ok) {
-            throw new Error("Could not read worksheet metadata");
-          }
-
-          const spreadsheetMeta = (await metadataResponse.json()) as {
-            sheets?: Array<{
-              properties?: {
-                title?: string;
-              };
-            }>;
-          };
-
-          const mainTab = env.GOOGLE_SHEET_TAB.trim();
-
-          const tabTitles = (spreadsheetMeta.sheets ?? [])
-            .map((sheet) => sheet.properties?.title)
-            .filter(
-              (title): title is string =>
-                Boolean(title) && title !== mainTab,
-            );
-
-          if (tabTitles.length > 0) {
-            const batchUrl = new URL(
-              `https://sheets.googleapis.com/v4/spreadsheets/` +
-              `${encodeURIComponent(activeSheetId)}/values:batchGet`,
-            );
-
-            tabTitles.forEach((title) => {
-              const range =
-                `'${title.replace(/'/g, "''")}'!A:ZZZ`;
-              batchUrl.searchParams.append("ranges", range);
-            });
-
-            const batchResponse = await fetch(batchUrl.toString(), {
-              headers: {
-                Authorization: `Bearer ${tokenData.access_token}`,
-              },
-            });
-
-            if (!batchResponse.ok) {
-              throw new Error("Could not read supplementary worksheets");
-            }
-
-            const batchData = (await batchResponse.json()) as {
-              valueRanges?: Array<{
-                values?: unknown[][];
-              }>;
-            };
-
-            tabTitles.forEach((title, index) => {
-              const values =
-                batchData.valueRanges?.[index]?.values ?? [];
-
-              supplementaryTabs[title] = values.map((row) =>
-                row.map((value) => String(value ?? "")),
-              );
-            });
-          }
-        } catch (error) {
-          console.error(
-            "Supplementary worksheet read failed:",
-            error instanceof Error ? error.message : String(error),
-          );
-          supplementaryError =
-            "Some supplementary worksheet details could not be loaded.";
-        }
-        }
-
-        return jsonResponse(
-          {
-            success: true,
-            data,
-            count: data.length,
-            supplementaryTabs,
-            ...(supplementaryError ? { supplementaryError } : {}),
-          },
-          200,
-        );
-
-      } catch (error) {
-        console.error("[ITINERARY READ FAILED]", {
-          name: error instanceof Error ? error.name : "UnknownError",
-          message: error instanceof Error ? error.message : String(error),            stack: error instanceof Error ? error.stack : undefined,
-          });
-
-        return jsonResponse(
-          {
-            success: false,
-            error: "An unexpected error occurred while reading the itinerary.",
-          },            
-          500,
-        );
-      }
+    return { day, route, highlights };
+  });
+  
+  const categorized = useMemo(() => {
+    const groups: Record<string, DayEntry[]> = {
+      route: [],
+      places: [],
+      stay: [],
+      other: [],
+    };
+    for (const entry of dayEntries) {
+      const label = entry.label.toLowerCase();
+      if (/route|drive|driving|destination|distance|travel time|departure|arrival|transport/.test(label)) groups.route.push(entry);
+      else if (/attraction|place|visit|activity|experience|sight|stop|location|walk|hike|tour/.test(label)) groups.places.push(entry);
+      else if (/camp|campsite|accommodation|hotel|booking|check.?in|reservation|stay|overnight/.test(label)) groups.stay.push(entry);
+      else groups.other.push(entry);
     }
+    return groups;
+  }, [dayEntries]);
 
-    // Save a confirmed session location to SESSION LOCATIONS only.
-    if (
-      request.method === "POST" &&
-      url.pathname === "/api/session-location"
-    ) {
-      const session = await readSession(request, env);
-      const trip = await resolveTrip(request, env);
-      if (!trip) return jsonResponse({ success: false, error: "Select a valid trip first." }, 404);
+  const sessionLocationRows = useMemo(() => {
+    const tabName = Object.keys(supplementaryTabs).find((name) => /^session\s+locations?$/i.test(name));
+    const rows = tabName ? (supplementaryTabs[tabName] ?? []) : [];
+    if (rows.length < 2) return [] as Array<{ date: string; session: string; location: string }>;
+    const headers = rows[0].map((cell) => String(cell ?? "").trim().toLowerCase());
+    const dateIndex = headers.findIndex((h) => h === "date" || h.includes("trip date"));
+    const sessionIndex = headers.findIndex((h) => h === "session" || h.includes("time of day"));
+    const locationIndex = headers.findIndex((h) => h === "planned location" || h === "location");
+    if (dateIndex < 0 || sessionIndex < 0 || locationIndex < 0) return [];
+    return rows.slice(1).map((row) => ({
+      date: String(row[dateIndex] ?? "").trim(),
+      session: String(row[sessionIndex] ?? "").trim(),
+      location: String(row[locationIndex] ?? "").trim(),
+    })).filter((row) => row.date && row.session);
+  }, [supplementaryTabs]);
 
-      if (!session) {
-        return jsonResponse(
-          { success: false, error: "Authentication required." },
-          401,
-        );
-      }
+  const normalizeTripDate = (value: string) => value.toLowerCase().replace(/,/g, " ").replace(/\s+/g, " ").trim();
+  const getSessionLocation = (session: string) => {
+    const selectedDate = normalizeTripDate(selectedDay?.date ?? "");
+    const match = sessionLocationRows.find((row) => normalizeTripDate(row.date) === selectedDate && row.session.toLowerCase() === session.toLowerCase());
+    return match?.location ?? "";
+  };
 
-      // Accept writes only from this same origin.
-      if (request.headers.get("Origin") !== url.origin) {
-        return jsonResponse(
-          { success: false, error: "Invalid request origin." },
-          403,
-        );
-      }
+  const openSessionLocationEditor = (session: string) => {
+    const key = `${selectedDay?.date ?? ""}|${session}`;
+    setLocationDrafts((current) => ({ ...current, [key]: current[key] ?? getSessionLocation(session) }));
+    setLocationMessage("");
+    setLocationModalSession(session);
+  };
 
-      if (
-        !env.GOOGLE_CLIENT_ID ||
-        !env.GOOGLE_CLIENT_SECRET ||
-        !env.TOKEN_ENCRYPTION_KEY ||
-        !trip.sheetId ||
-        !env.OAUTH_TOKEN_STORE
-      ) {
-        return jsonResponse(
-          { success: false, error: "Google Sheets is not configured." },
-          500,
-        );
-      }
-
+  const detectMemoryPlace = async () => {
+    if (!navigator.geolocation) {
+      setMemoryMessage("Location detection is not supported by this browser.");
+      return;
+    }
+    setIsDetectingPlace(true);
+    setMemoryMessage("Requesting your location permission…");
+    navigator.geolocation.getCurrentPosition(async (position) => {
+      const { latitude, longitude } = position.coords;
       try {
-        const body = (await request.json()) as {
-          date?: unknown;
-          session?: unknown;
-          oldLocation?: unknown;
-          newLocation?: unknown;
-        };
-
-        const date =
-          typeof body.date === "string" ? body.date.trim() : "";
-        const sessionName =
-          typeof body.session === "string"
-            ? body.session.trim()
-            : "";
-        const oldLocation =
-          typeof body.oldLocation === "string"
-            ? body.oldLocation.trim()
-            : "";
-        const newLocation =
-          typeof body.newLocation === "string"
-            ? body.newLocation.trim()
-            : "";
-
-        if (
-          !date ||
-          !sessionName ||
-          !newLocation ||
-          date.length > 40 ||
-          sessionName.length > 40 ||
-          oldLocation.length > 1000 ||
-          newLocation.length > 1000 ||
-          !["Morning", "Afternoon", "Evening"].includes(sessionName)
-        ) {
-          return jsonResponse(
-            { success: false, error: "Invalid session location details." },
-            400,
-          );
-        }
-
-        const tokenKey =
-          `google-refresh:${session.email.toLowerCase()}`;
-        const encryptedRefreshToken =
-          await env.OAUTH_TOKEN_STORE.get(tokenKey);
-
-        if (!encryptedRefreshToken) {
-          return jsonResponse(
-            {
-              success: false,
-              error: "Google Sheets is not connected. Reconnect Google Sheets.",
-              connectUrl: "/api/sheets/connect",
-            },
-            403,
-          );
-        }
-
-        const refreshToken = await decryptToken(
-          encryptedRefreshToken,
-          env.TOKEN_ENCRYPTION_KEY,
-        );
-
-        const tokenResponse = await fetch(
-          "https://oauth2.googleapis.com/token",
-          {
-            method: "POST",
-            headers: {
-              "Content-Type": "application/x-www-form-urlencoded",
-            },
-            body: new URLSearchParams({
-              client_id: env.GOOGLE_CLIENT_ID,
-              client_secret: env.GOOGLE_CLIENT_SECRET,
-              refresh_token: refreshToken,
-              grant_type: "refresh_token",
-            }).toString(),
-          },
-        );
-
-        if (!tokenResponse.ok) {
-          return jsonResponse(
-            {
-              success: false,
-              error: "Google access failed. Reconnect Google Sheets.",
-              connectUrl: "/api/sheets/connect",
-            },
-            502,
-          );
-        }
-
-        const tokenData = (await tokenResponse.json()) as {
-          access_token?: string;
-        };
-
-        if (!tokenData.access_token) {
-          return jsonResponse(
-            { success: false, error: "Google returned no access token." },
-            502,
-          );
-        }
-
-        const sessionTab = await findExistingTab(tokenData.access_token, trip.sheetId, ["SESSION LOCATION", "SESSION LOCATIONS"], "SESSION LOCATION");
-        await ensureSheetTab(tokenData.access_token, trip.sheetId, sessionTab, ["Date", "Session", "Planned location"]);
-        const sheetId = encodeURIComponent(trip.sheetId);
-        const readRange = `${quoteSheetTab(sessionTab)}!A:C`;
-        const readUrl =
-          `https://sheets.googleapis.com/v4/spreadsheets/${sheetId}/values/` +
-          encodeURIComponent(readRange);
-
-        const readResponse = await fetch(readUrl, {
-          headers: {
-            Authorization: `Bearer ${tokenData.access_token}`,
-          },
-        });
-
-        if (!readResponse.ok) {
-          return jsonResponse(
-            {
-              success: false,
-              error: "Could not read SESSION LOCATIONS. Check Google Sheets access.",
-            },
-            502,
-          );
-        }
-
-        const sheetData = (await readResponse.json()) as {
-          values?: unknown[][];
-        };
-        const rows = sheetData.values ?? [];
-
-        if (rows.length === 0) {
-          return jsonResponse(
-            { success: false, error: "SESSION LOCATIONS is empty." },
-            409,
-          );
-        }
-
-        const headers = rows[0].map((value) =>
-          String(value ?? "").trim().toLowerCase(),
-        );
-        const dateCol = headers.indexOf("date");
-        const sessionCol = headers.indexOf("session");
-        const locationCol = headers.indexOf("planned location");
-
-        if (dateCol < 0 || sessionCol < 0 || locationCol < 0) {
-          return jsonResponse(
-            {
-              success: false,
-              error: "SESSION LOCATIONS must have Date, Session, and Planned location headers.",
-            },
-            409,
-          );
-        }
-
-        const matches: Array<{ rowNumber: number; location: string }> = [];
-
-        rows.slice(1).forEach((row, index) => {
-          const rowDate = String(row[dateCol] ?? "").trim();
-          const rowSession = String(row[sessionCol] ?? "").trim();
-
-          if (rowDate === date && rowSession === sessionName) {
-            matches.push({
-              rowNumber: index + 2,
-              location: String(row[locationCol] ?? "").trim(),
-            });
-          }
-        });
-
-        if (matches.length === 0 && !oldLocation) {
-          const appendUrl = `${sheetsValuesUrl(trip.sheetId, `${quoteSheetTab(sessionTab)}!A:C`)}:append?valueInputOption=RAW&insertDataOption=INSERT_ROWS`;
-          const appendResponse = await fetch(appendUrl, { method: "POST", headers: { Authorization: `Bearer ${tokenData.access_token}`, "Content-Type": "application/json" }, body: JSON.stringify({ values: [[date, sessionName, newLocation]] }) });
-          if (!appendResponse.ok) return jsonResponse({ success: false, error: "Could not add this session location to Google Sheets." }, 502);
-          return jsonResponse({ success: true, message: "Session location added.", date, session: sessionName, oldLocation: "", newLocation }, 200);
-        }
-        if (matches.length !== 1) {
-          return jsonResponse(
-            {
-              success: false,
-              error: matches.length === 0
-                ? "Session row not found for the existing location. Refresh the itinerary and try again."
-                : "Duplicate date and session rows found. Please correct SESSION LOCATIONS first.",
-            },
-            409,
-          );
-        }
-
-        const match = matches[0];
-
-        // Prevent overwriting a change made by someone else.
-        if (match.location !== oldLocation) {
-          return jsonResponse(
-            {
-              success: false,
-              error: "This location has changed since you opened it. Refresh and review the latest value.",
-              currentLocation: match.location,
-            },
-            409,
-          );
-        }
-
-        const columnLetter = (columnIndex: number): string => {
-          let number = columnIndex + 1;
-          let result = "";
-
-          while (number > 0) {
-            const remainder = (number - 1) % 26;
-            result =
-            String.fromCharCode(65 + remainder) + result;
-            number = Math.floor((number - 1) / 26);
-          }
-          return result;
-        };
-
-        const writeRange =
-          `${quoteSheetTab(sessionTab)}!${columnLetter(locationCol)}${match.rowNumber}`;
-        const writeUrl =
-          `https://sheets.googleapis.com/v4/spreadsheets/${sheetId}/values/` +
-          encodeURIComponent(writeRange) +
-          "?valueInputOption=RAW";
-
-        const writeResponse = await fetch(writeUrl, {
-          method: "PUT",
-          headers: {
-            Authorization: `Bearer ${tokenData.access_token}`,
-            "Content-Type": "application/json",
-          },
-          body: JSON.stringify({
-            values: [[newLocation]],
-          }),
-        });
-
-        if (!writeResponse.ok) {
-          const errorText = await writeResponse.text();
-          console.error(
-            "Session location save failed:",
-            writeResponse.status,
-            errorText.slice(0, 500),
-          );
-
-          return jsonResponse(
-            {
-              success: false,
-              error:
-                writeResponse.status === 403
-                  ? "Google Sheets write permission is missing. Reconnect Google Sheets and grant the requested access."
-                  : "Could not save the location. Your change was not confirmed.",
-            },
-            502,
-          );
-        }
-
-        return jsonResponse(
-          {
-            success: true,
-            message: "Session location saved.",
-            date,
-            session: sessionName,
-            oldLocation,
-            newLocation,
-          },
-          200,
-        );
+        const response = await fetch(`https://nominatim.openstreetmap.org/reverse?format=jsonv2&lat=${latitude}&lon=${longitude}`);
+        if (!response.ok) throw new Error("Could not resolve the GPS coordinates to a place name.");
+        const result = await response.json() as { name?: string; display_name?: string; address?: Record<string, string> };
+        const address = result.address ?? {};
+        const place = result.name || address.tourism || address.amenity || address.natural || address.road || address.suburb || result.display_name;
+        setMemoryAttraction(place || `GPS ${latitude.toFixed(5)}, ${longitude.toFixed(5)}`);
+        setMemoryMessage(`Place detected from GPS (${latitude.toFixed(4)}, ${longitude.toFixed(4)}). Please check the place name before saving.`);
       } catch (error) {
-        console.error(
-          "Session location save failed:",
-          error instanceof Error ? error.message : String(error),
-        );
-
-        return jsonResponse(
-          { success: false, error: "Could not process the location update." },
-          500,
-        );
+        setMemoryAttraction(`GPS ${latitude.toFixed(5)}, ${longitude.toFixed(5)}`);
+        setMemoryMessage(error instanceof Error ? `${error.message} Coordinates added instead.` : "Coordinates added instead.");
+      } finally {
+        setIsDetectingPlace(false);
       }
-    }
+    }, (error) => {
+      setIsDetectingPlace(false);
+      setMemoryMessage(error.code === error.PERMISSION_DENIED ? "Location permission was denied. You can type the place name instead." : "Could not detect location. Please try again or enter the place manually.");
+    }, { enableHighAccuracy: true, timeout: 12000, maximumAge: 60000 });
+  };
 
-    
-    // Serve private Google Drive memory photos through the authenticated Worker.
-    // Direct drive.google.com image URLs do not work reliably for private files.
-    if (request.method === "GET" && url.pathname === "/api/memory-photo") {
-      const session = await readSession(request, env);
-      if (!session) return jsonResponse({ success: false, error: "Authentication required." }, 401);
-      const trip = await resolveTrip(request, env);
-      if (!trip) return jsonResponse({ success: false, error: "Select a valid trip first." }, 404);
-      const fileId = (url.searchParams.get("fileId") || "").trim();
-      if (!/^[a-zA-Z0-9_-]{10,200}$/.test(fileId)) return jsonResponse({ success: false, error: "Invalid photo ID." }, 400);
-      try {
-        const accessToken = await googleAccessToken(session, env);
-        const driveResponse = await fetch(`https://www.googleapis.com/drive/v3/files/${encodeURIComponent(fileId)}?alt=media`, {
-          headers: { Authorization: `Bearer ${accessToken}` },
-        });
-        if (!driveResponse.ok) {
-          const detail = (await driveResponse.text().catch(() => "")).slice(0, 300);
-          return jsonResponse({ success: false, error: driveResponse.status === 404 ? "Photo not found or not shared with this traveller." : `Could not load photo from Google Drive (HTTP ${driveResponse.status}). ${detail}` }, driveResponse.status === 404 ? 404 : 502);
+  const saveSessionLocation = async (session: string) => {
+    const key = `${selectedDay?.date ?? ""}|${session}`;
+    const newLocation = (locationDrafts[key] ?? getSessionLocation(session)).trim();
+    const oldLocation = getSessionLocation(session);
+    if (!selectedDay || !newLocation) { setLocationMessage("Enter a planned location before saving."); return; }
+    setLocationSaving(key);
+    setLocationMessage("");
+    try {
+      const response = await fetch(`/api/session-location?tripId=${encodeURIComponent(selectedTripId)}`, {
+        method: "POST", credentials: "same-origin",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ tripId: selectedTripId, date: selectedDay.date, Date: selectedDay.date, session, Session: session, oldLocation, newLocation, "Planned location": newLocation }),
+      });
+      const result = (await response.json()) as ApiResponse;
+      if (!response.ok || !result.success) throw new Error(result.error || "Could not save the planned location.");
+      setSupplementaryTabs((current) => {
+        const existingTabName = Object.keys(current).find((name) => /^session\s+locations?$/i.test(name));
+        const tabName = existingTabName || "SESSION LOCATION";
+        const rows = (current[tabName] ?? [["Date", "Session", "Planned location"]]).map((row) => [...row]);
+        if (rows.length) {
+          const headers = rows[0].map((cell) => String(cell ?? "").trim().toLowerCase());
+          const dateIndex = headers.findIndex((h) => h === "date" || h.includes("trip date"));
+          const sessionIndex = headers.findIndex((h) => h === "session" || h.includes("time of day"));
+          const locationIndex = headers.findIndex((h) => h === "planned location" || h === "location");
+          const rowIndex = rows.findIndex((row, i) => i > 0 && normalizeTripDate(String(row[dateIndex] ?? "")) === normalizeTripDate(selectedDay.date) && String(row[sessionIndex] ?? "").toLowerCase() === session.toLowerCase());
+          if (rowIndex > 0 && locationIndex >= 0) rows[rowIndex][locationIndex] = newLocation;
+          else if (locationIndex >= 0 && dateIndex >= 0 && sessionIndex >= 0) rows.push([selectedDay.date, session, newLocation]);
         }
-        const contentType = driveResponse.headers.get("Content-Type") || "application/octet-stream";
-        if (!/^image\/(jpeg|png|webp|gif|heic|heif)$/i.test(contentType.split(";")[0])) {
-          return jsonResponse({ success: false, error: "The Drive file is not a supported image." }, 415);
+        return { ...current, [tabName]: rows };
+      });
+      setLocationDrafts((current) => { const next = { ...current }; delete next[key]; return next; });
+      setLocationMessage(`${session} location saved.`);
+      setLocationModalSession(null);
+    } catch (error) {
+      setLocationMessage(error instanceof Error ? error.message : "Could not save the planned location.");
+    } finally { setLocationSaving(""); }
+  };
+
+  const navigateToItinerary = (dayIndex = dashboardDayIndex) => {
+    setActiveDayIndex(Math.max(0, Math.min(dayIndex, Math.max(0, tripDays.length - 1))));
+    setActiveView("itinerary");
+  };
+  const selectedTrip = trips.find((trip) => trip.id === selectedTripId);
+
+  return (
+    <div className="min-h-screen bg-[#f4f6f4] pb-40 text-slate-900">
+      <style>{`
+        @keyframes itinerarySlideIn { from { opacity: .65; transform: translateX(10px); } to { opacity: 1; transform: translateX(0); } }
+        @keyframes travelLoadingMove { 0% { transform: translateX(-8vw); } 100% { transform: translateX(108vw); } }
+        @keyframes travelLoadingFloat { 0%,100% { transform: translateY(0); } 50% { transform: translateY(-4px); } }
+        @media (max-width: 640px) {
+          /* Global mobile density: compact spacing without changing desktop styles. */
+          main { padding-left: 0.75rem !important; padding-right: 0.75rem !important; padding-top: 0.875rem !important; }
+          main.space-y-6 > * + * { margin-top: 1rem !important; }
+          main .p-6, main .sm\:p-6 { padding: 0.875rem !important; }
+          main .p-5 { padding: 0.75rem !important; }
+          main .p-4 { padding: 0.75rem !important; }
+          main .p-3 { padding: 0.625rem !important; }
+          main .px-6 { padding-left: 0.875rem !important; padding-right: 0.875rem !important; }
+          main .py-6 { padding-top: 0.875rem !important; padding-bottom: 0.875rem !important; }
+          main .gap-6 { gap: 0.875rem !important; }
+          main .gap-5 { gap: 0.75rem !important; }
+          main .gap-4 { gap: 0.625rem !important; }
+          main .gap-3 { gap: 0.5rem !important; }
+          main .mt-6 { margin-top: 0.875rem !important; }
+          main .mt-5, main .mt-4 { margin-top: 0.625rem !important; }
+          main .mt-3 { margin-top: 0.5rem !important; }
+          main .space-y-5 > * + * { margin-top: 0.875rem !important; }
+          main .space-y-4 > * + * { margin-top: 0.625rem !important; }
+          main .rounded-3xl { border-radius: 1.125rem !important; }
+          main .rounded-2xl { border-radius: 0.875rem !important; }
+          main .text-3xl { font-size: 1.5rem !important; line-height: 2rem !important; }
+          main .text-2xl { font-size: 1.25rem !important; line-height: 1.75rem !important; }
+          main .text-xl { font-size: 1.125rem !important; line-height: 1.5rem !important; }
+          main .text-lg { font-size: 1rem !important; line-height: 1.5rem !important; }
+          header > div { padding: 0.625rem 0.75rem !important; gap: 0.5rem !important; }
+          header h1 { font-size: 1.125rem !important; line-height: 1.5rem !important; }
+          header .text-sm { font-size: 0.75rem !important; line-height: 1rem !important; }
+          header button { min-height: 2.25rem; padding: 0.375rem 0.625rem !important; }
+          main button, main [role="button"] { min-height: 2.5rem; }
+          main input, main select, main textarea { font-size: 0.875rem; }
+          main input, main select { min-height: 2.5rem; }
+          nav { padding-left: 0.375rem !important; padding-right: 0.375rem !important; }
         }
-        return new Response(driveResponse.body, {
-          status: 200,
-          headers: {
-            "Content-Type": contentType,
-            "Cache-Control": "private, max-age=300",
-            "X-Content-Type-Options": "nosniff",
-            "Content-Disposition": "inline",
-          },
-        });
-      } catch (error) {
-        return jsonResponse({ success: false, error: error instanceof Error ? error.message : "Could not retrieve the trip photo." }, 502);
-      }
-    }
+        @media (prefers-reduced-motion: reduce) { .travel-loading-vehicle { animation: none !important; } }
+      `}</style>
+      <header className="border-b border-slate-200 bg-white">
+        <div className="mx-auto flex max-w-6xl flex-col gap-3 px-4 py-4 sm:flex-row sm:items-center sm:justify-between sm:px-6">
+          <button type="button" onClick={() => setActiveView("home")} className="text-left">
+            <p className="text-xs font-bold uppercase tracking-[0.18em] text-emerald-800">Shared travel companion</p>
+            <h1 className="mt-1 text-2xl font-bold tracking-tight sm:text-3xl">{selectedTrip?.name || "Travel Companion"}</h1>
+            <p className="mt-1 text-sm text-slate-500">{dateRange}</p>
+          </button>
+          <div className="flex flex-wrap items-center gap-2">
+            {verifiedEmail && selectedTripId && <button type="button" aria-pressed={dataSaverMode} onClick={() => setDataSaverMode((enabled) => !enabled)} className={`rounded-lg border px-3 py-2 text-sm font-semibold ${dataSaverMode ? "border-emerald-800 bg-emerald-50 text-emerald-900" : "border-slate-300 bg-white text-slate-700"}`} title="Lite mode loads the main itinerary without supplementary worksheets">{dataSaverMode ? "Lite mode: On" : "Lite mode: Off"}</button>}
+            {verifiedEmail && <span className="text-sm font-semibold text-slate-700">Welcome, {welcomeName}</span>}
+            {verifiedEmail && selectedTripId && activeView !== "home" && (
+              <button type="button" onClick={goBack} className="rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm font-semibold hover:bg-slate-50">← Back</button>
+            )}
+            {verifiedEmail && selectedTripId && activeView !== "home" && (
+              <button type="button" onClick={goToDashboard} className="rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm font-semibold hover:bg-slate-50">Dashboard</button>
+            )}
+            {verifiedEmail && selectedTripId && activeView === "home" && (
+              <button type="button" onClick={returnToTripSelection} className="rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm font-semibold hover:bg-slate-50">Trip selection</button>
+            )}
+          </div>
+        </div>
+      </header>
 
-    if (url.pathname === "/api/highlight-photo" && (request.method === "GET" || request.method === "POST")) {
-      const session = await readSession(request, env);
-      if (!session) return jsonResponse({ success: false, error: "Authentication required." }, 401);
-      if (request.method === "POST" && request.headers.get("Origin") !== url.origin) return jsonResponse({ success: false, error: "Invalid request origin." }, 403);
-      try {
-        let body: Record<string, unknown> = {};
-        if (request.method === "POST") body = await request.json() as Record<string, unknown>;
-        const tripId = typeof body.tripId === "string" ? body.tripId : url.searchParams.get("tripId") || undefined;
-        const trip = await resolveTrip(request, env, tripId);
-        if (!trip) return jsonResponse({ success: false, error: "Select a valid trip first." }, 404);
-        const date = (request.method === "POST" ? body.date : url.searchParams.get("date")) as string | null;
-        if (!date || !String(date).trim() || String(date).length > 40) return jsonResponse({ success: false, error: "Select a valid itinerary date." }, 400);
-        const dateKey = String(date).trim().toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "");
-        const key = `highlight-photo:${trip.id}:${dateKey}`;
-        if (request.method === "GET") {
-          const saved = await env.OAUTH_TOKEN_STORE.get(key);
-          const photo = saved ? JSON.parse(saved) as { id?: string; url?: string; date?: string; uploaded_by?: string } : null;
-          if (url.searchParams.get("image") === "1") {
-            const fileId = url.searchParams.get("fileId") || photo?.id || "";
-            if (!fileId || !photo?.id || fileId !== photo.id) return jsonResponse({ success: false, error: "The saved highlight photo was not found." }, 404);
-            const accessToken = await googleAccessToken(session, env);
-            const imageResponse = await fetch(`https://www.googleapis.com/drive/v3/files/${encodeURIComponent(fileId)}?alt=media`, { headers: { Authorization: `Bearer ${accessToken}` } });
-            if (!imageResponse.ok) return jsonResponse({ success: false, error: `Could not load the saved highlight photo from Google Drive (HTTP ${imageResponse.status}).` }, 502);
-            return new Response(imageResponse.body, { status: 200, headers: { "Content-Type": imageResponse.headers.get("Content-Type") || "image/jpeg", "Cache-Control": "private, max-age=300", "X-Content-Type-Options": "nosniff" } });
-          }
-          const imageUrl = photo?.id ? `${url.origin}/api/highlight-photo?tripId=${encodeURIComponent(trip.id)}&date=${encodeURIComponent(String(date))}&image=1&fileId=${encodeURIComponent(photo.id)}` : "";
-          return jsonResponse({ success: true, photo: photo ? { ...photo, url: imageUrl } : null, tripId: trip.id, date: String(date) });
-        }
-        const photo = body.photo as { name?: unknown; mime_type?: unknown; data_base64?: unknown } | undefined;
-        if (!photo) return jsonResponse({ success: false, error: "Choose a photo first." }, 400);
-        const accessToken = await googleAccessToken(session, env);
-        const uploaded = await uploadSharedMemoryPhoto(accessToken, { ...photo, name: `highlight-${dateKey}-${String(photo.name || "photo")}` });
-        const imageUrl = `${url.origin}/api/highlight-photo?tripId=${encodeURIComponent(trip.id)}&date=${encodeURIComponent(String(date))}&image=1&fileId=${encodeURIComponent(uploaded.id)}`;
-        const savedPhoto = { id: uploaded.id, url: imageUrl, date: String(date), uploaded_by: session.email, updated_at: new Date().toISOString() };
-        await env.OAUTH_TOKEN_STORE.put(key, JSON.stringify(savedPhoto));
-        return jsonResponse({ success: true, photo: savedPhoto, message: "Today Highlight photo saved to the shared Drive folder." });
-      } catch (error) {
-        return jsonResponse({ success: false, error: error instanceof Error ? error.message : "Could not save the Today Highlight photo." }, 500);
-      }
-    }
+      <main className="mx-auto max-w-6xl space-y-6 px-4 py-5 sm:px-6 sm:py-7">
+        {!verifiedEmail && (
+          <section className="rounded-2xl border border-slate-200 bg-white p-5 shadow-sm">
+            <h2 className="text-lg font-semibold">Google account</h2>
+            <p className="mt-2 text-sm text-slate-600">Sign in with an approved Google account to view your shared travel companion.</p>
+            {authMessage && <p className="mt-2 text-sm text-slate-500" aria-live="polite">{authMessage}</p>}
+            {isVerifying && <p className="mt-2 text-sm text-slate-500">Verifying account…</p>}
+            <div id="google-sign-in-button" className="mt-4 min-h-10" />
+          </section>
+        )}
 
-    // Shared Trip Memories: read and save records in TRIP_MEMORIES.
-    if (
-      (request.method === "GET" || request.method === "POST") &&
-      url.pathname === "/api/memories"
-    ) {
-      const session = await readSession(request, env);
-      const trip = await resolveTrip(request, env);
-      if (!trip) return jsonResponse({ success: false, error: "Select a valid trip first." }, 404);
+        {verifiedEmail && !selectedTripId && (
+          <section className="mx-auto max-w-3xl space-y-5">
+            <div className="rounded-3xl bg-gradient-to-br from-emerald-950 via-emerald-800 to-teal-700 p-6 text-white shadow-sm sm:p-8">
+              <p className="text-xs font-bold uppercase tracking-[0.16em] text-emerald-100">Shared travel companion</p>
+              <h2 className="mt-3 text-3xl font-bold">Welcome, {welcomeName} 👋</h2>
+              <p className="mt-2 text-sm text-emerald-50">Choose a trip to open its dashboard. Trip details are not loaded until you select one.</p>
+            </div>
+            {trips.map((trip) => (
+              <article key={trip.id} className="rounded-2xl border border-slate-200 bg-white p-5 shadow-sm sm:p-6">
+                <div className="flex flex-col gap-4 sm:flex-row sm:items-center">
+                  <div className="flex h-16 w-16 shrink-0 items-center justify-center rounded-2xl bg-emerald-50 text-4xl" aria-hidden="true">🚐</div>
+                  <div className="min-w-0 flex-1">
+                    <p className="text-xs font-bold uppercase tracking-wide text-emerald-800">Available trip</p>
+                    <h3 className="mt-1 text-xl font-bold">{trip.name}</h3>
+                    <p className="mt-1 text-sm text-slate-600">Shared trip · Google Sheets itinerary</p>
+                  </div>
+                  <button type="button" onClick={() => { setSelectedTripId(trip.id); setViewHistory([]); setActiveViewState("home"); setRefreshKey((n) => n + 1); }} className="rounded-xl bg-emerald-800 px-5 py-3 text-sm font-bold text-white hover:bg-emerald-900">Open trip →</button>
+                </div>
+              </article>
+            ))}
+            {trips.length === 0 && <p className="rounded-xl bg-white p-4 text-sm text-slate-600">No trips are registered yet. Add a Google Sheet to begin.</p>}
+            <article className="rounded-2xl border border-dashed border-slate-300 bg-white p-5 sm:p-6">
+              <div className="flex items-start gap-3">
+                <div className="flex h-12 w-12 shrink-0 items-center justify-center rounded-xl bg-slate-100 text-2xl" aria-hidden="true">＋</div>
+                <div className="flex-1">
+                  <h3 className="font-bold">Add trip itinerary</h3>
+                  <p className="mt-1 text-sm leading-6 text-slate-600">Connect another Google Sheet or create a new itinerary in the app.</p>
+                  <button type="button" onClick={() => setShowAddTripInfo(true)} className="mt-3 rounded-lg border border-emerald-800 px-4 py-2 text-sm font-semibold text-emerald-800 hover:bg-emerald-50">Add a trip</button>
+                </div>
+              </div>
+            </article>
+            {showAddTripInfo && (
+              <div className="fixed inset-0 z-50 flex items-end justify-center bg-slate-950/50 p-3 sm:items-center" role="dialog" aria-modal="true" aria-labelledby="add-trip-title">
+                <div className="w-full max-w-lg rounded-2xl bg-white p-5 shadow-xl sm:p-6">
+                  <div className="flex items-start justify-between gap-3">
+                    <h3 id="add-trip-title" className="text-lg font-bold">Add trip itinerary</h3>
+                    <button type="button" onClick={() => setShowAddTripInfo(false)} className="rounded-lg px-2 py-1 text-slate-500 hover:bg-slate-100" aria-label="Close">✕</button>
+                  </div>
+                  <p className="mt-3 text-sm leading-6 text-slate-600">Connect an existing Google Sheet that you can access. The itinerary tab must already exist. The app will keep this trip's expenses, checklist and locations separate.</p>
+                  <form onSubmit={addTrip} className="mt-4 space-y-3">
+                    <label className="block text-sm font-semibold">Trip name<input required minLength={2} maxLength={100} value={tripNameDraft} onChange={(event) => setTripNameDraft(event.target.value)} placeholder="e.g. Japan Spring Trip" className="mt-1 w-full rounded-lg border border-slate-300 px-3 py-2 font-normal" /></label>
+                    <label className="block text-sm font-semibold">Google Sheets ID<input required value={tripSheetIdDraft} onChange={(event) => setTripSheetIdDraft(event.target.value)} placeholder="Paste the ID from the Google Sheets URL" className="mt-1 w-full rounded-lg border border-slate-300 px-3 py-2 font-normal" /></label>
+                    <label className="block text-sm font-semibold">Itinerary tab name<input required value={tripTabDraft} onChange={(event) => setTripTabDraft(event.target.value)} placeholder="FINAL ITINERARY" className="mt-1 w-full rounded-lg border border-slate-300 px-3 py-2 font-normal" /></label>
+                    {tripMessage && <p className="text-sm text-slate-600" aria-live="polite">{tripMessage}</p>}
+                    <div className="flex gap-2"><button type="button" onClick={() => setShowAddTripInfo(false)} className="flex-1 rounded-lg border border-slate-300 px-4 py-3 text-sm font-semibold">Cancel</button><button type="submit" disabled={tripSaving} className="flex-1 rounded-lg bg-emerald-800 px-4 py-3 text-sm font-semibold text-white disabled:opacity-50">{tripSaving ? "Checking sheet…" : "Connect trip"}</button></div>
+                  </form>
+                </div>
+              </div>
+            )}
+          </section>
+        )}
 
-      if (!session) {
-        return jsonResponse(
-          { success: false, error: "Authentication required." },
-          401,
-        );
-      }
+        {verifiedEmail && selectedTripId && (
+          <>
+            {selectedTripId && itineraryError && (
+              <div className="rounded-xl border border-amber-200 bg-amber-50 p-4" role="alert">
+                <p className="font-semibold text-amber-900">Itinerary could not be loaded</p>
+                <p className="mt-1 text-sm text-amber-800">{itineraryError}</p>
+                <div className="mt-3 flex flex-wrap gap-2">
+                  <button type="button" onClick={() => setRefreshKey((n) => n + 1)} className="rounded-lg bg-amber-900 px-3 py-2 text-sm font-semibold text-white">Try again</button>
+                </div>
+              </div>
+            )}
 
-      if (
-        !env.GOOGLE_CLIENT_ID ||
-        !env.GOOGLE_CLIENT_SECRET ||
-        !env.TOKEN_ENCRYPTION_KEY ||
-        !trip.sheetId ||
-        !env.OAUTH_TOKEN_STORE
-      ) {
-        return jsonResponse(
-          { success: false, error: "Google Sheets is not configured." },
-          500,
-        );
-      }
+            {selectedTripId && isLoadingItinerary && <div className="overflow-hidden rounded-2xl border border-slate-200 bg-white p-5 text-sm text-slate-600" role="status" aria-live="polite"><p className="font-semibold text-slate-800">Getting your journey ready…</p><div className="relative mt-4 h-12 overflow-hidden rounded-xl bg-sky-50"><div className="absolute inset-x-0 bottom-2 border-t-2 border-dashed border-sky-200" /><span className="travel-loading-vehicle absolute bottom-1 text-2xl" style={{ animation: "travelLoadingMove 3.2s linear infinite, travelLoadingFloat .7s ease-in-out infinite alternate" }}>🚐</span><span className="travel-loading-vehicle absolute right-4 top-1 text-xl" style={{ animation: "travelLoadingFloat 1.1s ease-in-out infinite" }}>✈️</span></div><p className="mt-3 text-xs text-slate-500">Loading the trip plan…</p></div>}
 
-      if (
-        request.method === "POST" &&
-        request.headers.get("Origin") !== url.origin
-      ) {
-        return jsonResponse(
-          { success: false, error: "Invalid request origin." },
-          403,
-        );
-      }
+            {!isLoadingItinerary && !itineraryError && activeView === "home" && (
+              <div className="space-y-6">
+                <section className="relative overflow-hidden rounded-3xl bg-gradient-to-br from-emerald-950 via-emerald-800 to-teal-700 p-6 text-white shadow-sm sm:p-8">
+                  <div className="absolute -right-10 -top-12 h-56 w-56 rounded-full border border-white/10" />
+                  <div className="absolute -right-1 top-8 h-36 w-36 rounded-full border border-white/10" />
+                  <div className="relative max-w-2xl">
+                    <span className="inline-flex items-center rounded-full border border-white/25 bg-white/10 px-3 py-1 text-xs font-semibold uppercase tracking-wider">{isTripOngoing ? "During the trip" : isTripUpcoming ? "Your trip is coming up" : "Your trip dashboard"}</span>
+                    <div className="mt-5 flex items-start gap-4">
+                      <div className="flex h-14 w-14 shrink-0 items-center justify-center rounded-2xl bg-white/15 text-3xl" aria-hidden="true">🚐</div>
+                      <div>
+                        <h2 className="text-2xl font-bold sm:text-3xl">Welcome, {welcomeName}</h2>
+                        <p className="mt-1 text-sm font-semibold text-emerald-50">{selectedTrip?.name || "Selected trip"}</p>
+                        <p className="mt-2 text-sm text-emerald-50 sm:text-base">{dateRange}</p>
+                        <p className="mt-3 max-w-xl text-sm leading-6 text-emerald-50">Your shared home for the daily plan, trip reminders, expenses and memories.</p>
+                      </div>
+                    </div>
+                    <button   type="button"   onClick={() => setActiveView("checklist")}   className="mt-6 rounded-xl bg-white px-5 py-3 text-sm font-bold text-emerald-950 shadow-sm hover:bg-emerald-50" >   START JOURNEY ✈️🚐   <span aria-hidden="true"> →</span> </button>
+                  </div>
+                </section>
 
-      try {
-        const tokenKey =
-          `google-refresh:${session.email.toLowerCase()}`;
+                <section className="grid gap-5 lg:grid-cols-[1.5fr_1fr]">
+                  <div className="rounded-2xl border border-slate-200 bg-white p-5 shadow-sm sm:p-6">
+                    <p className="text-xs font-bold uppercase tracking-[0.16em] text-emerald-800">
+                      Trip preview
+                    </p>
+                    <h2 className="mt-1 text-xl font-bold">
+                      Your journey at a glance
+                    </h2>
+                    <p className="mt-1 text-sm text-slate-500">
+                      Upcoming routes and attraction highlights.
+                    </p>
 
-        const encryptedRefreshToken =
-          await env.OAUTH_TOKEN_STORE.get(tokenKey);
+                    <div className="mt-4 space-y-3">
+                      {dashboardPreviewDays.map(({ day, route, highlights }, index) => (
+                        <button
+                          key={day.key}
+                          type="button"
+                          onClick={() => {
+                            setActiveDayIndex(dashboardDayIndex + index);
+                            setActiveView("itinerary");
+                          }}
+                          className="w-full rounded-xl border border-slate-200 p-4 text-left hover:border-emerald-500 hover:bg-emerald-50/40"
+                        >
+                          <p className="text-xs font-bold uppercase tracking-wide text-emerald-800">
+                            Day {dashboardDayIndex + index + 1} · {day.weekday}
+                          </p>
+                          <h3 className="mt-1 font-bold">{day.date}</h3>
+                  
+                          {route && (
+                            <p className="mt-2 text-sm font-medium text-slate-700">
+                              {route}
+                            </p>
+                          )}
+                  
+                          {highlights.length > 0 && (
+                            <ul className="mt-2 space-y-1">
+                              {highlights.map((highlight, highlightIndex) => (
+                                <li
+                                  key={`${day.key}-${highlightIndex}`}
+                                  className="line-clamp-2 text-sm text-slate-600"
+                                >
+                                  • {highlight}
+                                </li>
+                              ))}
+                            </ul>
+                          )}
+                  
+                          <p className="mt-3 text-xs font-semibold text-emerald-800">
+                            View this day →
+                          </p>
+                        </button>
+                      ))}
+                    </div>
 
-        if (!encryptedRefreshToken) {
-          return jsonResponse(
-            {
-              success: false,
-              error: "Google Sheets is not connected. Reconnect Google Sheets.",
-              connectUrl: "/api/sheets/connect",
-            },
-            403,
-          );
-        }
+                    <button
+                      type="button"
+                      onClick={() => navigateToItinerary()}
+                      disabled={tripDays.length === 0}
+                      className="mt-4 w-full rounded-xl bg-emerald-800 px-4 py-3 text-sm font-bold text-white hover:bg-emerald-900 disabled:opacity-50"
+                    >
+                      Open full itinerary →
+                    </button>
+                  </div>
+                  
+                  <div className="grid gap-5 sm:grid-cols-2 lg:grid-cols-1">
+                    <section className="rounded-2xl border border-slate-200 bg-white p-5 shadow-sm">
+                      <div className="flex items-start gap-3">
+                        <div className="flex h-11 w-11 items-center justify-center rounded-xl bg-amber-50 text-2xl" aria-hidden="true">💳</div>
+                        <div>
+                          <h2 className="font-bold">Trip expenses</h2>
+                          <p className="mt-1 text-sm text-slate-600">Expense tracking is not connected yet.</p>
+                          <p className="mt-2 text-xs text-slate-500">No spending total is shown until expense data is added.</p>
+                        </div>
+                      </div>
+                      <button type="button" onClick={() => setActiveView("expenses")} className="mt-4 text-sm font-semibold text-emerald-800 hover:underline">Open expenses →</button>
+                    </section>
+                    <section className="rounded-2xl border border-slate-200 bg-white p-5 shadow-sm">
+                      <div className="flex items-start gap-3">
+                        <div className="flex h-11 w-11 items-center justify-center rounded-xl bg-sky-50 text-2xl" aria-hidden="true">🔔</div>
+                        <div>
+                          <h2 className="font-bold">Reminders</h2>
+                          <p className="mt-1 text-sm text-slate-600">Booking and check-in reminders are not connected yet.</p>
+                          <p className="mt-2 text-xs text-slate-500">No pending count is shown until reminders are configured.</p>
+                        </div>
+                      </div>
+                      <button type="button" onClick={() => setActiveView("itinerary")} className="mt-4 text-sm font-semibold text-emerald-800 hover:underline">Review trip plan →</button>
+                    </section>
+                  </div>
+                </section>
 
-        const refreshToken = await decryptToken(
-          encryptedRefreshToken,
-          env.TOKEN_ENCRYPTION_KEY,
-        );
+                <section>
+                  <div className="mb-3 flex items-end justify-between gap-3">
+                    <div>
+                      <h2 className="text-lg font-bold">Your trip</h2>
+                      <p className="mt-1 text-sm text-slate-500">Jump to a part of your travel companion.</p>
+                    </div>
+                    <button type="button" onClick={() => setRefreshKey((n) => n + 1)} disabled={isLoadingItinerary} className="text-sm font-semibold text-emerald-800 hover:underline disabled:opacity-50">Refresh itinerary</button>
+                  </div>
+                  <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3">
+                    {[
+                      { view: "itinerary" as ViewName, icon: "🗓️", title: "Itinerary", description: "Daily plans and destinations", available: true },
+                      { view: "checklist" as ViewName, icon: "🎒", title: "Things to do & bring", description: "Shared pre-trip checklist", available: true },
+                      { view: "expenses" as ViewName, icon: "💳", title: "Expenses", description: "Pre-trip and actual spending", available: true },
+                      { view: "memories" as ViewName, icon: "📸", title: "Memories", description: "Shared travel memories", available: true },
+                      { view: "documents" as ViewName, icon: "📁", title: "Documents & Links", description: "Bookings, campervan details and travel references", available: true },
+                      { view: "map" as ViewName, icon: "🗺️", title: "Map", description: "Routes and saved places", available: true },
+                    ].map((item) => (
+                      <button key={item.view} type="button" onClick={() => setActiveView(item.view)} className="rounded-2xl border border-slate-200 bg-white p-4 text-left shadow-sm transition hover:-translate-y-0.5 hover:border-emerald-300 hover:shadow">
+                        <span className="text-2xl" aria-hidden="true">{item.icon}</span>
+                        <span className="mt-3 block font-bold">{item.title}</span>
+                        <span className="mt-1 block text-sm text-slate-500">{item.description}</span>
+                        {!item.available && <span className="mt-3 inline-block rounded-full bg-slate-100 px-2 py-1 text-xs font-medium text-slate-500">Not connected yet</span>}
+                      </button>
+                    ))}
+                  </div>
+                </section>
+              </div>
+            )}
 
-        const tokenResponse = await fetch(
-          "https://oauth2.googleapis.com/token",
-          {
-            method: "POST",
-            headers: {
-              "Content-Type": "application/x-www-form-urlencoded",
-            },
-            body: new URLSearchParams({
-              client_id: env.GOOGLE_CLIENT_ID,
-              client_secret: env.GOOGLE_CLIENT_SECRET,
-              refresh_token: refreshToken,
-              grant_type: "refresh_token",
-            }).toString(),
-          },
-        );
+            {!isLoadingItinerary && !itineraryError && activeView === "itinerary" && (
+              <section onTouchStart={(event) => setTouchStart({ x: event.touches[0].clientX, y: event.touches[0].clientY })} onTouchEnd={(event) => { if (!touchStart) return; const dx = event.changedTouches[0].clientX - touchStart.x; const dy = event.changedTouches[0].clientY - touchStart.y; if (Math.abs(dx) > 55 && Math.abs(dx) > Math.abs(dy) * 1.25) setActiveDayIndex((index) => Math.max(0, Math.min(tripDays.length - 1, index + (dx < 0 ? 1 : -1)))); setTouchStart(null); }} className="space-y-5 rounded-2xl border border-slate-200 bg-white p-5 shadow-sm sm:p-6">
+                <div className="flex flex-wrap items-center justify-between gap-3">
+                  <div>
+                    <p className="text-xs font-bold uppercase tracking-[0.16em] text-emerald-800">Daily itinerary</p>
+                    <h2 className="mt-1 text-xs font-medium text-slate-500">Swipe or tap a day</h2>
+                    <p className="mt-1 text-sm text-slate-500">{tripDays.length} travel days · {dataSaverMode ? "main itinerary only (Lite mode)" : "itinerary and supplementary notes"}</p>
+                  </div>
+                  <button type="button" onClick={() => setActiveView("home")} className="rounded-lg border border-slate-300 px-3 py-2 text-sm font-semibold hover:bg-slate-50">← Dashboard</button>
+                </div>
+                {tripDays.length === 0 ? (
+                  <p className="rounded-xl bg-slate-50 p-4 text-sm text-slate-600">No travel dates were found in the spreadsheet's second header row.</p>
+                ) : (
+                  <>
+                    <div className="-mx-1 flex gap-2 overflow-x-auto px-1 pb-2">
+                      {tripDays.map((day, index) => {
+                        const selected = index === safeDayIndex;
+                        return (
+                          <button key={day.key} type="button" aria-pressed={selected} onClick={() => setActiveDayIndex(index)} className={`min-w-[100px] shrink-0 rounded-xl border p-3 text-left transition ${day.dateObject && dateIsSameDay(day.dateObject, today) ? "border-amber-400 bg-amber-50 ring-1 ring-amber-300" : selected ? "border-emerald-700 bg-emerald-50 ring-1 ring-emerald-700" : "border-slate-200 bg-white hover:border-emerald-300"}`}>
+                            <span className={`block text-xs font-bold ${day.dateObject && dateIsSameDay(day.dateObject, today) ? "text-amber-800" : selected ? "text-emerald-800" : "text-slate-500"}`}>{day.weekday}</span>
+                            <span className="mt-1 block font-semibold">{day.date}</span>
+                            <span className="mt-1 block text-xs text-slate-500">{day.dateObject && dateIsSameDay(day.dateObject, today) ? "★ TODAY" : `Day ${index + 1}`}</span>
+                          </button>
+                        );
+                      })}
+                    </div>
+                    <div className="flex items-center justify-between gap-3 text-xs text-slate-500"><span>← Swipe the itinerary card to change day →</span><span className="font-semibold">{safeDayIndex + 1} / {tripDays.length}</span></div>
+                    <div className="flex justify-center gap-1.5" aria-label={`Day ${safeDayIndex + 1} of ${tripDays.length}`}>{tripDays.map((day, index) => <button key={`dot-${day.key}`} type="button" onClick={() => setActiveDayIndex(index)} aria-label={`Go to ${day.date}`} aria-current={index === safeDayIndex ? "step" : undefined} className={`h-1.5 rounded-full transition-all duration-300 ${index === safeDayIndex ? "w-7 bg-emerald-700" : "w-1.5 bg-slate-300 hover:bg-emerald-400"}`} />)}</div>
 
-        if (!tokenResponse.ok) {
-          return jsonResponse(
-            {
-              success: false,
-              error: "Google access failed. Reconnect Google Sheets.",
-              connectUrl: "/api/sheets/connect",
-            },
-            502,
-          );
-        }
+                    {selectedDay && (
+                      <section key={selectedDay.key} style={{ animation: "itinerarySlideIn 200ms ease-out" }} className="overflow-hidden rounded-2xl border border-slate-200 transition-all duration-300">
+                        <div className="flex flex-wrap items-center justify-between gap-3 bg-slate-50 px-4 py-4 sm:px-5">
+                          <div>
+                            <p className={`text-xs font-bold uppercase tracking-[0.15em] ${selectedDay.dateObject && dateIsSameDay(selectedDay.dateObject, today) ? "text-amber-800" : "text-emerald-800"}`}>{selectedDay.weekday} · Day {safeDayIndex + 1}{selectedDay.dateObject && dateIsSameDay(selectedDay.dateObject, today) ? " · TODAY" : ""}</p>
+                            <h3 className="mt-1 text-xl font-bold">{selectedDay.date}</h3>
+                          </div>
+                          <div className="flex gap-2">
+                            <button type="button" disabled={safeDayIndex === 0} onClick={() => setActiveDayIndex((i) => Math.max(i - 1, 0))} className="rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm font-semibold disabled:opacity-40">Previous</button>
+                            <button type="button" disabled={safeDayIndex >= tripDays.length - 1} onClick={() => setActiveDayIndex((i) => Math.min(i + 1, tripDays.length - 1))} className="rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm font-semibold disabled:opacity-40">Next</button>
+                          </div>
+                        </div>
+                        {dayEntries.length === 0 ? (
+                          <p className="px-5 py-8 text-sm text-slate-500">No itinerary details have been entered for this day yet.</p>
+                        ) : (
+                          <div className="space-y-4 p-4 sm:p-5">
+                            <section
+                              className={`relative overflow-hidden rounded-2xl border border-slate-300 p-4 shadow-sm sm:p-5 ${showHighlightPhoto ? "text-white" : "border-emerald-200 bg-gradient-to-br from-emerald-50 to-white text-slate-900"}`}
+                              style={showHighlightPhoto ? {
+                                backgroundImage: `linear-gradient(110deg, rgba(8, 24, 38, 0.78), rgba(8, 24, 38, 0.48)), url(${highlightPhoto?.url || "https://images.unsplash.com/photo-1469521669194-babb45599def?auto=format&fit=crop&w=1600&q=85"})`,
+                                backgroundSize: "cover",
+                                backgroundPosition: "center",
+                              } : undefined}
+                            >
+                              <div className="flex flex-wrap items-center justify-between gap-2">
+                                <h4 className="text-lg font-bold">⭐ Today Highlight</h4>
+                                <button type="button" onClick={() => setShowHighlightPhoto((enabled) => !enabled)} aria-pressed={showHighlightPhoto} className={`rounded-full border px-3 py-1.5 text-xs font-semibold transition ${showHighlightPhoto ? "border-white/60 bg-black/25 text-white hover:bg-black/40" : "border-slate-300 bg-white text-slate-700 hover:bg-slate-50"}`}>
+                                  {showHighlightPhoto ? "Photo background: On" : "Photo background: Off"}
+                                </button>
+                              </div>
+                              <div className="mt-3 flex flex-wrap gap-2">
+                                <label className={`cursor-pointer rounded-lg border px-3 py-2 text-sm font-semibold ${showHighlightPhoto ? "border-white/50 bg-black/25 text-white" : "border-slate-300 bg-white text-slate-700"}`}>🖼️ Add photo<input type="file" accept="image/*" onChange={(event) => { const file = event.currentTarget.files?.[0]; if (file) void uploadHighlightPhoto(file); event.currentTarget.value = ""; }} className="sr-only" /></label>
+                                <label className={`cursor-pointer rounded-lg border px-3 py-2 text-sm font-semibold ${showHighlightPhoto ? "border-white/50 bg-black/25 text-white" : "border-slate-300 bg-white text-slate-700"}`}>📸 Take picture<input type="file" accept="image/*" capture="environment" onChange={(event) => { const file = event.currentTarget.files?.[0]; if (file) void uploadHighlightPhoto(file); event.currentTarget.value = ""; }} className="sr-only" /></label>
+                                {highlightPhotoSaving && <span className="self-center text-xs">Uploading photo…</span>}
+                              </div>
+                              {highlightPhotoMessage && <p className={`mt-2 text-xs ${showHighlightPhoto ? "text-white" : "text-slate-600"}`} aria-live="polite">{highlightPhotoMessage}</p>}
+                              <div className="mt-4 space-y-4">
+                                <div><p className="font-semibold">🛣️ Route</p>{categorized.route.filter((entry) => /route|destination|distance|departure|arrival|transport/i.test(entry.label)).length ? categorized.route.filter((entry) => /route|destination|distance|departure|arrival|transport/i.test(entry.label)).map((entry) => <p key={entry.key} className="mt-1 whitespace-pre-wrap text-sm leading-6">{entry.value}</p>) : <p className={`mt-1 text-sm ${showHighlightPhoto ? "text-white/80" : "text-slate-500"}`}>No route details entered for this day.</p>}</div>
+                                <div><p className="font-semibold">🚐 Driving note</p>{categorized.route.filter((entry) => /drive|driving|travel time/i.test(entry.label)).length ? categorized.route.filter((entry) => /drive|driving|travel time/i.test(entry.label)).map((entry) => <p key={entry.key} className="mt-1 whitespace-pre-wrap text-sm leading-6">{entry.value}</p>) : <p className={`mt-1 text-sm ${showHighlightPhoto ? "text-white/80" : "text-slate-500"}`}>No separate driving note entered.</p>}</div>
+                                <div><p className="font-semibold">⚡ Activity</p>{dashboardPreviewDays.find((item) => item.day.key === selectedDay.key)?.highlights.length ? <ul className="mt-1 list-disc space-y-1 pl-5 text-sm leading-6">{dashboardPreviewDays.find((item) => item.day.key === selectedDay.key)!.highlights.map((item, i) => <li key={`${i}-${item}`}>{item}</li>)}</ul> : <p className={`mt-1 text-sm ${showHighlightPhoto ? "text-white/80" : "text-slate-500"}`}>Activity highlights will appear here from the itinerary.</p>}</div>
+                              </div>
+                            </section>
+                            <section className="space-y-3">
+                              <h4 className="font-semibold">🕒 Daily Timeline</h4>
+                              {(["Morning", "Afternoon", "Evening"] as const).map((session) => {
+                                const entry = dayEntries.find((item) => item.label.trim().toLowerCase() === session.toLowerCase());
+                                const savedLocation = getSessionLocation(session);
+                                const lines = (entry?.value ?? "").split(/\n+/).map((line) => line.trim()).filter(Boolean);
+                                return <div key={session} className={`rounded-xl border p-4 ${lines.length ? "border-slate-200 bg-white" : "border-dashed border-slate-300 bg-slate-50/70"}`}>
+                                  <div className="flex items-center gap-3"><h5 className={`font-bold ${lines.length ? "text-slate-900" : "text-slate-500"}`}>{session}</h5><span className="text-2xl" aria-hidden="true">{session === "Morning" ? "🧇" : session === "Afternoon" ? "🧆" : "🍲"}</span></div>
+                                  {lines.length ? <div className="mt-3 space-y-2">{lines.map((line, i) => {
+                                    const match = line.match(/^(\d{1,2}(?:[:.]\d{2})?\s*(?:a\.?m\.?|p\.?m\.?)?)(?:\s*[-–:,]\s*|\s+)(.+)$/i);
+                                    const mealWord = session === "Morning" ? /\b(breakfast)\b/i : session === "Afternoon" ? /\b(lunch)\b/i : /\b(dinner)\b/i;
+                                    const text = match ? match[2] : line;
+                                    const wordMatch = text.match(mealWord);
+                                    return <div key={`${session}-${i}`} className="flex items-start gap-2 text-sm leading-6">{match && <span className="shrink-0 rounded-md bg-slate-100 px-2 py-0.5 text-xs font-semibold text-slate-700">{match[1]}</span>}<span>{wordMatch ? <>{text.slice(0, wordMatch.index)}<strong>{wordMatch[0]}</strong>{text.slice((wordMatch.index ?? 0) + wordMatch[0].length)}</> : text}</span></div>;
+                                  })}</div> : <p className="mt-2 text-xs text-slate-400">No planned activity</p>}
+                                  <button type="button" onClick={() => openSessionLocationEditor(session)} className="mt-3 flex w-full items-start gap-3 rounded-xl border border-dashed border-slate-300 bg-slate-50 p-3 text-left transition hover:border-emerald-400 hover:bg-emerald-50/60"><span className="text-2xl" aria-hidden="true">📍</span><span className="min-w-0 flex-1"><span className="block text-xs font-semibold text-slate-600">Session & Location · Tap to edit</span><span className="mt-1 block whitespace-pre-wrap text-sm text-slate-800">{savedLocation || `Add a ${session.toLowerCase()} location`}</span></span><span className="text-sm font-semibold text-emerald-800">Edit</span></button>
+                                </div>;
+                              })}
+                              {locationMessage && <p className="text-sm text-slate-600" aria-live="polite">{locationMessage}</p>}
+                            </section>
+                            <section className="rounded-xl border border-slate-200 p-4">
+                              <h4 className="font-semibold">🏕️ Bookings & Charges</h4>
+                              {categorized.stay.length ? categorized.stay.map((entry) => <div key={entry.key} className="mt-2"><p className="text-xs font-semibold text-slate-500">{entry.label}</p><p className="whitespace-pre-wrap text-sm leading-6">{entry.value}</p></div>) : <p className="mt-2 text-sm text-slate-500">No accommodation or booking details entered for this day.</p>}
+                              {categorized.other.filter((entry) => /fee|charge|cost|price|booking|reservation|payment/i.test(entry.label)).map((entry) => <div key={entry.key} className="mt-2"><p className="text-xs font-semibold text-slate-500">{entry.label}</p><p className="whitespace-pre-wrap text-sm leading-6">{entry.value}</p></div>)}
+                            </section>
+                            <section className="rounded-xl border border-slate-200 p-4">
+                              <h4 className="font-semibold">📍 Other Activities & Details</h4>
+                              {categorized.places.length ? categorized.places.filter((entry) => !/^(morning|afternoon|evening)$/i.test(entry.label)).map((entry) => <div key={entry.key} className="mt-2"><p className="text-xs font-semibold text-slate-500">{entry.label}</p><p className="whitespace-pre-wrap text-sm leading-6">{entry.value}</p></div>) : <p className="mt-2 text-sm text-slate-500">No additional activity entries.</p>}
+                            </section>
+                          </div>
+                        )}
+                        <div className="border-t border-slate-100 p-4">
+                          <h4 className="font-semibold text-slate-900">
+                            Practical Tips & Date-Specific Notes
+                          </h4>
 
-        const tokenData = (await tokenResponse.json()) as {
-          access_token?: string;
-        };
+                          {Object.entries(supplementaryTabs)
+                            .filter(
+                              ([tabName]) =>
+                                /^\d{1,2}\s+nov$/i.test(tabName) &&
+                                selectedDay.date.toLowerCase().includes(tabName.toLowerCase())
+                            )
+                            .map(([tabName, rows]) => (
+                              <div key={tabName} className="mt-3">
+                                <h5 className="text-sm font-semibold text-emerald-800">
+                                  {tabName} — Supplementary Notes
+                                </h5>
+                                {rows.map((row, rowIndex) => {
+                                  const text = row
+                                    .map((cell) => String(cell ?? "").trim())
+                                    .filter(Boolean)
+                                    .join(" · ");
 
-        if (!tokenData.access_token) {
-          return jsonResponse(
-            { success: false, error: "Google returned no access token." },
-            502,
-          );
-        }
+                                  return text ? (
+                                    <p
+                                      key={`${tabName}-${rowIndex}`}
+                                      className="mt-2 whitespace-pre-wrap break-words text-sm leading-6 text-slate-700"
+                                    >
+                                      {text}
+                                    </p>
+                                  ) : null;
+                                })}
+                              </div>                        
+                            ))}
 
-        const memoryTab = await findExistingTab(tokenData.access_token, trip.sheetId, ["TRIP_MEMORIES", "TRIP MEMORIES"], "TRIP_MEMORIES");
-        await ensureSheetTab(tokenData.access_token, trip.sheetId, memoryTab, ["memory_id", "trip_date", "attraction", "author_email", "content", "created_at", "updated_at", "photo_ids"]);
-        const range = encodeURIComponent(`${quoteSheetTab(memoryTab)}!A:H`);
-        const sheetUrl =
-          `https://sheets.googleapis.com/v4/spreadsheets/` +
-          `${encodeURIComponent(trip.sheetId)}/values/${range}`;
+                          
+                          <div className="mt-4 rounded-xl bg-slate-50 p-3">  
+                          <h5 className="text-sm font-semibold text-slate-800">    
+                          👕 Practical Tips & Layering Notes  
+                          </h5>
+  
+                          {(() => {    
+                          const rows = supplementaryTabs["Layering"] ?? [];    
+                          const rawText = rows      
+                          .flat()      
+                          .map((cell) => String(cell ?? "").trim())      
+                          .find((cell) => cell.startsWith("{"));                          
+   
+                           if (!rawText) {
+                                return (
+                                  <p className="mt-2 text-sm text-slate-500">
+                                    No layering notes are available.
+                                  </p>
+                                );
+                              }
 
-        if (request.method === "GET") {
-          const sheetResponse = await fetch(sheetUrl, {
-            headers: {
-              Authorization: `Bearer ${tokenData.access_token}`,
-            },
-          });
+                              try {
+                                const parsed = JSON.parse(rawText) as {
+                                  itinerary?: Array<{
+                                    day?: string;
+                                    date?: string;
+                                    location?: string;
+                                    weather_and_activity?: string;
+                                    icons?: string[];
+                                    wear?: string;
+                                  }>;
+                                  core_golden_rule?: string;
+                                  layering_formula?: {
+                                    title?: string;
+                                    description?: string;
+                                    steps?: Array<{ step?: number; item?: string; icon?: string }>;
+                                  };
+                                };
 
-          if (!sheetResponse.ok) {
-            return jsonResponse(
-              {
-                success: false,
-                error: "Could not read TRIP_MEMORIES. Check the worksheet name and Google Sheets access.",
-              },
-              502,
-            );
-          }
+                                const entries = parsed.itinerary ?? [];
+                                const selectedDate = selectedDay?.date ?? "";
+                          
+                                const normalizeDate = (value: string) =>
+                                  value.toLowerCase().replace(/\s+/g, " ").trim();
 
-          const sheetData = (await sheetResponse.json()) as {
-            values?: unknown[][];
-          };
+                                const layering = entries.find((entry) => {
+                                  const date = normalizeDate(entry.date ?? "");
+                                  const selected = normalizeDate(selectedDate);
 
-          const rows = sheetData.values || [];
-          const memories = rows.slice(1).filter(
-            (row) =>
-              typeof row[0] === "string" &&
-              typeof row[1] === "string" &&
-              typeof row[4] === "string" &&
-              String(row[0]).trim() !== "",
-          ).map((row) => ({
-            memory_id: String(row[0] || ""),
-            trip_date: String(row[1] || ""),
-            attraction: String(row[2] || ""),
-            author_email: String(row[3] || ""),
-            content: String(row[4] || ""),
-            created_at: String(row[5] || ""),
-            updated_at: String(row[6] || ""),
-            photo_ids: String(row[7] || ""),
-          }));
+                                  if (!date || !selected) return false;
+                                  if (date === selected) return true;
 
-          return jsonResponse({
-            success: true,
-            memories,
-          });
-        }
+                                  // Support entries covering a date range, e.g. "19–20 Nov".
+                                  const range = date.match(
+                                    /^(\d{1,2})\s*[–-]\s*(\d{1,2})\s+([a-z]+)$/
+                                  );
+                                  const single = selected.match(/^(\d{1,2})\s+([a-z]+)$/);
 
-        const body = (await request.json()) as {
-          memory_id?: unknown;
-          trip_date?: unknown;
-          attraction?: unknown;
-          content?: unknown;
-          photos?: Array<{ name?: unknown; mime_type?: unknown; data_base64?: unknown }>;
-        };
+                                  return Boolean(
+                                    range &&
+                                    single &&
+                                    range[3] === single[2] &&
+                                    Number(single[1]) >= Number(range[1]) &&
+                                    Number(single[1]) <= Number(range[2])
+                                  );
+                                });
 
-        const memoryId =
-          typeof body.memory_id === "string" ? body.memory_id.trim() : "";
-        const tripDate =
-          typeof body.trip_date === "string" ? body.trip_date.trim() : "";
-        const attraction =
-          typeof body.attraction === "string" ? body.attraction.trim() : "";
-        const content =
-          typeof body.content === "string" ? body.content.trim() : "";
+                                return (
+                                  <div className="mt-2 space-y-3">
+                                    {layering ? (
+                                      <>
+                                        <div className="flex flex-wrap items-center justify-between gap-2">
+                                          <p className="font-semibold text-slate-800">
+                                            {layering.location ?? layering.day}
+                                          </p>
+                                          <span className="text-xs text-slate-600">
+                                            {layering.weather_and_activity}
+                                          </span>
+                                        </div>
 
-        if (
-          !memoryId ||
-          memoryId.length > 100 ||
-          !tripDate ||
-          tripDate.length > 40 ||
-          attraction.length > 200 ||
-          !content ||
-          content.length > 5000
-        ) {
-          return jsonResponse(
-            { success: false, error: "Invalid memory details." },
-            400,
-          );
-        }
+                                        {layering.icons && layering.icons.length > 0 && (
+                                          <p className="text-4xl" aria-label="Suggested clothing">
+                                            {layering.icons.join(" ")}
+                                          </p>
+                                        )}
 
-        // Check existing IDs so retries do not normally create duplicates.
-        const existingResponse = await fetch(sheetUrl, {
-          headers: {
-            Authorization: `Bearer ${tokenData.access_token}`,
-          },
-        });
+                                        <p className="whitespace-pre-wrap text-sm leading-6 text-slate-700">
+                                          {layering.wear}
+                                        </p>
+                                      </>
+                                    ) : (
+                                      <p className="text-sm text-slate-500">
+                                        No layering recommendation matches {selectedDate || "this day"}.
+                                      </p>
+                                    )}
 
-        if (!existingResponse.ok) {
-          return jsonResponse(
-            { success: false, error: "Could not check existing memories." },
-            502,
-          );
-        }
+                                    {(parsed.layering_formula || parsed.core_golden_rule) && (
+                                      <details className="rounded-lg border border-slate-200 bg-white">
+                                        <summary className="cursor-pointer select-none px-3 py-3 text-sm font-semibold text-slate-800">
+                                          🧥 General layering guide <span className="ml-1 text-xs font-normal text-slate-500">(tap to expand)</span>
+                                        </summary>
+                                        <div className="space-y-3 border-t border-slate-100 px-3 py-3">
+                                          {parsed.layering_formula && (
+                                            <div>
+                                              <p className="font-semibold text-slate-800">
+                                                {parsed.layering_formula.title || "Layering formula"}
+                                              </p>
+                                              {parsed.layering_formula.description && (
+                                                <p className="mt-1 text-sm leading-6 text-slate-600">
+                                                  {parsed.layering_formula.description}
+                                                </p>
+                                              )}
+                                              {parsed.layering_formula.steps && parsed.layering_formula.steps.length > 0 && (
+                                                <ol className="mt-3 grid grid-cols-1 gap-2 sm:grid-cols-2">
+                                                  {parsed.layering_formula.steps.map((step, index) => (
+                                                    <li key={`${step.step ?? index + 1}-${step.item ?? "layer"}`} className="flex items-center gap-2 rounded-lg bg-slate-50 px-3 py-2 text-sm text-slate-700">
+                                                      <span className="text-xl" aria-hidden="true">{step.icon || "•"}</span>
+                                                      <span><span className="mr-1 text-xs font-semibold text-slate-400">{step.step ?? index + 1}.</span>{step.item || "Layer"}</span>
+                                                    </li>
+                                                  ))}
+                                                </ol>
+                                              )}
+                                            </div>
+                                          )}
+                                          {parsed.core_golden_rule && (
+                                            <div className="border-t border-slate-200 pt-3">
+                                              <p className="text-xs font-semibold text-slate-700">Packing tip</p>
+                                              <p className="mt-1 text-sm leading-6 text-slate-600">
+                                                {parsed.core_golden_rule}
+                                              </p>
+                                            </div>
+                                          )}
+                                        </div>
+                                      </details>
+                                    )}
+                                  </div>
+                                );
+                              } catch {
+                                return (
+                                  <p className="mt-2 text-sm text-amber-700">
+                                    Layering data could not be read. Please check the JSON in the
+                                    Layering spreadsheet tab.
+                                  </p>
+                                );
+                              }
+                            })()}
+                          </div>
+                        </div>
+                        <div className="grid gap-3 border-t border-slate-100 bg-white p-4 sm:grid-cols-3">
+                          <InfoPanel icon="🛣️" title="Route & destinations" entries={categorized.route} empty="Route details are not labelled in the sheet yet." />
+                          <div className="rounded-xl border border-slate-200 bg-white p-4"><h3 className="font-semibold">📍 Places to visit</h3>{categorized.places.length ? <div className="mt-2 space-y-2">{categorized.places.map((entry) => <p key={entry.key} className="whitespace-pre-wrap text-sm leading-6 text-slate-700">{entry.value}</p>)}</div> : <p className="mt-2 text-sm text-slate-500">No places are labelled in the itinerary sheet yet. Find attractions near your current GPS location.</p>}<button type="button" onClick={findNearbyAttractions} className="mt-3 min-h-11 rounded-lg border border-emerald-300 bg-emerald-50 px-3 py-2 text-sm font-semibold text-emerald-900">{nearbyPlacesMessage === "Requesting your location…" ? "Locating…" : "Find nearby attractions 📍"}</button>{nearbyPlaces.length > 0 && <ul className="mt-3 space-y-2">{nearbyPlaces.map((place) => <li key={place.id} className="rounded-lg border border-slate-100 bg-slate-50 p-3"><a href={`https://www.google.com/maps/search/?api=1&query=${encodeURIComponent(`${place.lat},${place.lon}`)}`} target="_blank" rel="noreferrer" className="font-semibold text-emerald-800 underline">{place.name} ↗</a><p className="mt-1 text-xs capitalize text-slate-500">{place.kind.replace(/_/g, " ")} · Open in Google Maps</p></li>)}</ul>}{nearbyPlacesUrl && <a href={nearbyPlacesUrl} target="_blank" rel="noreferrer" className="mt-2 block text-sm font-semibold text-emerald-800 underline">View broader nearby search in Google Maps ↗</a>}{nearbyPlacesMessage && <p className="mt-2 text-xs text-slate-500">{nearbyPlacesMessage}</p>}</div>
+                          <InfoPanel icon="🏕️" title="Stay & bookings" entries={categorized.stay} empty="Stay details are not labelled in the sheet yet." />
+                        </div>
+                        <div className="border-t border-slate-100 bg-slate-50 p-4">
+                          <div className="flex items-start justify-between gap-3"><div><h4 className="font-semibold">📸 Travel Memories</h4><p className="mt-1 text-sm text-slate-600">Shared notes saved for {selectedDay.date}.</p></div><button type="button" onClick={() => { setActiveView("memories"); }} className="shrink-0 rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm font-semibold">Add memory</button></div>
+                          {memories.filter((memory) => normalizeTripDate(memory.trip_date) === normalizeTripDate(selectedDay.date)).length ? <div className="mt-3 space-y-3">{memories.filter((memory) => normalizeTripDate(memory.trip_date) === normalizeTripDate(selectedDay.date)).map((memory) => <article key={memory.memory_id} className="rounded-lg border border-slate-200 bg-white p-3"><p className="font-semibold">{memory.attraction}</p><p className="mt-1 whitespace-pre-wrap text-sm leading-6 text-slate-700">{memory.content}</p>{getMemoryPhotoIds(memory.photo_ids).length > 0 && <div className="mt-3 grid grid-cols-2 gap-2">{getMemoryPhotoIds(memory.photo_ids).map((photoId) => <a key={photoId} href={`https://drive.google.com/uc?export=view&id=${encodeURIComponent(photoId)}`} target="_blank" rel="noreferrer" className="overflow-hidden rounded-lg border border-slate-200"><img src={`https://drive.google.com/uc?export=view&id=${encodeURIComponent(photoId)}`} alt={`Photo for ${memory.attraction}`} loading="lazy" className="h-28 w-full object-cover" /><span className="block px-2 py-1 text-xs font-semibold text-emerald-800">Open photo ↗</span></a>)}</div>}<p className="mt-2 text-xs text-slate-500">Shared by {memory.author_email || "trip companion"}</p></article>)}</div> : <p className="mt-3 text-sm text-slate-500">No memories saved for this day yet.</p>}
+                        </div>
+                      </section>
+                    )}
+                  </>
+                )}
+              </section>
+            )}
 
-        const existingData = (await existingResponse.json()) as {
-          values?: string[][];
-        };
+            {!isLoadingItinerary && !itineraryError && activeView === "documents" && (
+              <section className="rounded-2xl border border-slate-200 bg-white p-5 shadow-sm sm:p-7">
+                <button type="button" onClick={goToDashboard} className="text-sm font-semibold text-emerald-800 hover:underline">← Back to dashboard</button>
+                <p className="mt-6 text-xs font-bold uppercase tracking-[0.16em] text-emerald-800">Trip resources</p>
+                <h2 className="mt-2 text-2xl font-bold">Documents & Links</h2>
+                <p className="mt-2 text-sm text-slate-600">Approved trip documents and useful reference websites, loaded from the Google Sheets Link tab.</p>
+                {documentsMessage && <p className="mt-3 rounded-lg bg-amber-50 p-3 text-sm text-amber-900">{documentsMessage}</p>}
+                {tripDocuments.length ? <div className="mt-5 space-y-3">{tripDocuments.map((document, index) => <a key={`${document.title}-${index}`} href={document.url} target="_blank" rel="noreferrer" className="flex items-center gap-3 rounded-xl border border-slate-200 p-4 transition hover:border-emerald-400 hover:bg-emerald-50/40"><span className="flex h-11 w-11 shrink-0 items-center justify-center rounded-xl bg-emerald-50 text-xl">{document.kind === "drive_folder" ? "📁" : "🔗"}</span><span className="min-w-0 flex-1"><span className="block text-xs font-semibold uppercase tracking-wide text-slate-500">{document.category}</span><span className="mt-1 block font-semibold text-slate-900">{document.title}</span><span className="mt-1 block break-all text-xs text-slate-500">{document.kind === "drive_folder" ? "Open shared Google Drive folder" : document.url}</span></span><span className="text-emerald-800">↗</span></a>)}</div> : !documentsMessage ? <p className="mt-4 rounded-xl bg-slate-50 p-4 text-sm text-slate-600">No approved links were found in the Link tab.</p> : null}
+              </section>
+            )}
 
-        const existingRows = existingData.values || [];
-        const existingRow = existingRows.slice(1).find(
-          (row) => String(row[0] || "") === memoryId,
-        );
+            {!isLoadingItinerary && !itineraryError && activeView === "checklist" && (
+              <section
+                onTouchStart={(event) => setChecklistTouchStart({ x: event.touches[0].clientX, y: event.touches[0].clientY })}
+                onTouchEnd={(event) => {
+                  if (!checklistTouchStart || checklistCategories.length < 2) return;
+                  const dx = event.changedTouches[0].clientX - checklistTouchStart.x;
+                  const dy = event.changedTouches[0].clientY - checklistTouchStart.y;
+                  if (Math.abs(dx) > 45 && Math.abs(dx) > Math.abs(dy) * 1.2) {
+                    setChecklistCategoryIndex((index) => (index + (dx < 0 ? 1 : -1) + checklistCategories.length) % checklistCategories.length);
+                  }
+                  setChecklistTouchStart(null);
+                }}
+                className="rounded-2xl border border-slate-200 bg-white p-5 shadow-sm sm:p-7"
+              >
+                <button type="button" onClick={goToDashboard} className="text-sm font-semibold text-emerald-800 hover:underline">← Back to dashboard</button>
+                <p className="mt-6 text-xs font-bold uppercase tracking-[0.16em] text-emerald-800">Trip checklist</p>
+                <h2 className="mt-2 text-2xl font-bold">Checklist</h2>
+                <div className="mt-4 grid grid-cols-2 gap-2" role="tablist" aria-label="Checklist sections">
+                  {beforeDepartureVisible && <button type="button" role="tab" aria-selected={activeChecklistTab === "before"} onClick={() => { setChecklistTab("before"); setChecklistCategoryIndex(0); }} className={`rounded-xl border px-3 py-2.5 text-sm font-semibold ${activeChecklistTab === "before" ? "border-emerald-800 bg-emerald-800 text-white" : "border-slate-200 bg-white text-slate-700"}`}>✈️ Before Departure</button>}
+                  <button type="button" role="tab" aria-selected={activeChecklistTab === "grocery"} onClick={() => { setChecklistTab("grocery"); setChecklistCategoryIndex(0); }} className={`rounded-xl border px-3 py-2.5 text-sm font-semibold ${activeChecklistTab === "grocery" ? "border-emerald-800 bg-emerald-800 text-white" : "border-slate-200 bg-white text-slate-700"}`}>🛒 Grocery</button>
+                </div>
+                {activeChecklistTab === "before" ? <><p className="mt-3 text-sm text-slate-600">Choose Shared or Personal for each item. Long-press an item to cancel or restore it.</p><div className="mt-3 rounded-xl bg-emerald-50 p-3 text-sm text-emerald-900">Completed: {checklistCompletedCount} of {checklistActiveCount} items</div></> : <><p className="mt-3 text-sm text-slate-600">Reusable grocery list. Choose Shared or Personal for each item; reset completion for the next shopping trip.</p><div className="mt-3 flex items-center justify-between gap-2 rounded-xl bg-emerald-50 p-3"><span className="text-sm text-emerald-900">Completed: {checklistCompletedCount} of {checklistActiveCount} items</span><button type="button" onClick={() => void resetGroceryChecklist()} disabled={!groceryItems.length || Boolean(checklistSavingId)} className="rounded-lg border border-emerald-700 bg-white px-3 py-2 text-xs font-bold text-emerald-900 disabled:opacity-50">↻ Reset grocery</button></div></>}
+                {checklistCategories.length > 0 ? (
+                  <>
+                    <div className="-mx-1 mt-4 flex gap-2 overflow-x-auto px-1 pb-2" aria-label="Checklist categories">
+                      {checklistCategories.map((category, index) => (
+                        <button key={category} type="button" aria-pressed={index === safeChecklistCategoryIndex} onClick={() => setChecklistCategoryIndex(index)} className={`shrink-0 rounded-full border px-4 py-2 text-sm font-semibold transition ${index === safeChecklistCategoryIndex ? "border-emerald-800 bg-emerald-800 text-white" : "border-slate-200 bg-white text-slate-600 hover:border-emerald-300"}`}>{category}</button>
+                      ))}
+                    </div>
+                    <div key={selectedChecklistCategory} className="mt-3 space-y-3" style={{ animation: "itinerarySlideIn 220ms ease-out" }}>
+                      {selectedChecklistItems.map((item) => {
+                        const mode = item.completion_mode || "PERSONAL";
+                        const sharedDone = Boolean(item.shared_done || item.shared_status === "✓");
+                        const ralphDone = Boolean(item.ralph_done || item.ralph_status === "✓");
+                        const juneDone = Boolean(item.june_done || item.june_status === "✓");
+                        const done = mode === "SHARED" ? sharedDone : (ralphDone && juneDone);
+                        const ownDone = welcomeName === "Ralph" ? ralphDone : juneDone;
+                        const otherName = welcomeName === "Ralph" ? "June" : "Ralph";
+                        const otherDone = welcomeName === "Ralph" ? juneDone : ralphDone;
+                        return (
+                          <article key={item.item_id} onPointerDown={(event) => startChecklistLongPress(event, item)} onPointerUp={clearChecklistLongPress} onPointerLeave={clearChecklistLongPress} onPointerCancel={clearChecklistLongPress} className={`rounded-xl border p-4 transition ${item.cancelled ? "border-slate-200 bg-slate-100 opacity-65" : done ? "border-emerald-200 bg-emerald-50/40" : item.to_buy ? "border-amber-300 bg-amber-50/50" : "border-slate-200 bg-white"}`}>
+                            <div className="flex flex-wrap items-center gap-2">
+                              <p className={`font-medium ${item.cancelled ? "text-slate-500 line-through" : done ? "text-slate-500 line-through" : "text-slate-800"}`}>{item.item}</p>
+                              <span className={`inline-flex items-center rounded-full border px-2 py-0.5 text-xs font-bold ${mode === "SHARED" ? "border-sky-200 bg-sky-50 text-sky-800" : "border-violet-200 bg-violet-50 text-violet-800"}`}>{mode === "SHARED" ? "Shared" : "Personal"}</span>
+                              {item.cancelled && <span className="rounded-full bg-slate-200 px-2 py-0.5 text-xs font-bold text-slate-600">Cancelled</span>}
+                              {item.to_buy && !done && !item.cancelled && <span className="inline-flex items-center rounded-full border border-amber-300 bg-amber-100 px-2 py-0.5 text-xs font-bold text-amber-900">🛒 To Buy</span>}
+                              {item.checklist_type === "packing" && item.must_have && <span className="inline-flex items-center rounded-full border border-rose-200 bg-rose-50 px-2 py-0.5 text-xs font-bold text-rose-700">✔️ Must have</span>}
+                            </div>
+                            {(item.quantity || item.due_date || item.notes) && <p className="mt-1 whitespace-pre-wrap text-sm leading-5 text-slate-500">{[item.quantity ? `Qty: ${item.quantity}` : "", item.due_date ? `Due: ${item.due_date}` : "", item.notes || ""].filter(Boolean).join(" · ")}</p>}
+                            <div className="mt-3 flex flex-wrap items-center gap-2">
+                              <span className="mr-1 text-xs font-semibold text-slate-500">Completion:</span>
+                              <button type="button" disabled={Boolean(checklistSavingId) || Boolean(item.cancelled)} onClick={() => void setChecklistMode(item, "SHARED")} className={`rounded-lg border px-3 py-2 text-sm font-bold disabled:opacity-50 ${mode === "SHARED" ? "border-sky-700 bg-sky-700 text-white" : "border-slate-300 bg-white text-slate-700"}`}>Shared</button>
+                              <button type="button" disabled={Boolean(checklistSavingId) || Boolean(item.cancelled)} onClick={() => void setChecklistMode(item, "PERSONAL")} className={`rounded-lg border px-3 py-2 text-sm font-bold disabled:opacity-50 ${mode === "PERSONAL" ? "border-violet-700 bg-violet-700 text-white" : "border-slate-300 bg-white text-slate-700"}`}>Personal</button>
+                            </div>
+                            {!item.cancelled && <div className="mt-3 flex flex-wrap gap-2">
+                              {mode === "SHARED" ? <button type="button" disabled={Boolean(checklistSavingId)} onClick={() => void setChecklistStatus(item, "Shared", sharedDone ? "" : "✓")} className={`min-h-11 rounded-lg border px-4 py-2.5 text-sm font-semibold disabled:opacity-50 ${sharedDone ? "border-emerald-800 bg-emerald-800 text-white" : "border-slate-300 bg-white text-slate-700"}`}>{sharedDone ? "✓ Done · Both" : "□ Mark done · Both"}</button> : <><button type="button" disabled={Boolean(checklistSavingId) || (welcomeName !== "Ralph")} onClick={() => void setChecklistStatus(item, "Ralph", ralphDone ? "" : "✓")} className={`min-h-11 rounded-lg border px-3 py-2.5 text-sm font-semibold disabled:opacity-50 ${ralphDone ? "border-emerald-800 bg-emerald-800 text-white" : "border-slate-300 bg-white text-slate-700"}`}>{ralphDone ? "✓ Ralph done" : "□ Ralph done"}</button><button type="button" disabled={Boolean(checklistSavingId) || (welcomeName !== "June")} onClick={() => void setChecklistStatus(item, "June", juneDone ? "" : "✓")} className={`min-h-11 rounded-lg border px-3 py-2.5 text-sm font-semibold disabled:opacity-50 ${juneDone ? "border-emerald-800 bg-emerald-800 text-white" : "border-slate-300 bg-white text-slate-700"}`}>{juneDone ? "✓ June done" : "□ June done"}</button><span className="self-center text-xs text-slate-500">{otherName}: {otherDone ? "Done" : "Not done"}</span></>}
+                              {activeChecklistTab === "before" && !done && <button type="button" disabled={Boolean(checklistSavingId)} onClick={() => void toggleChecklistToBuy(item)} className={`min-h-11 rounded-lg border px-3 py-2.5 text-sm font-semibold disabled:opacity-50 ${item.to_buy ? "border-amber-400 bg-amber-100 text-amber-900" : "border-slate-300 bg-white text-slate-700"}`}>{item.to_buy ? "✓ Remove To Buy" : "+ To Buy"}</button>}
+                            </div>}
+                            {checklistSavingId === item.item_id && <span className="mt-2 block text-xs text-slate-500">Syncing…</span>}
+                            <p className="mt-2 text-[11px] text-slate-400">Long-press this item to cancel or restore it.</p>
+                          </article>
+                        );
+                      })}
+                    </div>
+                    <div className="mt-4 flex items-center justify-between gap-3">
+                      <button type="button" disabled={safeChecklistCategoryIndex === 0} onClick={() => setChecklistCategoryIndex((index) => Math.max(0, index - 1))} className="rounded-lg border border-slate-300 px-3 py-2 text-sm font-semibold disabled:opacity-40">← Previous</button>
+                      <span className="text-xs text-slate-500">{safeChecklistCategoryIndex + 1} / {checklistCategories.length} · Swipe to switch</span>
+                      <button type="button" disabled={safeChecklistCategoryIndex >= checklistCategories.length - 1} onClick={() => setChecklistCategoryIndex((index) => Math.min(checklistCategories.length - 1, index + 1))} className="rounded-lg border border-slate-300 px-3 py-2 text-sm font-semibold disabled:opacity-40">Next →</button>
+                    </div>
+                  </>
+                ) : (
+                  <p className="mt-4 rounded-xl border border-dashed border-slate-300 p-4 text-sm text-slate-600">No checklist items were returned from Google Sheets. Confirm the “Things to do & bring” tab and its headers are configured.</p>
+                )}
+                {checklistMessage && <p className="mt-3 text-sm text-slate-600" aria-live="polite">{checklistMessage}</p>}
+                <button type="button" onClick={() => { setNewChecklistType(activeChecklistTab === "grocery" ? "GROCERY" : "BEFORE_DEPARTURE"); setNewChecklistCategory(""); setShowChecklistAddModal(true); }} className="fixed bottom-24 right-5 z-40 flex h-14 w-14 items-center justify-center rounded-full bg-emerald-800 text-3xl font-semibold text-white shadow-xl transition hover:scale-105 hover:bg-emerald-900 sm:bottom-8 sm:right-8" aria-label="Add checklist item" title="Add checklist item">+</button>
+              </section>
+            )}
 
-        if (existingRow) {
-          return jsonResponse({
-            success: true,
-            duplicate: true,
-            message: "Memory already saved.",
-            memory: {
-              memory_id: String(existingRow[0] || ""),
-              trip_date: String(existingRow[1] || ""),
-              attraction: String(existingRow[2] || ""),
-              author_email: String(existingRow[3] || ""),
-              content: String(existingRow[4] || ""),
-              created_at: String(existingRow[5] || ""),
-              updated_at: String(existingRow[6] || ""),
-              photo_ids: String(existingRow[7] || ""),
-            },
-          });
-        }
+            {!isLoadingItinerary && !itineraryError && activeView === "companion" && (
+              <section className="rounded-2xl border border-slate-200 bg-white p-5 shadow-sm sm:p-7">
+                <button
+                  type="button"
+                  onClick={() => setActiveView("checklist")}
+                  className="text-sm font-semibold text-emerald-800 hover:underline"
+                >
+                  ← Back to checklist
+                </button>
 
-        const photos = Array.isArray(body.photos) ? body.photos : [];
-        if (photos.length > 4) return jsonResponse({ success: false, error: "Choose up to 4 photos per memory." }, 400);
-        let encodedTotal = 0;
-        for (const photo of photos) {
-          const encoded = typeof photo.data_base64 === "string" ? photo.data_base64.replace(/^data:image\/[^;]+;base64,/, "") : "";
-          encodedTotal += encoded.length;
-          // Base64 adds roughly 33% overhead. This permits up to 10 MiB per photo.
-          if (!encoded || encoded.length > 14_000_000) return jsonResponse({ success: false, error: "Each photo must be 10 MB or smaller." }, 400);
-        }
-        // Four photos at the 10 MiB per-photo limit are supported.
-        if (encodedTotal > 56_000_000) return jsonResponse({ success: false, error: "Total photo size must be 40 MB or smaller per memory." }, 400);
-        const photoFiles: Array<{ id: string; url: string }> = [];
-        for (const photo of photos) photoFiles.push(await uploadSharedMemoryPhoto(tokenData.access_token, photo, 10 * 1024 * 1024));
-        // Store both Drive file IDs and URLs so photos can be located from the sheet later.
-        const photoIdsValue = photoFiles.length ? JSON.stringify(photoFiles) : "";
-        const createdAt = new Date().toISOString();
-        const appendUrl =
-          `${sheetUrl}:append?valueInputOption=RAW&insertDataOption=INSERT_ROWS`;
+                <div className="mt-6 flex h-16 w-16 items-center justify-center rounded-2xl bg-emerald-50 text-3xl">
+                  ❤️
+                </div>
 
-        const appendResponse = await fetch(appendUrl, {
-          method: "POST",
-          headers: {
-            Authorization: `Bearer ${tokenData.access_token}`,
-            "Content-Type": "application/json",
-          },
-          body: JSON.stringify({
-            values: [[
-              memoryId,
-              tripDate,
-              attraction,
-              session.email,
-              content,
-              createdAt,
-              createdAt,
-              photoIdsValue,
-            ]],
-          }),
-        });
+                <p className="mt-5 text-xs font-bold uppercase tracking-[0.16em] text-emerald-800">
+                  Your travel companion
+                </p>
+                <h2 className="mt-2 text-2xl font-bold">Two travellers, one journey</h2>
+                <p className="mt-3 text-sm leading-6 text-slate-600">
+                  Your shared trip, itinerary and travel memories belong
+                  in one place. Sign in using your own approved Google account.
+                </p>
 
-        if (!appendResponse.ok) {
-          return jsonResponse(
-            { success: false, error: "Could not save the memory to Google Sheets." },
-            502,
-          );
-        }
+                <div className="mt-5 rounded-xl border border-slate-200 p-4">
+                  <p className="text-xs font-semibold uppercase tracking-wide text-slate-500">
+                    Currently signed in
+                  </p>
+                  <p className="mt-1 break-all font-medium text-slate-900">
+                    {verifiedEmail}
+                  </p>
+                </div>
 
-        return jsonResponse({
-          success: true,
-          duplicate: false,
-          message: "Memory saved.",
-          memory: {
-            memory_id: memoryId,
-            trip_date: tripDate,
-            attraction,
-            author_email: session.email,
-            content,
-            created_at: createdAt,
-            updated_at: createdAt,
-            photo_ids: photoIdsValue,
-          },
-        });
-      } catch (error) {
-        return jsonResponse(
-          { success: false, error: error instanceof Error ? error.message : "An unexpected error occurred while accessing memories." },
-          500,
-        );
-      }
-    }
-    
-    // Per-photo comments and emoji reactions are stored separately from the
-    // original TRIP_MEMORIES records and Google Drive photo files.
-    if ((request.method === "GET" || request.method === "POST") && url.pathname === "/api/memory-interactions") {
-      const session = await readSession(request, env);
-      if (!session) return jsonResponse({ success: false, error: "Authentication required." }, 401);
-      if (request.method === "POST" && request.headers.get("Origin") !== url.origin) return jsonResponse({ success: false, error: "Invalid request origin." }, 403);
-      try {
-        const body = request.method === "POST" ? await request.json() as Record<string, unknown> : {};
-        const trip = await resolveTrip(request, env, typeof body.tripId === "string" ? body.tripId : undefined);
-        if (!trip) return jsonResponse({ success: false, error: "Select a valid trip first." }, 404);
-        const token = await googleAccessToken(session, env);
-        const tab = "TRIP_MEMORY_INTERACTIONS";
-        const headers = ["interaction_id", "memory_id", "photo_id", "kind", "value", "author_email", "created_at"];
-        await ensureSheetTab(token, trip.sheetId, tab, headers);
-        const range = `${quoteSheetTab(tab)}!A:G`;
-        const read = await fetch(sheetsValuesUrl(trip.sheetId, range), { headers: { Authorization: `Bearer ${token}` } });
-        if (!read.ok) return jsonResponse({ success: false, error: "Could not read photo comments and reactions." }, 502);
-        const data = await read.json() as { values?: unknown[][] };
-        const rows = data.values || [];      
-        if (request.method === "GET") {
-          const interactions = rows.slice(1).filter((row) => String(row[1] || "").trim() && String(row[2] || "").trim() && String(row[4] || "").trim()).map((row) => ({ interaction_id: String(row[0] || ""), memory_id: String(row[1] || ""), photo_id: String(row[2] || ""), kind: String(row[3] || ""), value: String(row[4] || ""), author: String(row[5] || "").toLowerCase() === "koochanyee@gmail.com" ? "Ralph" : String(row[5] || "").toLowerCase() === "wookahwai@gmail.com" ? "June" : "Traveller", created_at: String(row[6] || "") }));
-          return jsonResponse({ success: true, interactions });
-        }
-        const action = String(body.action || "");
-        const memoryId = typeof body.memory_id === "string" ? body.memory_id.trim() : "";
-        const photoId = typeof body.photo_id === "string" ? body.photo_id.trim() : "";
-        if (!memoryId || memoryId.length > 120 || !photoId || photoId.length > 200) return jsonResponse({ success: false, error: "Invalid memory or photo reference." }, 400);
-        const createdAt = new Date().toISOString();
-        if (action === "reaction") {
-          const allowed = ["❤️", "😂", "😍", "👍", "🎉", "🥰", "👏"];
-          const emoji = typeof body.value === "string" ? body.value : "";
-          if (!allowed.includes(emoji)) return jsonResponse({ success: false, error: "Unsupported emoji reaction." }, 400);
-          const existingIndex = rows.slice(1).findIndex((row) => String(row[1] || "") === memoryId && String(row[2] || "") === photoId && String(row[3] || "") === "REACTION" && String(row[5] || "").toLowerCase() === session.email.toLowerCase());
-          if (existingIndex >= 0) {
-            const sheetRow = existingIndex + 2;
-            const current = String(rows[sheetRow - 1]?.[4] || "");
-            const nextValue = current === emoji ? "" : emoji;
-            const update = await fetch(`${sheetsValuesUrl(trip.sheetId, `${quoteSheetTab(tab)}!E${sheetRow}`)}?valueInputOption=RAW`, { method: "PUT", headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" }, body: JSON.stringify({ values: [[nextValue]] }) });
-            if (!update.ok) return jsonResponse({ success: false, error: "Could not update emoji reaction." }, 502);
-          } else {
-            const append = await fetch(`${sheetsValuesUrl(trip.sheetId, `${quoteSheetTab(tab)}!A:G`)}:append?valueInputOption=RAW&insertDataOption=INSERT_ROWS`, { method: "POST", headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" }, body: JSON.stringify({ values: [[crypto.randomUUID(), memoryId, photoId, "REACTION", emoji, session.email, createdAt]] }) });
-            if (!append.ok) return jsonResponse({ success: false, error: "Could not save emoji reaction." }, 502);
-          }
-          return jsonResponse({ success: true, message: "Reaction updated." });
-        }
-        if (action === "comment") {
-          const comment = typeof body.value === "string" ? body.value.trim() : "";
-          if (!comment || comment.length > 1000) return jsonResponse({ success: false, error: "Enter a comment of up to 1,000 characters." }, 400);
-          const append = await fetch(`${sheetsValuesUrl(trip.sheetId, `${quoteSheetTab(tab)}!A:G`)}:append?valueInputOption=RAW&insertDataOption=INSERT_ROWS`, { method: "POST", headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" }, body: JSON.stringify({ values: [[crypto.randomUUID(), memoryId, photoId, "COMMENT", comment, session.email, createdAt]] }) });
-          if (!append.ok) return jsonResponse({ success: false, error: "Could not save comment." }, 502);
-          return jsonResponse({ success: true, message: "Comment shared." }, 201);
-        }
-        return jsonResponse({ success: false, error: "Unsupported interaction." }, 400);
-      } catch (error) { return jsonResponse({ success: false, error: error instanceof Error ? error.message : "Could not save photo interaction." }, 500); }
-    }
+                <p className="mt-4 text-sm text-slate-500">
+                  Shared companion profiles and live shared editing are not connected yet.
+                </p>
 
-    return jsonResponse(
-      { error: "Not Found" },
-      404,
-    );
-  },
-} satisfies ExportedHandler<Env>;
+                <button
+                  type="button"
+                  onClick={() => navigateToItinerary()}
+                  disabled={tripDays.length === 0}
+                  className="mt-6 w-full rounded-xl bg-emerald-800 px-5 py-3 font-bold text-white hover:bg-emerald-900 disabled:opacity-50"
+                >
+                  Show Itinerary →
+                </button>
+              </section>
+            )}            
+
+            {!isLoadingItinerary && !itineraryError && ["expenses", "memories", "map"].includes(activeView) && (
+              <section className="rounded-2xl border border-slate-200 bg-white p-6 shadow-sm sm:p-8">
+                <button type="button" onClick={goToDashboard} className="text-sm font-semibold text-emerald-800 hover:underline">← Back to dashboard</button>
+                <div className="mt-6 flex h-14 w-14 items-center justify-center rounded-2xl bg-emerald-50 text-3xl" aria-hidden="true">{activeView === "expenses" ? "💳" : activeView === "memories" ? "📸" : "🗺️"}</div>
+                <h2 className="mt-4 text-2xl font-bold">{activeView === "expenses" ? "Trip expenses" : activeView === "memories" ? "Travel memories" : "Trip map"}</h2>
+                {activeView === "expenses" ? <div className="mt-5 space-y-5">
+                  <div className="grid gap-3 sm:grid-cols-3">
+                    <div className="rounded-xl border border-slate-200 p-4"><p className="text-xs font-semibold uppercase text-slate-500">Paid pre-trip expenses</p><p className="mt-2 text-xl font-bold">{formatExpenseTotal(paidPreTripExpenses.filter((expense) => expense.share_type !== "personal"))}</p><p className="mt-1 text-xs text-slate-500">Unpaid estimates excluded</p></div>
+                    <div className="rounded-xl border border-slate-200 p-4"><p className="text-xs font-semibold uppercase text-slate-500">Actual shared spending</p><p className="mt-2 text-xl font-bold">{formatExpenseTotal(paidOrActualExpenses.filter((expense) => expense.expense_type === "actual-trip" && expense.share_type !== "personal"))}</p><p className="mt-1 text-xs text-slate-500">During the trip, split 50:50</p></div>
+                    <div className="rounded-xl border border-slate-200 p-4"><p className="text-xs font-semibold uppercase text-slate-500">Personal spending</p><p className="mt-2 text-xl font-bold">{formatExpenseTotal(paidOrActualExpenses.filter((expense) => expense.share_type === "personal"))}</p><p className="mt-1 text-xs text-slate-500">Not included in the shared split</p></div>
+                  </div>
+                  <div className="grid grid-cols-3 gap-2" role="tablist" aria-label="Expense sections">
+                    {([['pre-trip','Pre-trip'],['actual-trip','Actual trip'],['personal','Personal']] as const).map(([tab,label]) => <button key={tab} type="button" role="tab" aria-selected={expenseTab === tab} onClick={() => { setExpenseTab(tab); setExpenseShareType(tab === "personal" ? "personal" : "shared"); if (tab === "pre-trip") setExpenseType("pre-trip"); else if (tab === "actual-trip") setExpenseType("actual-trip"); }} className={`rounded-xl border px-3 py-3 text-sm font-semibold ${expenseTab === tab ? "border-emerald-800 bg-emerald-800 text-white" : "border-slate-300 bg-white text-slate-700"}`}>{label}</button>)}
+                  </div>
+                  {expenseTab === "pre-trip" && <section className="rounded-xl border border-slate-200 p-3"><h3 className="font-semibold text-sm">Pre-trip category summary</h3><div className="mt-2 grid grid-cols-1 gap-1.5 sm:grid-cols-2">{["Transportation", "Camping site", "Hotel stay", "Activity", "Other"].map((category) => { const matches = paidPreTripExpenses.filter((expense) => { if (expense.share_type === "personal") return false; const searchText = `${expense.category || ""} ${expense.description || ""}`; return category === "Transportation" ? /transport|flight|airfare|airline|campervan|motorhome|vehicle hire|camper van rental/i.test(searchText) : category === "Camping site" ? /camp|campsite|holiday park/i.test(searchText) && !/campervan|motorhome|vehicle hire|camper van rental/i.test(searchText) : category === "Hotel stay" ? /hotel|accommodation|motel|lodge/i.test(searchText) : category === "Activity" ? /activity|ticket|tour|attraction|booking/i.test(searchText) : !/transport|flight|airfare|airline|campervan|motorhome|vehicle hire|camper van rental|camp|campsite|holiday park|hotel|accommodation|motel|lodge|activity|ticket|tour|attraction|booking/i.test(searchText); }); const categoryColor = category === "Transportation" ? "bg-black border-black text-white" : category === "Camping site" ? "bg-sky-50 border-sky-200 text-sky-900" : category === "Hotel stay" ? "bg-violet-50 border-violet-200 text-violet-900" : category === "Activity" ? "bg-amber-50 border-amber-200 text-amber-900" : "bg-emerald-50 border-emerald-200 text-emerald-900"; return <div key={category} className={`flex min-h-9 items-center justify-between gap-2 rounded-md border px-2.5 py-1.5 ${categoryColor}`}><span className="text-xs font-medium">{category}</span><span className="whitespace-nowrap text-xs font-semibold">{formatExpenseTotal(matches)}</span></div>; })}</div></section>}
+                  {expenseTab === "personal" && <section className="rounded-xl border border-slate-200 p-4"><h3 className="font-semibold">Trip expense summary</h3><p className="mt-1 text-xs text-slate-500">Paid pre-trip costs and actual trip costs only. Shared items are divided 50:50; each person's own personal costs are added to their share. Unpaid estimates are excluded.</p><div className="mt-3 grid gap-3 sm:grid-cols-2">{(["Ralph", "June"] as const).map((person) => { const personTotal = (type?: "pre-trip" | "actual-trip") => { const totals: Record<string, number> = {}; paidOrActualExpenses.filter((expense) => (!type || expense.expense_type === type)).forEach((expense) => { const currency = expense.currency || "NZD"; if (expense.share_type === "personal") { if (expense.paid_by !== person) return; totals[currency] = (totals[currency] || 0) + Number(expense.amount || 0); } else { totals[currency] = (totals[currency] || 0) + Number(expense.amount || 0) / 2; } }); return Object.entries(totals).length ? Object.entries(totals).map(([currency, total]) => formatMoney(total, currency)).join(" · ") : formatMoney(0, "NZD"); }; return <div key={person} className="rounded-xl border border-slate-200 p-3"><h4 className="font-semibold">{person} · estimated personal share</h4><div className="mt-2 flex justify-between gap-2 text-sm"><span className="text-slate-500">Paid pre-trip</span><strong>{personTotal("pre-trip")}</strong></div><div className="mt-1 flex justify-between gap-2 text-sm"><span className="text-slate-500">Actual trip</span><strong>{personTotal("actual-trip")}</strong></div><div className="mt-2 flex justify-between gap-2 border-t border-slate-100 pt-2 text-sm"><span className="font-semibold">Total</span><strong>{personTotal()}</strong></div></div>; })}</div><div className="mt-4 grid gap-2 sm:grid-cols-3"><div className="rounded-lg bg-slate-50 p-3"><p className="text-xs text-slate-500">Shared expenses · 50:50</p><p className="mt-1 font-bold">{formatExpenseTotal(paidOrActualExpenses.filter((expense) => expense.share_type !== "personal"))}</p></div><div className="rounded-lg bg-slate-50 p-3"><p className="text-xs text-slate-500">Personal expenses</p><p className="mt-1 font-bold">{formatExpenseTotal(expenses.filter((expense) => expense.share_type === "personal"))}</p></div><div className="rounded-lg bg-emerald-50 p-3"><p className="text-xs text-emerald-800">Total recorded trip expenses</p><p className="mt-1 font-bold">{formatExpenseTotal(paidOrActualExpenses)}</p></div></div><p className="mt-2 text-xs text-slate-500">The total excludes unpaid estimates from FINAL EXPENSES; currencies are shown separately and are not converted.</p></section>}
+                  <form onSubmit={(event) => void saveExpense(event)} className="rounded-xl border border-slate-200 p-4">
+                    <h3 className="font-semibold">{editingExpenseId ? "Edit expense record" : `Add ${expenseTab === "pre-trip" ? "pre-trip expense" : expenseTab === "actual-trip" ? "actual trip expense" : "personal expense"}`}</h3>
+                    <div className="mt-4 grid gap-3 sm:grid-cols-2">
+                      <label className="text-sm font-medium">Date<input type="date" required value={expenseDate} onChange={(event) => { const value = event.target.value; setExpenseDate(value); setExpenseType(value >= "2026-11-07" ? "actual-trip" : "pre-trip"); }} className="mt-1 block w-full rounded-lg border border-slate-300 px-3 py-2 font-normal" /></label>
+                      <label className="text-sm font-medium">Expense sharing<select value={expenseShareType} onChange={(event) => setExpenseShareType(event.target.value as "shared" | "personal")} className="mt-1 block w-full rounded-lg border border-slate-300 px-3 py-2 font-normal"><option value="shared">Shared · split 50:50</option><option value="personal">Personal · not split</option></select></label>
+                      <label className="text-sm font-medium">Paid by<select value={expensePaidBy} onChange={(event) => setExpensePaidBy(event.target.value)} className="mt-1 block w-full rounded-lg border border-slate-300 px-3 py-2 font-normal"><option>Ralph</option><option>June</option><option>Shared</option></select></label>
+                      <label className="text-sm font-medium">Description<input required maxLength={200} value={expenseDescription} onChange={(event) => setExpenseDescription(event.target.value)} placeholder="e.g. Campervan deposit" className="mt-1 block w-full rounded-lg border border-slate-300 px-3 py-2 font-normal" /></label>
+                      <label className="text-sm font-medium">Category<select value={expenseCategory} onChange={(event) => setExpenseCategory(event.target.value)} className="mt-1 block w-full rounded-lg border border-slate-300 px-3 py-2 font-normal">{["Transportation", "Camping site", "Hotel stay", "Activity", "Flights", "Campervan", "Accommodation", "Insurance", "Bookings & activities", "Fuel", "Groceries", "Meals", "Parking & transport", "Shopping", "Other"].map((category) => <option key={category}>{category}</option>)}</select></label>
+                      <div className="grid grid-cols-[1fr_100px] gap-2"><label className="text-sm font-medium">Amount<input type="number" min="0.01" step="0.01" required value={expenseAmount} onChange={(event) => setExpenseAmount(event.target.value)} placeholder="0.00" className="mt-1 block w-full rounded-lg border border-slate-300 px-3 py-2 font-normal" /></label><label className="text-sm font-medium">Currency<select value={expenseCurrency} onChange={(event) => setExpenseCurrency(event.target.value)} className="mt-1 block w-full rounded-lg border border-slate-300 px-2 py-2 font-normal"><option>NZD</option><option>MYR</option><option>AUD</option><option>USD</option></select></label></div>
+                      <div className="sm:col-span-2"><div className="flex flex-wrap items-center justify-between gap-2"><span className="text-sm font-medium">Location (GPS)</span><button type="button" onClick={detectExpenseLocation} disabled={isDetectingExpenseLocation} className="rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm font-semibold disabled:opacity-50">{isDetectingExpenseLocation ? "Locating…" : "📍 Use GPS"}</button></div><input readOnly value={expenseLocation} placeholder="Optional — attach current location" className="mt-2 block w-full rounded-lg border border-slate-300 bg-slate-50 px-3 py-2 text-sm" /></div>
+                      <label className="text-sm font-medium sm:col-span-2">Notes (optional)<textarea rows={2} maxLength={1000} value={expenseNotes} onChange={(event) => setExpenseNotes(event.target.value)} className="mt-1 block w-full rounded-lg border border-slate-300 px-3 py-2 font-normal" /></label>
+                    </div>
+                    <button type="submit" disabled={expenseSaving} className="mt-4 rounded-lg bg-emerald-800 px-4 py-2.5 text-sm font-semibold text-white disabled:opacity-50">{expenseSaving ? "Saving…" : editingExpenseId ? "Save changes" : "Save expense"}</button>{editingExpenseId && <button type="button" onClick={() => { setEditingExpenseId(""); setExpenseMessage("Edit cancelled."); }} className="mt-4 ml-2 rounded-lg border border-slate-300 px-4 py-2.5 text-sm font-semibold">Cancel edit</button>}
+                    {expenseMessage && <p className="mt-3 text-sm text-slate-600" aria-live="polite">{expenseMessage}</p>}
+                  </form>
+                  {(() => { const visibleExpenses = expenses.filter((expense) => expenseTab === "personal" ? expense.share_type === "personal" : expense.share_type !== "personal" && expense.expense_type === expenseTab); return <section><h3 className="font-semibold">{expenseTab === "pre-trip" ? "Pre-trip expenses" : expenseTab === "actual-trip" ? "Actual trip expenses" : "Personal expenses"}</h3>{visibleExpenses.length ? <div className="mt-3 space-y-3">{[...visibleExpenses].sort((a,b) => (b.date || "").localeCompare(a.date || "")).map((expense) => <article key={expense.expense_id} className="rounded-xl border border-slate-200 p-4"><div className="flex flex-wrap items-start justify-between gap-3"><div className="min-w-0"><p className="font-semibold">{expense.description}</p><p className="mt-1 text-xs text-slate-500">{expense.date || "Planned / booked"} · {expense.category} · Paid by {expense.paid_by}</p><div className="mt-2 flex flex-wrap gap-2"><span className="inline-block rounded-full bg-slate-100 px-2 py-1 text-xs text-slate-600">{expense.expense_type === "pre-trip" ? "Pre-trip" : "Actual trip"}{expense.source === "FINAL EXPENSES" ? " · From planning sheet" : ""}</span><span className="inline-block rounded-full bg-blue-50 px-2 py-1 text-xs text-blue-800">{expense.share_type === "personal" ? "Personal" : "Shared · 50:50"}</span>{expense.payment_status && <span className={`inline-block rounded-full px-2 py-1 text-xs ${expense.payment_status === "Paid" ? "bg-emerald-100 text-emerald-800" : "bg-amber-100 text-amber-800"}`}>{expense.payment_status}</span>}</div>{typeof expense.split_share === "number" && <p className="mt-2 text-xs text-slate-600">50:50 share: {formatMoney(expense.split_share, expense.currency)}</p>}{expense.location && <a className="mt-2 block text-xs font-semibold text-emerald-800 underline" href={`https://www.google.com/maps?q=${encodeURIComponent(expense.latitude && expense.longitude ? `${expense.latitude},${expense.longitude}` : expense.location)}`} target="_blank" rel="noreferrer">📍 {expense.location} · Open map</a>}{expense.notes && <p className="mt-2 whitespace-pre-wrap text-sm text-slate-600">{expense.notes}</p>}</div><div className="shrink-0 text-right"><p className="font-bold">{formatMoney(Number(expense.amount), expense.currency)}</p>{expense.source === "TRIP EXPENSES" && <div className="mt-3 flex flex-wrap justify-end gap-2"><button type="button" onClick={() => beginEditExpense(expense)} className="min-h-10 rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm font-semibold text-slate-700">Edit</button><button type="button" disabled={expenseSaving} onClick={() => void markExpenseLegacy(expense)} className="min-h-10 rounded-lg border border-rose-200 bg-rose-50 px-3 py-2 text-sm font-semibold text-rose-800 disabled:opacity-50">Remove</button></div>}</div></div></article>)}</div> : <p className="mt-2 rounded-xl bg-slate-50 p-4 text-sm text-slate-600">No {expenseTab === "personal" ? "personal" : expenseTab === "pre-trip" ? "pre-trip" : "actual trip"} expenses found.</p>}</section>; })()}
+                </div> : activeView === "map" ? <div className="mt-5 space-y-4"><p className="max-w-xl text-sm leading-6 text-slate-600">Open a day's route in Google Maps for driving directions. Flight days open a location search instead of driving directions.</p>{tripDays.map((day, index) => { const routeEntry = getEntriesForDay(day).find((entry) => /^(route|route\s*\/.*|route\s*and.*)$/i.test(entry.label.trim())) || getEntriesForDay(day).find((entry) => /route/i.test(entry.label)); const routeText = routeEntry?.value.trim() || ""; return <article key={day.key} className="rounded-xl border border-slate-200 p-4"><div className="flex items-start justify-between gap-3"><div><p className="text-xs font-semibold uppercase tracking-wide text-emerald-800">Day {index + 1} · {day.date}</p><h3 className="mt-1 font-semibold">{routeText || "Route not entered"}</h3></div><span aria-hidden="true" className="text-2xl">🛣️</span></div>{routeText ? <a href={googleMapsUrl(routeText)} target="_blank" rel="noreferrer" className="mt-3 inline-flex rounded-lg bg-emerald-800 px-4 py-2.5 text-sm font-semibold text-white hover:bg-emerald-900">{/\b(KUL|SIN)\b|flight|airport transfer/i.test(routeText) ? "Open locations in Google Maps ↗" : "Open driving route in Google Maps ↗"}</a> : <p className="mt-2 text-sm text-slate-500">Add route details to this day's itinerary to enable directions.</p>}</article>; })}<p className="text-xs text-slate-500">Google Maps opens separately. Route accuracy depends on the place names in your itinerary.</p></div> : <div className="mt-5 space-y-5">
+                  <form onSubmit={(event) => { event.preventDefault(); setMemoryPreviewOpen(true); setMemoryMessage(""); }} className="rounded-xl border border-slate-200 p-4">
+                    <h3 className="font-semibold">Add a shared memory</h3><p className="mt-1 text-sm text-slate-500">Review the preview before saving. Memories are shared with both approved travellers.</p>
+                    <label className="mt-4 block text-sm font-medium">Trip date</label><select value={memoryDate} onChange={(event) => setMemoryDate(event.target.value)} required className="mt-1 w-full rounded-lg border border-slate-300 px-3 py-2 text-sm">{!tripDays.some((day) => normalizeTripDate(day.date) === normalizeTripDate(memoryDate)) && <option value={memoryDate}>Today · {memoryDate}</option>}{tripDays.map((day) => <option key={day.key} value={day.date}>{day.date}</option>)}</select>
+                    <label className="mt-3 block text-sm font-medium">Attraction / place</label><div className="mt-1 flex gap-2"><input value={memoryAttraction} onChange={(event) => setMemoryAttraction(event.target.value)} required maxLength={160} placeholder="e.g. Lake Tekapo" className="min-w-0 flex-1 rounded-lg border border-slate-300 px-3 py-2 text-sm" /><button type="button" onClick={() => void detectMemoryPlace()} disabled={isDetectingPlace} className="shrink-0 rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm font-semibold disabled:opacity-50">{isDetectingPlace ? "Locating…" : "📍 Use GPS"}</button></div>
+                    <label className="mt-3 block text-sm font-medium">Memory</label><textarea value={memoryContent} onChange={(event) => setMemoryContent(event.target.value)} required maxLength={5000} rows={4} placeholder="What would you like to remember about this place?" className="mt-1 w-full rounded-lg border border-slate-300 px-3 py-2 text-sm" />
+                    <label className="mt-3 block text-sm font-medium">Photos</label><div className="mt-2 grid gap-2 sm:grid-cols-2"><label className="cursor-pointer rounded-lg border border-slate-300 bg-white px-3 py-3 text-center text-sm font-semibold text-slate-700 hover:bg-slate-50">🖼️ Choose from gallery<input type="file" accept="image/*" multiple onChange={(event) => { const selected = Array.from(event.target.files ?? []) as File[]; setMemoryPhotoFiles((current) => [...current, ...selected].slice(0, MAX_MEMORY_PHOTOS)); event.currentTarget.value = ""; }} className="sr-only" /></label><label className="cursor-pointer rounded-lg border border-emerald-300 bg-emerald-50 px-3 py-3 text-center text-sm font-semibold text-emerald-900 hover:bg-emerald-100">📷 Take a picture<input type="file" accept="image/*" capture="environment" onChange={(event) => { const selected = Array.from(event.target.files ?? []) as File[]; setMemoryPhotoFiles((current) => [...current, ...selected].slice(0, MAX_MEMORY_PHOTOS)); event.currentTarget.value = ""; }} className="sr-only" /></label></div>
+                    {memoryPhotoFiles.length > 0 && <p className="mt-2 text-xs text-slate-600">{memoryPhotoFiles.length} of {MAX_MEMORY_PHOTOS} photos selected. You can remove unwanted photos in the preview before saving.</p>}
+                    <p className="mt-1 text-xs text-slate-500">Up to 4 photos, 10 MB each. If Drive access is not yet authorized, the app will ask you to reconnect once.</p>
+                    <button type="submit" className="mt-3 rounded-lg bg-emerald-800 px-4 py-2.5 text-sm font-semibold text-white">Preview memory</button>
+                  </form>
+                  {memoryPreviewOpen && <section className="rounded-xl border border-emerald-300 bg-emerald-50/50 p-4"><p className="text-xs font-bold uppercase tracking-wide text-emerald-800">Preview — not saved yet</p><h3 className="mt-2 font-semibold">{memoryAttraction}</h3><p className="mt-1 text-xs text-slate-500">{memoryDate}</p><p className="mt-3 whitespace-pre-wrap text-sm leading-6">{memoryContent}</p><div className="mt-4"><p className="text-sm font-semibold">Selected photos ({memoryPhotoFiles.length}/{MAX_MEMORY_PHOTOS})</p><MemoryPhotoSelectionPreview files={memoryPhotoFiles} onRemove={(index) => setMemoryPhotoFiles((current) => current.filter((_, photoIndex) => photoIndex !== index))} />{memoryPhotoFiles.some((file) => file.size > MAX_MEMORY_PHOTO_BYTES) && <p className="mt-2 text-sm font-medium text-rose-700">One or more photos exceed 10 MB. Remove those photos or choose smaller files before saving.</p>}</div><div className="mt-4 flex flex-wrap gap-2"><button type="button" onClick={() => void saveMemory()} disabled={isSavingMemory || memoryPhotoFiles.some((file) => file.size > MAX_MEMORY_PHOTO_BYTES)} className="rounded-lg bg-emerald-800 px-4 py-2.5 text-sm font-semibold text-white disabled:opacity-50">{isSavingMemory ? "Saving…" : "Confirm & save"}</button><button type="button" onClick={() => setMemoryPreviewOpen(false)} className="rounded-lg border border-slate-300 bg-white px-4 py-2.5 text-sm font-semibold">Keep editing</button></div></section>}
+                  {memoryMessage && <p className="text-sm text-slate-600" aria-live="polite">{memoryMessage}</p>}
+                  <section className="rounded-xl border border-slate-200 p-4">
+                    <div className="flex flex-wrap items-center justify-between gap-2"><h3 className="font-semibold">Trip photo gallery</h3><span className="text-xs text-slate-500">{memoryGalleryPhotos.length} photo{memoryGalleryPhotos.length === 1 ? "" : "s"}</span></div>
+                    {memoryGalleryPhotos.length ? <div className="mt-3 max-h-[420px] overflow-y-auto overscroll-contain rounded-lg border border-slate-100 p-2"><div className="grid grid-cols-2 gap-2 sm:grid-cols-3">{memoryGalleryPhotos.map((photo, index) => <button key={`${photo.memory_id}-${photo.id}-${index}`} type="button" onClick={() => setSelectedMemoryPhoto(photo)} className="overflow-hidden rounded-lg border border-slate-200 bg-white text-left shadow-sm hover:border-emerald-400 focus:outline-none focus:ring-2 focus:ring-emerald-600"><img src={getMemoryPhotoUrl(photo.id)} alt={`Trip photo: ${photo.attraction}`} loading="lazy" className="h-28 w-full bg-slate-100 object-cover sm:h-36" /><span className="block truncate px-2 pt-2 text-xs font-semibold text-slate-800">{photo.attraction}</span><span className="block px-2 pb-2 text-[11px] text-slate-500">{photo.trip_date}</span></button>)}</div></div> : <p className="mt-2 text-sm text-slate-500">Photos added to saved memories will appear here.</p>}
+                  </section>
+                  <section><h3 className="font-semibold">Shared memory collection</h3>{memories.length ? <div className="mt-3 space-y-3">{[...memories].sort((a,b) => (a.trip_date || "").localeCompare(b.trip_date || "")).map((memory) => <article key={memory.memory_id} className="rounded-xl border border-slate-200 p-4"><div className="flex flex-wrap items-start justify-between gap-2"><h4 className="font-semibold">{memory.attraction}</h4><span className="text-xs text-slate-500">{memory.trip_date}</span></div><p className="mt-2 whitespace-pre-wrap text-sm leading-6 text-slate-700">{memory.content}</p>{getMemoryPhotoIds(memory.photo_ids).length > 0 && <div className="mt-3 grid grid-cols-3 gap-2 sm:grid-cols-4">{getMemoryPhotoIds(memory.photo_ids).map((photoId) => <button key={photoId} type="button" onClick={() => setSelectedMemoryPhoto({ id: photoId, attraction: memory.attraction, trip_date: memory.trip_date, memory_id: memory.memory_id })} className="overflow-hidden rounded-lg border border-slate-200 bg-white text-left"><img src={getMemoryPhotoUrl(photoId)} alt={`Photo for ${memory.attraction}`} loading="lazy" className="h-20 w-full bg-slate-100 object-cover sm:h-24" /><span className="block px-2 py-1 text-[11px] font-semibold text-emerald-800">View photo</span></button>)}</div>}<p className="mt-2 text-xs text-slate-500">Shared by {memory.author_email || "trip companion"}</p></article>)}</div> : <p className="mt-2 text-sm text-slate-500">No shared memories have been saved yet.</p>}</section>
+
+                </div>}
+              </section>
+            )}
+          </>
+        )}
+      </main>
+
+      {showChecklistAddModal && (
+        <div className="fixed inset-0 z-[80] flex items-end justify-center bg-slate-950/50 p-0 sm:items-center sm:p-4" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) setShowChecklistAddModal(false); }}>
+          <section role="dialog" aria-modal="true" aria-labelledby="add-checklist-title" className="w-full max-w-lg rounded-t-2xl bg-white p-5 shadow-2xl sm:rounded-2xl sm:p-6">
+            <div className="flex items-center justify-between gap-3"><h2 id="add-checklist-title" className="text-xl font-bold">Add checklist item</h2><button type="button" onClick={() => setShowChecklistAddModal(false)} className="rounded-lg px-3 py-2 text-lg hover:bg-slate-100" aria-label="Close">✕</button></div>
+            <form onSubmit={(event) => void addChecklistItem(event)} className="mt-4 space-y-3">
+              <label className="block text-sm font-semibold">List<select value={newChecklistType} onChange={(event) => { setNewChecklistType(event.target.value as "BEFORE_DEPARTURE" | "GROCERY"); setNewChecklistCategory(""); }} className="mt-1 w-full rounded-lg border border-slate-300 px-3 py-2.5"><option value="BEFORE_DEPARTURE">Before Departure</option><option value="GROCERY">Grocery</option></select></label>
+              <label className="block text-sm font-semibold">Category<select required value={newChecklistCategory || addChecklistCategories[0] || "Other"} onChange={(event) => setNewChecklistCategory(event.target.value)} className="mt-1 w-full rounded-lg border border-slate-300 px-3 py-2.5">{(addChecklistCategories.length ? addChecklistCategories : ["Other"]).map((category) => <option key={category} value={category}>{category}</option>)}</select></label>
+              <label className="block text-sm font-semibold">Item<input required maxLength={250} value={newChecklistItem} onChange={(event) => setNewChecklistItem(event.target.value)} placeholder="Enter item" className="mt-1 w-full rounded-lg border border-slate-300 px-3 py-2.5" /></label>
+              <label className="block text-sm font-semibold">Quantity (optional)<input maxLength={80} value={newChecklistQuantity} onChange={(event) => setNewChecklistQuantity(event.target.value)} placeholder="e.g. 2" className="mt-1 w-full rounded-lg border border-slate-300 px-3 py-2.5" /></label>
+              <label className="block text-sm font-semibold">Notes (optional)<textarea maxLength={500} rows={2} value={newChecklistNotes} onChange={(event) => setNewChecklistNotes(event.target.value)} className="mt-1 w-full rounded-lg border border-slate-300 px-3 py-2.5" /></label>
+              <p className="text-xs text-slate-500">The new item is shared with Ralph and June and saved in Google Sheets.</p>
+              <div className="flex gap-2"><button type="button" onClick={() => setShowChecklistAddModal(false)} className="flex-1 rounded-xl border border-slate-300 px-4 py-3 text-sm font-semibold">Cancel</button><button type="submit" disabled={checklistSavingId === "__add__" || !newChecklistItem.trim()} className="flex-1 rounded-xl bg-emerald-800 px-4 py-3 text-sm font-semibold text-white disabled:opacity-50">{checklistSavingId === "__add__" ? "Saving…" : "Save item"}</button></div>
+            </form>
+          </section>
+        </div>
+      )}
+
+      {selectedMemoryPhoto && (
+        <div className="fixed inset-0 z-[70] flex items-center justify-center bg-slate-950/95 p-3 sm:p-6" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) setSelectedMemoryPhoto(null); }}>
+          <section role="dialog" aria-modal="true" aria-label={`Trip photo from ${selectedMemoryPhoto.attraction}`} className="relative flex max-h-full w-full max-w-5xl flex-col items-center" onTouchStart={(event) => setPhotoTouchStart({ x: event.touches[0].clientX, y: event.touches[0].clientY })} onTouchEnd={(event) => { if (!photoTouchStart || memoryGalleryPhotos.length < 2) return; const dx = event.changedTouches[0].clientX - photoTouchStart.x; const dy = event.changedTouches[0].clientY - photoTouchStart.y; if (Math.abs(dx) > 45 && Math.abs(dx) > Math.abs(dy) * 1.2) { const next = Math.max(0, Math.min(memoryGalleryPhotos.length - 1, selectedMemoryPhotoIndex + (dx < 0 ? 1 : -1))); setSelectedMemoryPhoto(memoryGalleryPhotos[next]); setMemoryInteractionMessage(""); } setPhotoTouchStart(null); }}>
+            <div className="mb-3 flex w-full items-center justify-between gap-3 text-white"><div className="min-w-0"><p className="truncate text-sm font-semibold">{selectedMemoryPhoto.attraction}</p><p className="text-xs text-slate-300">{selectedMemoryPhoto.trip_date} · {selectedMemoryPhotoIndex >= 0 ? selectedMemoryPhotoIndex + 1 : 1} / {memoryGalleryPhotos.length}</p></div><button type="button" onClick={() => setSelectedMemoryPhoto(null)} className="shrink-0 rounded-full bg-white/15 px-4 py-2 text-sm font-semibold text-white hover:bg-white/25">Close ✕</button></div>
+            <div className="flex min-h-0 w-full items-center justify-center gap-2">
+              <button type="button" disabled={selectedMemoryPhotoIndex <= 0} onClick={() => setSelectedMemoryPhoto(memoryGalleryPhotos[selectedMemoryPhotoIndex - 1])} aria-label="Previous photo" className="hidden rounded-full bg-white/15 px-3 py-3 text-2xl text-white disabled:opacity-20 sm:block">‹</button>
+              <img src={getMemoryPhotoUrl(selectedMemoryPhoto.id)} alt={`Full-size trip photo: ${selectedMemoryPhoto.attraction}`} className="max-h-[52vh] max-w-full rounded-lg object-contain" />
+              <button type="button" disabled={selectedMemoryPhotoIndex < 0 || selectedMemoryPhotoIndex >= memoryGalleryPhotos.length - 1} onClick={() => setSelectedMemoryPhoto(memoryGalleryPhotos[selectedMemoryPhotoIndex + 1])} aria-label="Next photo" className="hidden rounded-full bg-white/15 px-3 py-3 text-2xl text-white disabled:opacity-20 sm:block">›</button>
+            </div>
+            <p className="mt-2 text-xs text-slate-300 sm:hidden">Swipe left or right to view another photo</p>
+            <div className="mt-4 w-full max-w-2xl rounded-xl bg-white p-4 text-slate-900">
+              <h3 className="font-semibold">Reactions</h3>
+              <div className="mt-2 flex flex-wrap gap-2">{["❤️", "😂", "😍", "👍", "🎉", "🥰", "👏"].map((emoji) => { const count = selectedPhotoInteractions.filter((entry) => entry.kind === "REACTION" && entry.value === emoji).length; const mine = selectedPhotoInteractions.some((entry) => entry.kind === "REACTION" && entry.value === emoji && entry.author === welcomeName); return <button key={emoji} type="button" disabled={memoryInteractionSaving} onClick={() => void saveMemoryInteraction("reaction", emoji)} className={`rounded-full border px-3 py-2 text-lg disabled:opacity-50 ${mine ? "border-emerald-700 bg-emerald-50" : "border-slate-200 bg-white"}`}>{emoji}<span className="ml-1 text-xs font-semibold text-slate-600">{count || ""}</span></button>; })}</div>
+              <h3 className="mt-4 font-semibold">Comments</h3>
+              <div className="mt-2 max-h-36 space-y-2 overflow-y-auto">{selectedPhotoInteractions.filter((entry) => entry.kind === "COMMENT").map((entry) => <div key={entry.interaction_id} className="rounded-lg bg-slate-50 p-2"><div className="flex items-center justify-between gap-2"><span className="text-xs font-bold text-slate-700">{entry.author}</span><span className="text-[10px] text-slate-400">{entry.created_at ? new Date(entry.created_at).toLocaleString() : ""}</span></div><p className="mt-1 whitespace-pre-wrap text-sm text-slate-700">{entry.value}</p></div>)}{!selectedPhotoInteractions.some((entry) => entry.kind === "COMMENT") && <p className="text-sm text-slate-500">No comments yet. Add the first one.</p>}</div>
+              <form onSubmit={(event) => { event.preventDefault(); void saveMemoryInteraction("comment", memoryCommentDraft); }} className="mt-3 flex gap-2"><input value={memoryCommentDraft} onChange={(event) => setMemoryCommentDraft(event.target.value)} maxLength={1000} placeholder="Write a comment…" className="min-w-0 flex-1 rounded-lg border border-slate-300 px-3 py-2 text-sm" /><button type="submit" disabled={memoryInteractionSaving || !memoryCommentDraft.trim()} className="rounded-lg bg-emerald-800 px-4 py-2 text-sm font-semibold text-white disabled:opacity-50">Send</button></form>
+              {memoryInteractionMessage && <p className="mt-2 text-xs text-slate-600" aria-live="polite">{memoryInteractionMessage}</p>}
+            </div>
+          </section>
+        </div>
+      )}
+
+      {locationModalSession && selectedDay && (
+        <div className="fixed inset-0 z-50 flex items-end justify-center bg-slate-950/40 p-0 sm:items-center sm:p-4" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) setLocationModalSession(null); }}>
+          <section role="dialog" aria-modal="true" aria-labelledby="session-location-title" className="w-full max-w-lg rounded-t-2xl bg-white p-5 shadow-2xl sm:rounded-2xl sm:p-6">
+            <div className="flex items-start justify-between gap-3"><div><p className="text-xs font-bold uppercase tracking-wide text-emerald-800">{selectedDay.date} · {locationModalSession}</p><h2 id="session-location-title" className="mt-1 text-xl font-bold">Edit session location</h2><p className="mt-1 text-sm text-slate-500">Changes sync to the SESSION LOCATION Google Sheet.</p></div><button type="button" aria-label="Close location editor" onClick={() => setLocationModalSession(null)} className="rounded-lg px-3 py-2 text-lg hover:bg-slate-100">✕</button></div>
+            <label className="mt-5 block text-sm font-semibold" htmlFor="session-location-input">Planned location</label>
+            <textarea id="session-location-input" autoFocus rows={3} value={locationDrafts[`${selectedDay.date}|${locationModalSession}`] ?? getSessionLocation(locationModalSession)} onChange={(event) => setLocationDrafts((current) => ({ ...current, [`${selectedDay.date}|${locationModalSession}`]: event.target.value }))} placeholder={`Where will you be during ${locationModalSession.toLowerCase()}?`} className="mt-2 w-full rounded-xl border border-slate-300 p-3 text-sm focus:border-emerald-700 focus:outline-none focus:ring-2 focus:ring-emerald-100" />
+            {locationMessage && <p className="mt-2 text-sm text-slate-600" aria-live="polite">{locationMessage}</p>}
+            <div className="mt-4 flex gap-2"><button type="button" onClick={() => setLocationModalSession(null)} className="flex-1 rounded-xl border border-slate-300 px-4 py-3 text-sm font-semibold">Cancel</button><button type="button" disabled={locationSaving === `${selectedDay.date}|${locationModalSession}` || !(locationDrafts[`${selectedDay.date}|${locationModalSession}`] ?? getSessionLocation(locationModalSession)).trim()} onClick={async () => { await saveSessionLocation(locationModalSession); }} className="flex-1 rounded-xl bg-emerald-800 px-4 py-3 text-sm font-semibold text-white disabled:opacity-50">{locationSaving === `${selectedDay.date}|${locationModalSession}` ? "Saving…" : "Save & sync"}</button></div>
+          </section>
+        </div>
+      )}
+
+      {showDriveAccessModal && verifiedEmail && selectedTripId && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-950/55 p-4" role="dialog" aria-modal="true" aria-labelledby="drive-access-title">
+          <section className="w-full max-w-md rounded-2xl bg-white p-5 shadow-2xl sm:p-6">
+            <div className="flex items-start gap-3">
+              <div className="flex h-11 w-11 shrink-0 items-center justify-center rounded-full bg-amber-100 text-xl" aria-hidden="true">🔐</div>
+              <div className="min-w-0 flex-1">
+                <h2 id="drive-access-title" className="text-lg font-bold">Google Drive access needed</h2>
+                <p className="mt-2 text-sm leading-6 text-slate-600">Google Drive permission is needed to upload memory photos. Reconnect your Google account and approve the requested Drive access. You can cancel and continue without uploading photos.</p>
+              </div>
+              <button type="button" aria-label="Close Drive access message" onClick={() => setShowDriveAccessModal(false)} className="rounded-lg px-2 py-1 text-lg text-slate-500 hover:bg-slate-100">✕</button>
+            </div>
+            <div className="mt-5 flex flex-col-reverse gap-2 sm:flex-row sm:justify-end">
+              <button type="button" onClick={() => setShowDriveAccessModal(false)} className="rounded-xl border border-slate-300 px-4 py-2.5 text-sm font-semibold">Not now</button>
+              <button type="button" onClick={() => { try { window.sessionStorage.setItem("campervan-selected-trip", selectedTripId); window.sessionStorage.setItem("campervan-active-view", activeView); window.sessionStorage.setItem("campervan-memory-attraction", memoryAttraction); window.sessionStorage.setItem("campervan-memory-content", memoryContent); window.sessionStorage.setItem("campervan-memory-preview", String(memoryPreviewOpen)); window.sessionStorage.setItem("campervan-drive-reconnect-pending", "1"); } catch { /* Continue to OAuth even if storage is unavailable. */ } window.location.assign("/api/sheets/connect"); }} className="rounded-xl bg-emerald-800 px-4 py-2.5 text-sm font-semibold text-white hover:bg-emerald-900">Reconnect Google / Drive</button>
+            </div>
+          </section>
+        </div>
+      )}
+
+      {verifiedEmail && selectedTripId && (
+        <nav className="fixed inset-x-0 bottom-0 z-30 border-t border-slate-200 bg-white/95 px-3 pb-[env(safe-area-inset-bottom)] shadow-[0_-4px_16px_rgba(15,23,42,0.06)] backdrop-blur">
+          <div className="mx-auto flex max-w-6xl items-center justify-between gap-3 border-b border-slate-100 py-2">
+            <p className="min-w-0 truncate text-xs font-semibold text-slate-600 sm:text-sm">Shared travel companion @ 2026</p>
+            <div className="flex shrink-0 items-center gap-2">
+              <button type="button" onClick={() => { window.scrollTo({ top: 0, behavior: "smooth" }); }} aria-label="Back to top" title="Back to top" className="group flex h-9 w-9 items-center justify-center rounded-full bg-emerald-800 text-lg font-bold text-white shadow-sm transition duration-150 hover:scale-110 hover:bg-emerald-700 hover:shadow-md focus-visible:scale-110 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-emerald-500 focus-visible:ring-offset-2 active:scale-105">▲</button>
+              <button type="button" onClick={() => setRefreshKey((n) => n + 1)} disabled={isLoadingItinerary} className="rounded-lg border border-slate-300 bg-white px-3 py-2 text-xs font-semibold text-slate-800 transition hover:bg-slate-50 disabled:opacity-50 sm:text-sm">{isLoadingItinerary ? "Refreshing…" : "Refresh itinerary"}</button>
+            </div>
+          </div>
+          <div className="mx-auto grid max-w-3xl grid-cols-6 gap-1 py-2">
+            {[
+              { view: "home" as ViewName, icon: "⌂", label: "Home" },
+              { view: "itinerary" as ViewName, icon: "▤", label: "Itinerary" },
+              { view: "checklist" as ViewName, icon: "🎒", label: "Checklist" },
+              { view: "expenses" as ViewName, icon: "＄", label: "Expenses" },
+              { view: "memories" as ViewName, icon: "♡", label: "Memories" },
+              { view: "map" as ViewName, icon: "⌖", label: "Map" },
+            ].map((item) => (
+              <button key={item.view} type="button" onClick={() => item.view === "itinerary" ? navigateToItinerary() : setActiveView(item.view)} className={`flex flex-col items-center gap-1 rounded-xl px-1 py-2 text-xs font-medium transition ${activeView === item.view ? "bg-emerald-50 text-emerald-900" : "text-slate-500 hover:bg-slate-50"}`} aria-current={activeView === item.view ? "page" : undefined}>
+                <span className="text-xl leading-none" aria-hidden="true">{item.icon}</span>
+                <span>{item.label}</span>
+              </button>
+            ))}
+          </div>
+        </nav>
+      )}
+    </div>
+  );
+}
+
+function InfoPanel({ icon, title, entries, empty }: { icon: string; title: string; entries: DayEntry[]; empty: string }) {
+  return (
+    <div className="rounded-xl border border-slate-200 p-3">
+      <div className="flex items-center gap-2"><span aria-hidden="true">{icon}</span><h4 className="text-sm font-semibold">{title}</h4></div>
+      {entries.length === 0 ? <p className="mt-2 text-xs leading-5 text-slate-500">{empty}</p> : <div className="mt-2 space-y-3">{entries.map((entry) => <div key={entry.key}><p className="text-xs font-semibold text-slate-700">{entry.label}</p><p className="mt-1 whitespace-pre-wrap break-words text-xs leading-5 text-slate-600">{entry.value}</p></div>)}</div>}
+    </div>
+  );
+}
+
+export default App;
