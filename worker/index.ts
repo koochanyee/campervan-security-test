@@ -187,6 +187,7 @@ interface GoogleOAuthState {
 interface GoogleOAuthTokenResponse {
   access_token?: string;
   refresh_token?: string;
+  id_token?: string;
   expires_in?: number;
   token_type?: string;
   error?: string;
@@ -369,7 +370,7 @@ interface TripConfig {
 const TRIP_REGISTRY_KEY = "trip-registry:shared:v1";
 const SOUTH_ISLAND_SHEET_ID = "1L_GUByHbUMIORDakIRutHUwK9pNMYPAsm1H1fe6RMB0";
 const TRIP_MEMORY_FOLDER_ID = "1mvq9t6mrtMnQk1Ug3DN2dl8S7cEDI-97";
-const EXPENSE_HEADERS = ["expense_id", "date", "description", "category", "amount", "currency", "paid_by", "expense_type", "notes", "created_at", "share_type", "latitude", "longitude", "location", "legacy"];
+const EXPENSE_HEADERS = ["expense_id", "date", "description", "category", "amount", "currency", "paid_by", "expense_type", "notes", "created_at", "share_type", "latitude", "longitude", "location", "legacy", "payment_method"];
 
 async function getTripRegistry(env: Env): Promise<TripConfig[]> {
   const saved = await env.OAUTH_TOKEN_STORE.get(TRIP_REGISTRY_KEY);
@@ -396,6 +397,18 @@ async function resolveTrip(request: Request, env: Env, bodyTripId?: string): Pro
   return trips.find((trip) => trip.id === tripId) || null;
 }
 
+const googleAuthMetaKey = (email: string) => `google-auth-meta:${email.toLowerCase()}`;
+const googleReconnectKey = (email: string) => `google-reconnect-required:${email.toLowerCase()}`;
+
+async function markGoogleReconnectRequired(env: Env, email: string, reason = "invalid_grant"): Promise<void> {
+  if (!env.OAUTH_TOKEN_STORE) return;
+  await env.OAUTH_TOKEN_STORE.put(googleReconnectKey(email), JSON.stringify({
+    status: "reconnect_required",
+    reason,
+    detectedAt: new Date().toISOString(),
+  }));
+}
+
 async function googleAccessToken(session: SessionPayload, env: Env): Promise<string> {
   if (!env.GOOGLE_CLIENT_ID || !env.GOOGLE_CLIENT_SECRET || !env.TOKEN_ENCRYPTION_KEY || !env.OAUTH_TOKEN_STORE) {
     throw new Error("Google Sheets is not configured.");
@@ -408,9 +421,20 @@ async function googleAccessToken(session: SessionPayload, env: Env): Promise<str
     headers: { "Content-Type": "application/x-www-form-urlencoded" },
     body: new URLSearchParams({ client_id: env.GOOGLE_CLIENT_ID, client_secret: env.GOOGLE_CLIENT_SECRET, refresh_token: refreshToken, grant_type: "refresh_token" }).toString(),
   });
-  if (!response.ok) throw new Error("Google access failed. Reconnect Google Sheets.");
+  if (!response.ok) {
+    const googleError = await response.json().catch(() => ({})) as { error?: string; error_description?: string };
+    if (googleError.error === "invalid_grant") {
+      await markGoogleReconnectRequired(env, session.email, "invalid_grant");
+      console.error("[GOOGLE TOKEN REFRESH FAILED]", { error: googleError.error, description: googleError.error_description || "Token expired or revoked", email: session.email });
+      throw new Error("Google authorization has expired. Reconnect Google Sheets to continue.");
+    }
+    console.error("[GOOGLE TOKEN REFRESH FAILED]", { status: response.status, error: googleError.error || "unknown_error", email: session.email });
+    throw new Error("Google access failed. Reconnect Google Sheets.");
+  }
   const data = await response.json() as { access_token?: string };
   if (!data.access_token) throw new Error("Google returned no access token.");
+  // A successful refresh proves this account's stored refresh token is still valid.
+  await env.OAUTH_TOKEN_STORE.delete(googleReconnectKey(session.email));
   return data.access_token;
 }
 
@@ -699,6 +723,42 @@ export default {
         },
       });
     }
+
+    // End the app session only. Google OAuth tokens remain stored per account.
+    if (url.pathname === "/api/auth/logout" && request.method === "POST") {
+      if (request.headers.get("Origin") !== url.origin) {
+        return jsonResponse({ success: false, error: "Invalid request origin." }, 403);
+      }
+      const response = jsonResponse({ success: true, message: "Signed out." });
+      response.headers.append("Set-Cookie", "m3_session=; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=0");
+      return response;
+    }
+
+    // Report the signed-in account's Google Sheets authorization state.
+    if (url.pathname === "/api/auth/google-status" && request.method === "GET") {
+      const session = await readSession(request, env);
+      if (!session) return jsonResponse({ success: false, error: "Authentication required." }, 401);
+      const email = session.email.toLowerCase();
+      const [refreshToken, reconnectFlag, metaRaw] = await Promise.all([
+        env.OAUTH_TOKEN_STORE.get(`google-refresh:${email}`),
+        env.OAUTH_TOKEN_STORE.get(googleReconnectKey(email)),
+        env.OAUTH_TOKEN_STORE.get(googleAuthMetaKey(email)),
+      ]);
+      let meta: { authorizedAt?: string } = {};
+      if (metaRaw) { try { meta = JSON.parse(metaRaw) as { authorizedAt?: string }; } catch { meta = {}; } }
+      const authorizedAt = meta.authorizedAt || null;
+      const expiresAt = authorizedAt ? new Date(new Date(authorizedAt).getTime() + 7 * 24 * 60 * 60 * 1000).toISOString() : null;
+      return jsonResponse({
+        success: true,
+        user: { email: session.email },
+        connected: Boolean(refreshToken) && !reconnectFlag,
+        needsReconnect: Boolean(reconnectFlag) || !refreshToken,
+        status: reconnectFlag ? "reconnect_required" : refreshToken ? "connected" : "not_connected",
+        authorizedAt,
+        estimatedTestingExpiryAt: expiresAt,
+        testingModeNotice: "Google OAuth Testing authorizations using Sheets/Drive scopes expire after 7 days. Reconnect when prompted.",
+      });
+    }
     
     // Start Google Sheets OAuth authorization
     if (
@@ -749,10 +809,10 @@ export default {
         googleUrl.searchParams.set("response_type", "code");
         googleUrl.searchParams.set(
           "scope",
-          "https://www.googleapis.com/auth/spreadsheets https://www.googleapis.com/auth/drive",
+          "openid email https://www.googleapis.com/auth/spreadsheets https://www.googleapis.com/auth/drive",
         );
         googleUrl.searchParams.set("access_type", "offline");
-        googleUrl.searchParams.set("prompt", "consent");
+        googleUrl.searchParams.set("prompt", "consent select_account");
         googleUrl.searchParams.set("state", state);
 
         return new Response(null, {
@@ -911,28 +971,62 @@ export default {
         const tokens =
           (await tokenResponse.json()) as GoogleOAuthTokenResponse;
 
-        if (!tokens.refresh_token) {
-          return new Response(
-            "Google did not return a refresh token. Revoke this app's access in your Google Account and try connecting again.",
-            {
-              status: 400,
-              headers: {
-                "Cache-Control": "no-store",
-                "Set-Cookie": clearStateCookie,
-              },
-            },
-          );
+        // Ensure the Google account granting Sheets/Drive access matches the app session.
+        if (!tokens.id_token) {
+          return new Response("Google did not return an identity token. Please retry Google connection.", {
+            status: 400,
+            headers: { "Cache-Control": "no-store", "Set-Cookie": clearStateCookie },
+          });
+        }
+        const identityResponse = await fetch(
+          "https://oauth2.googleapis.com/tokeninfo?id_token=" + encodeURIComponent(tokens.id_token),
+        );
+        if (!identityResponse.ok) {
+          return new Response("Could not verify the Google account used for Sheets access. Please reconnect.", {
+            status: 401,
+            headers: { "Cache-Control": "no-store", "Set-Cookie": clearStateCookie },
+          });
+        }
+        const oauthIdentity = await identityResponse.json() as GoogleTokenInfo;
+        const oauthEmail = String(oauthIdentity.email || "").toLowerCase();
+        const identityExpiry = Number(oauthIdentity.exp || 0);
+        if (
+          oauthIdentity.aud !== env.GOOGLE_CLIENT_ID ||
+          oauthEmail !== session.email.toLowerCase() ||
+          String(oauthIdentity.email_verified).toLowerCase() !== "true" ||
+          identityExpiry <= Math.floor(Date.now() / 1000)
+        ) {
+          console.error("[GOOGLE OAUTH ACCOUNT MISMATCH]", { sessionEmail: session.email, oauthEmail });
+          return new Response("The Google account selected for Sheets access does not match the account signed into the trip app. Please select the same account and try again.", {
+            status: 403,
+            headers: { "Cache-Control": "no-store", "Set-Cookie": clearStateCookie },
+          });
         }
 
-        const encryptedToken = await encryptToken(
-          tokens.refresh_token,
-          env.TOKEN_ENCRYPTION_KEY,
-        );
-
-        await env.OAUTH_TOKEN_STORE.put(
-          `google-refresh:${session.email.toLowerCase()}`,
-          encryptedToken,
-        );
+        const refreshKey = `google-refresh:${session.email.toLowerCase()}`;
+        if (tokens.refresh_token) {
+          const encryptedToken = await encryptToken(tokens.refresh_token, env.TOKEN_ENCRYPTION_KEY);
+          await env.OAUTH_TOKEN_STORE.put(refreshKey, encryptedToken);
+          await env.OAUTH_TOKEN_STORE.put(googleAuthMetaKey(session.email), JSON.stringify({
+            authorizedAt: new Date().toISOString(),
+            updatedAt: new Date().toISOString(),
+            mode: "testing",
+          }));
+          await env.OAUTH_TOKEN_STORE.delete(googleReconnectKey(session.email));
+        } else {
+          // Never overwrite a previously stored token with an empty value.
+          // If the prior token was invalid, the status marker remains and the user is asked to revoke/re-authorize.
+          const [existingToken, reconnectFlag] = await Promise.all([
+            env.OAUTH_TOKEN_STORE.get(refreshKey),
+            env.OAUTH_TOKEN_STORE.get(googleReconnectKey(session.email)),
+          ]);
+          if (!existingToken || reconnectFlag) {
+            return new Response(
+              "Google did not issue a replacement refresh token, and the previous connection cannot be confirmed. Remove this app's access from your Google Account, then reconnect and approve access again.",
+              { status: 400, headers: { "Cache-Control": "no-store", "Set-Cookie": clearStateCookie } },
+            );
+          }
+        }
 
         return new Response(null, {
           status: 302,
@@ -1019,6 +1113,14 @@ export default {
               if (!legacyHeaderWrite.ok) throw new Error("Could not add the legacy flag header in column O.");
             }
           }
+          const paymentMethodHeaderRead = await fetch(sheetsValuesUrl(trip.sheetId, `${quoteSheetTab(tab)}!P1`), { headers: { Authorization: `Bearer ${token}` } });
+          if (paymentMethodHeaderRead.ok) {
+            const paymentMethodHeaderData = await paymentMethodHeaderRead.json() as { values?: unknown[][] };
+            if (!String(paymentMethodHeaderData.values?.[0]?.[0] ?? "").trim()) {
+              const paymentMethodHeaderWrite = await fetch(`${sheetsValuesUrl(trip.sheetId, `${quoteSheetTab(tab)}!P1`)}?valueInputOption=RAW`, { method: "PUT", headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" }, body: JSON.stringify({ values: [["payment_method"]] }) });
+              if (!paymentMethodHeaderWrite.ok) throw new Error("Could not add the payment method header in column P.");
+            }
+          }
         }
 
         if (request.method === "GET") {
@@ -1030,7 +1132,7 @@ export default {
             const idx = (name: string) => header.indexOf(name);
             const idIdx = idx("expense_id"), dateIdx = idx("date"), descIdx = idx("description");
             const amountIdx = idx("amount"), currencyIdx = idx("currency"), paidByIdx = idx("paid_by");
-            const categoryIdx = idx("category"), notesIdx = idx("notes"), shareTypeIdx = idx("share_type"), latitudeIdx = idx("latitude"), longitudeIdx = idx("longitude"), locationIdx = idx("location"), legacyIdx = idx("legacy");
+            const categoryIdx = idx("category"), notesIdx = idx("notes"), shareTypeIdx = idx("share_type"), latitudeIdx = idx("latitude"), longitudeIdx = idx("longitude"), locationIdx = idx("location"), legacyIdx = idx("legacy"), paymentMethodIdx = idx("payment_method");
             rows.slice(1).forEach((row, rowOffset) => {
               const legacyFlag = legacyIdx >= 0 ? String(row[legacyIdx] ?? "").trim().toUpperCase() : "";
               if (["TRUE", "YES", "LEGACY", "1", "X"].includes(legacyFlag)) return;
@@ -1043,6 +1145,14 @@ export default {
               if (!expenseId || !description || !Number.isFinite(amount) || amount <= 0) return;
               const date = dateIdx >= 0 ? String(row[dateIdx] || "").trim() : "";
               const inferredType = date >= "2026-11-07" ? "actual-trip" : "pre-trip";
+              const savedPaidBy = paidByIdx >= 0 ? String(row[paidByIdx] || "Ralph").trim() : "Ralph";
+              const savedPaymentMethod = paymentMethodIdx >= 0 ? String(row[paymentMethodIdx] || "").trim() : "";
+              const savedMethodLower = savedPaymentMethod.toLowerCase();
+              const normalizedPaymentMethod = savedMethodLower === "cash" ? "Cash"
+                : savedMethodLower === "ralph (card)" ? "Ralph (Card)"
+                : savedMethodLower === "june (card)" ? "June (Card)"
+                : savedMethodLower === "card" ? (savedPaidBy === "June" ? "June (Card)" : savedPaidBy === "Ralph" ? "Ralph (Card)" : "Unspecified")
+                : "Unspecified";
               loggedExpenses.push({
                 expense_id: expenseId,
                 date,
@@ -1050,7 +1160,8 @@ export default {
                 category: categoryIdx >= 0 ? String(row[categoryIdx] || "Other") : "Other",
                 amount,
                 currency: currencyIdx >= 0 ? String(row[currencyIdx] || "NZD") : "NZD",
-                paid_by: paidByIdx >= 0 ? String(row[paidByIdx] || "Ralph") : "Ralph",
+                paid_by: normalizedPaymentMethod === "Ralph (Card)" ? "Ralph" : normalizedPaymentMethod === "June (Card)" ? "June" : "Shared",
+                payment_method: normalizedPaymentMethod,
                 // Date is the source of truth for the trip boundary: before 7 Nov is
                 // pre-trip; 7 Nov onward is actual-trip, even if an old row has a stale type.
                 expense_type: inferredType,
@@ -1127,26 +1238,27 @@ export default {
         const category = typeof body.category === "string" ? body.category.trim() : "Other";
         const amount = Number(body.amount);
         const currency = typeof body.currency === "string" ? body.currency.trim().toUpperCase() : "NZD";
-        const paidBy = typeof body.paid_by === "string" ? body.paid_by.trim() : "";
+        const paymentMethod = typeof body.payment_method === "string" ? body.payment_method.trim() : "";
+        const paidBy = paymentMethod === "Ralph (Card)" ? "Ralph" : paymentMethod === "June (Card)" ? "June" : paymentMethod === "Cash" ? "Shared" : "";
         const expenseType = date >= "2026-11-07" ? "actual-trip" : "pre-trip";
         const shareType = body.share_type === "personal" ? "personal" : body.share_type === "shared" ? "shared" : "shared";
         const latitude = typeof body.latitude === "string" ? body.latitude.trim() : "";
         const longitude = typeof body.longitude === "string" ? body.longitude.trim() : "";
         const location = typeof body.location === "string" ? body.location.trim() : "";
         const notes = typeof body.notes === "string" ? body.notes.trim() : "";
-        if (!expenseId || expenseId.length > 100 || !date || !description || description.length > 250 || !Number.isFinite(amount) || amount <= 0 || !["pre-trip", "actual-trip"].includes(String(expenseType)) || !["Ralph", "June", "Shared"].includes(paidBy) || !/^[A-Z]{3}$/.test(currency) || category.length > 100 || notes.length > 2000 || latitude.length > 30 || longitude.length > 30 || location.length > 500) return jsonResponse({ success: false, error: "Invalid expense details." }, 400);
+        if (!expenseId || expenseId.length > 100 || !date || !description || description.length > 250 || !Number.isFinite(amount) || amount <= 0 || !["pre-trip", "actual-trip"].includes(String(expenseType)) || !["Ralph", "June", "Shared"].includes(paidBy) || !["Ralph (Card)", "June (Card)", "Cash"].includes(paymentMethod) || !/^[A-Z]{3}$/.test(currency) || category.length > 100 || notes.length > 2000 || latitude.length > 30 || longitude.length > 30 || location.length > 500) return jsonResponse({ success: false, error: "Invalid expense details." }, 400);
         if (action === "edit") {
           if (existingRowIndex < 1) return jsonResponse({ success: false, error: "Could not find that app-entered expense to edit." }, 404);
           const createdAt = String(rows[existingRowIndex][9] || new Date().toISOString());
-          const editRange = `${quoteSheetTab(tab)}!A${existingRowIndex + 1}:O${existingRowIndex + 1}`;
-          const editWrite = await fetch(`${sheetsValuesUrl(trip.sheetId, editRange)}?valueInputOption=RAW`, { method: "PUT", headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" }, body: JSON.stringify({ values: [[expenseId, date, description, category, amount, currency, paidBy, expenseType, notes, createdAt, shareType, latitude, longitude, location, ""]] }) });
+          const editRange = `${quoteSheetTab(tab)}!A${existingRowIndex + 1}:P${existingRowIndex + 1}`;
+          const editWrite = await fetch(`${sheetsValuesUrl(trip.sheetId, editRange)}?valueInputOption=RAW`, { method: "PUT", headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" }, body: JSON.stringify({ values: [[expenseId, date, description, category, amount, currency, paidBy, expenseType, notes, createdAt, shareType, latitude, longitude, location, "", paymentMethod]] }) });
           if (!editWrite.ok) return jsonResponse({ success: false, error: `Could not update the expense in Google Sheets (HTTP ${editWrite.status}).` }, 502);
           return jsonResponse({ success: true, message: "Expense updated." });
         }
         if (action !== "create") return jsonResponse({ success: false, error: "Unknown expense action." }, 400);
         if (existingRowIndex > 0 || rows.slice(1).some((row) => row[0] === expenseId)) return jsonResponse({ success: true, duplicate: true, message: "Expense already saved." });
-        const appendUrl = `${sheetsValuesUrl(trip.sheetId, `${quoteSheetTab(tab)}!A:O`)}:append?valueInputOption=RAW&insertDataOption=INSERT_ROWS`;
-        const append = await fetch(appendUrl, { method: "POST", headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" }, body: JSON.stringify({ values: [[expenseId, date, description, category, amount, currency, paidBy, expenseType, notes, new Date().toISOString(), shareType, latitude, longitude, location, ""]] }) });
+        const appendUrl = `${sheetsValuesUrl(trip.sheetId, `${quoteSheetTab(tab)}!A:P`)}:append?valueInputOption=RAW&insertDataOption=INSERT_ROWS`;
+        const append = await fetch(appendUrl, { method: "POST", headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" }, body: JSON.stringify({ values: [[expenseId, date, description, category, amount, currency, paidBy, expenseType, notes, new Date().toISOString(), shareType, latitude, longitude, location, "", paymentMethod]] }) });
         if (!append.ok) {
           const detail = (await append.text().catch(() => "")).slice(0, 400);
           return jsonResponse({ success: false, error: `Could not save the expense to Google Sheets (HTTP ${append.status}). ${detail}` }, 502);
@@ -1475,17 +1587,20 @@ export default {
             description: googleError.error_description || "No description",
             email: session.email,
           });
+          if (googleError.error === "invalid_grant") await markGoogleReconnectRequired(env, session.email, "invalid_grant");
 
           return jsonResponse(
             {
               success: false,
-              error: "Could not refresh Google access. Please reconnect Google Sheets.",
+              code: googleError.error === "invalid_grant" ? "GOOGLE_RECONNECT_REQUIRED" : "GOOGLE_REFRESH_FAILED",
+              error: googleError.error === "invalid_grant" ? "Google authorization has expired. Reconnect Google Sheets to continue." : "Could not refresh Google access. Please reconnect Google Sheets.",
               connectUrl: "/api/sheets/connect",
             },
             502,
           );
         }
 
+        await env.OAUTH_TOKEN_STORE.delete(googleReconnectKey(session.email));
         const tokenData = (await tokenResponse.json()) as {
           access_token?: string;
         };
@@ -1793,16 +1908,20 @@ export default {
         );
 
         if (!tokenResponse.ok) {
+          const googleError = await tokenResponse.json().catch(() => ({})) as { error?: string; error_description?: string };
+          if (googleError.error === "invalid_grant") await markGoogleReconnectRequired(env, session.email, "invalid_grant");
           return jsonResponse(
             {
               success: false,
-              error: "Google access failed. Reconnect Google Sheets.",
+              code: googleError.error === "invalid_grant" ? "GOOGLE_RECONNECT_REQUIRED" : "GOOGLE_REFRESH_FAILED",
+              error: googleError.error === "invalid_grant" ? "Google authorization has expired. Reconnect Google Sheets to continue." : "Google access failed. Reconnect Google Sheets.",
               connectUrl: "/api/sheets/connect",
             },
             502,
           );
         }
 
+        await env.OAUTH_TOKEN_STORE.delete(googleReconnectKey(session.email));
         const tokenData = (await tokenResponse.json()) as {
           access_token?: string;
         };
@@ -2145,16 +2264,20 @@ export default {
         );
 
         if (!tokenResponse.ok) {
+          const googleError = await tokenResponse.json().catch(() => ({})) as { error?: string; error_description?: string };
+          if (googleError.error === "invalid_grant") await markGoogleReconnectRequired(env, session.email, "invalid_grant");
           return jsonResponse(
             {
               success: false,
-              error: "Google access failed. Reconnect Google Sheets.",
+              code: googleError.error === "invalid_grant" ? "GOOGLE_RECONNECT_REQUIRED" : "GOOGLE_REFRESH_FAILED",
+              error: googleError.error === "invalid_grant" ? "Google authorization has expired. Reconnect Google Sheets to continue." : "Google access failed. Reconnect Google Sheets.",
               connectUrl: "/api/sheets/connect",
             },
             502,
           );
         }
 
+        await env.OAUTH_TOKEN_STORE.delete(googleReconnectKey(session.email));
         const tokenData = (await tokenResponse.json()) as {
           access_token?: string;
         };
