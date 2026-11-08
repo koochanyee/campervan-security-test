@@ -18,6 +18,7 @@ type ApiResponse = {
   data?: ItineraryRow[];
   count?: number;
   error?: string;
+  code?: string;
   connectUrl?: string;
   message?: string;
   supplementaryTabs?: Record<string, string[][]>;
@@ -30,6 +31,10 @@ type ApiResponse = {
   trips?: TripConfigSummary[];
   trip?: TripConfigSummary;
   photo?: { id: string; url: string; date?: string } | null;
+  connected?: boolean;
+  needsReconnect?: boolean;
+  status?: string;
+  estimatedTestingExpiryAt?: string | null;
 };
 
 type TripConfigSummary = { id: string; name: string; itineraryTab?: string };
@@ -220,6 +225,9 @@ function App() {
   const [authMessage, setAuthMessage] = useState("");
   const [isVerifying, setIsVerifying] = useState(false);
   const [verifiedEmail, setVerifiedEmail] = useState("");
+  const [googleConnection, setGoogleConnection] = useState<{ connected: boolean; needsReconnect: boolean; status: string; estimatedTestingExpiryAt?: string | null } | null>(null);
+  const [isLoggingOut, setIsLoggingOut] = useState(false);
+  const [logoutError, setLogoutError] = useState("");
   const [itineraryRows, setItineraryRows] = useState<ItineraryRow[]>([]);
   const [supplementaryTabs, setSupplementaryTabs] = useState<Record<string, string[][]>>({});
   const [isLoadingItinerary, setIsLoadingItinerary] = useState(false);
@@ -429,6 +437,50 @@ function App() {
   }, []);
 
   useEffect(() => {
+    if (!verifiedEmail) { setGoogleConnection(null); return; }
+    let cancelled = false;
+    const loadGoogleConnection = async () => {
+      try {
+        const response = await fetch("/api/auth/google-status", { credentials: "same-origin", cache: "no-store" });
+        const result = await response.json() as ApiResponse;
+        if (!cancelled && response.ok && result.success) {
+          setGoogleConnection({
+            connected: Boolean(result.connected),
+            needsReconnect: Boolean(result.needsReconnect),
+            status: result.status || "unknown",
+            estimatedTestingExpiryAt: result.estimatedTestingExpiryAt || null,
+          });
+        }
+      } catch (error) {
+        console.error("Google connection status check failed:", error);
+      }
+    };
+    void loadGoogleConnection();
+    return () => { cancelled = true; };
+  }, [verifiedEmail]);
+
+  const handleLogout = async () => {
+    if (isLoggingOut) return;
+    if (!window.confirm("Log out of the travel companion? Your Google Sheets connection and trip data will be kept.")) return;
+    setIsLoggingOut(true);
+    setLogoutError("");
+    try {
+      const response = await fetch("/api/auth/logout", { method: "POST", credentials: "same-origin", headers: { "Content-Type": "application/json" } });
+      if (!response.ok) {
+        const result = await response.json().catch(() => ({})) as ApiResponse;
+        throw new Error(result.error || "Could not sign out. Please try again.");
+      }
+      try {
+        ["campervan-selected-trip", "campervan-active-view", "campervan-memory-attraction", "campervan-memory-content", "campervan-memory-preview", "campervan-drive-reconnect-pending"].forEach((key) => window.sessionStorage.removeItem(key));
+      } catch { /* Session cookie is already cleared by the Worker. */ }
+      window.location.replace("/");
+    } catch (error) {
+      setLogoutError(error instanceof Error ? error.message : "Could not sign out.");
+      setIsLoggingOut(false);
+    }
+  };
+
+  useEffect(() => {
     const clientId = import.meta.env.VITE_GOOGLE_CLIENT_ID as string | undefined;
     if (!clientId) {
       setAuthMessage("Google sign-in configuration is missing.");
@@ -528,6 +580,9 @@ function App() {
           if (!cancelled) {
             setItineraryRows([]);
             setItineraryError(result.error || `Could not load itinerary (HTTP ${response.status}).`);
+            if (result.code === "GOOGLE_RECONNECT_REQUIRED" || /google authorization has expired|could not refresh google access/i.test(result.error || "")) {
+              setGoogleConnection((current) => ({ connected: false, needsReconnect: true, status: "reconnect_required", estimatedTestingExpiryAt: current?.estimatedTestingExpiryAt || null }));
+            }
           }
           return;
         }
@@ -1311,6 +1366,16 @@ function App() {
           <div className="flex flex-wrap items-center gap-2">
             {verifiedEmail && selectedTripId && <button type="button" aria-pressed={dataSaverMode} onClick={() => setDataSaverMode((enabled) => !enabled)} className={`rounded-lg border px-3 py-2 text-sm font-semibold ${dataSaverMode ? "border-emerald-800 bg-emerald-50 text-emerald-900" : "border-slate-300 bg-white text-slate-700"}`} title="Lite mode loads the main itinerary without supplementary worksheets">{dataSaverMode ? "Lite mode: On" : "Lite mode: Off"}</button>}
             {verifiedEmail && <span className="text-sm font-semibold text-slate-700">Welcome, {welcomeName}</span>}
+            {verifiedEmail && (
+              <>
+                <span className={`rounded-full px-2.5 py-1 text-xs font-semibold ${googleConnection?.needsReconnect ? "bg-amber-100 text-amber-900" : googleConnection?.connected ? "bg-emerald-100 text-emerald-900" : "bg-slate-100 text-slate-600"}`} title={googleConnection?.estimatedTestingExpiryAt ? `Estimated Testing-mode expiry: ${new Date(googleConnection.estimatedTestingExpiryAt).toLocaleString()}` : "Google Sheets connection status"}>
+                  {googleConnection?.needsReconnect ? "Google reconnect needed" : googleConnection?.connected && googleConnection.estimatedTestingExpiryAt && new Date(googleConnection.estimatedTestingExpiryAt).getTime() <= Date.now() + 24 * 60 * 60 * 1000 ? "Google expires soon" : googleConnection?.connected ? "Google connected" : "Google status checking"}
+                </span>
+                {googleConnection?.connected && googleConnection.estimatedTestingExpiryAt && <span className="text-[11px] text-slate-500">Testing expiry estimate: {new Date(googleConnection.estimatedTestingExpiryAt).toLocaleDateString()}</span>}
+                <button type="button" onClick={() => { window.location.assign("/api/sheets/connect"); }} className="rounded-lg border border-emerald-700 bg-white px-3 py-2 text-sm font-semibold text-emerald-800 hover:bg-emerald-50">Reconnect Google</button>
+                <button type="button" onClick={() => { void handleLogout(); }} disabled={isLoggingOut} className="rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm font-semibold text-slate-700 hover:bg-slate-50 disabled:opacity-50">{isLoggingOut ? "Logging out…" : "Logout"}</button>
+              </>
+            )}
             {verifiedEmail && selectedTripId && activeView !== "home" && (
               <button type="button" onClick={goBack} className="rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm font-semibold hover:bg-slate-50">← Back</button>
             )}
@@ -1321,6 +1386,7 @@ function App() {
               <button type="button" onClick={returnToTripSelection} className="rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm font-semibold hover:bg-slate-50">Trip selection</button>
             )}
           </div>
+          {logoutError && <p className="text-sm text-rose-700" role="alert">{logoutError}</p>}
         </div>
       </header>
 
@@ -1395,6 +1461,7 @@ function App() {
                 <p className="mt-1 text-sm text-amber-800">{itineraryError}</p>
                 <div className="mt-3 flex flex-wrap gap-2">
                   <button type="button" onClick={() => setRefreshKey((n) => n + 1)} className="rounded-lg bg-amber-900 px-3 py-2 text-sm font-semibold text-white">Try again</button>
+                  {/google authorization has expired|reconnect google sheets/i.test(itineraryError) && <button type="button" onClick={() => { window.location.assign("/api/sheets/connect"); }} className="rounded-lg border border-amber-900 bg-white px-3 py-2 text-sm font-semibold text-amber-900">Reconnect Google Sheets</button>}
                 </div>
               </div>
             )}
