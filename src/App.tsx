@@ -1364,17 +1364,23 @@ function App() {
             <p className="mt-1 text-sm text-slate-500">{dateRange}</p>
           </button>
           <div className="flex flex-wrap items-center gap-2">
-            {verifiedEmail && selectedTripId && <button type="button" aria-pressed={dataSaverMode} onClick={() => setDataSaverMode((enabled) => !enabled)} className={`rounded-lg border px-3 py-2 text-sm font-semibold ${dataSaverMode ? "border-emerald-800 bg-emerald-50 text-emerald-900" : "border-slate-300 bg-white text-slate-700"}`} title="Lite mode loads the main itinerary without supplementary worksheets">{dataSaverMode ? "Lite mode: On" : "Lite mode: Off"}</button>}
             {verifiedEmail && <span className="text-sm font-semibold text-slate-700">Welcome, {welcomeName}</span>}
             {verifiedEmail && (
-              <>
-                <span className={`rounded-full px-2.5 py-1 text-xs font-semibold ${googleConnection?.needsReconnect ? "bg-amber-100 text-amber-900" : googleConnection?.connected ? "bg-emerald-100 text-emerald-900" : "bg-slate-100 text-slate-600"}`} title={googleConnection?.estimatedTestingExpiryAt ? `Estimated Testing-mode expiry: ${new Date(googleConnection.estimatedTestingExpiryAt).toLocaleString()}` : "Google Sheets connection status"}>
-                  {googleConnection?.needsReconnect ? "Google reconnect needed" : googleConnection?.connected && googleConnection.estimatedTestingExpiryAt && new Date(googleConnection.estimatedTestingExpiryAt).getTime() <= Date.now() + 24 * 60 * 60 * 1000 ? "Google expires soon" : googleConnection?.connected ? "Google connected" : "Google status checking"}
-                </span>
-                {googleConnection?.connected && googleConnection.estimatedTestingExpiryAt && <span className="text-[11px] text-slate-500">Testing expiry estimate: {new Date(googleConnection.estimatedTestingExpiryAt).toLocaleDateString()}</span>}
-                <button type="button" onClick={() => { window.location.assign("/api/sheets/connect"); }} className="rounded-lg border border-emerald-700 bg-white px-3 py-2 text-sm font-semibold text-emerald-800 hover:bg-emerald-50">Reconnect Google</button>
-                <button type="button" onClick={() => { void handleLogout(); }} disabled={isLoggingOut} className="rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm font-semibold text-slate-700 hover:bg-slate-50 disabled:opacity-50">{isLoggingOut ? "Logging out…" : "Logout"}</button>
-              </>
+              <details className="relative">
+                <summary className="flex min-h-10 cursor-pointer list-none items-center gap-2 rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm font-semibold text-slate-700 shadow-sm hover:bg-slate-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-emerald-600">
+                  <span>Menu</span><span aria-hidden="true" className="text-xs">▾</span>
+                </summary>
+                <div className="absolute right-0 top-full z-[70] mt-2 w-60 rounded-xl border border-slate-200 bg-white p-2 shadow-xl">
+                  <button type="button" onClick={(event) => { event.currentTarget.closest("details")?.removeAttribute("open"); window.location.assign("/api/sheets/connect"); }} className="flex w-full items-center rounded-lg px-3 py-2.5 text-left text-sm font-medium text-slate-700 hover:bg-emerald-50 hover:text-emerald-900">Reconnect Google</button>
+                  <button type="button" onClick={(event) => { event.currentTarget.closest("details")?.removeAttribute("open"); setRefreshKey((n) => n + 1); }} disabled={isLoadingItinerary} className="flex w-full items-center rounded-lg px-3 py-2.5 text-left text-sm font-medium text-slate-700 hover:bg-emerald-50 hover:text-emerald-900 disabled:opacity-50">{isLoadingItinerary ? "Refreshing itinerary…" : "Refresh itinerary"}</button>
+                  <label className="flex cursor-pointer items-center justify-between gap-3 rounded-lg px-3 py-2.5 text-sm font-medium text-slate-700 hover:bg-emerald-50">
+                    <span><span className="block">Lite mode</span><span className="block text-xs font-normal text-slate-500">Load main itinerary only</span></span>
+                    <input type="checkbox" checked={dataSaverMode} onChange={(event) => setDataSaverMode(event.target.checked)} className="h-4 w-4 accent-emerald-800" />
+                  </label>
+                  <div className="my-1 border-t border-slate-100" />
+                  <button type="button" onClick={(event) => { event.currentTarget.closest("details")?.removeAttribute("open"); void handleLogout(); }} disabled={isLoggingOut} className="flex w-full items-center rounded-lg px-3 py-2.5 text-left text-sm font-semibold text-rose-700 hover:bg-rose-50 disabled:opacity-50">{isLoggingOut ? "Logging out…" : "Logout"}</button>
+                </div>
+              </details>
             )}
             {verifiedEmail && selectedTripId && activeView !== "home" && (
               <button type="button" onClick={goBack} className="rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm font-semibold hover:bg-slate-50">← Back</button>
@@ -1461,7 +1467,6 @@ function App() {
                 <p className="mt-1 text-sm text-amber-800">{itineraryError}</p>
                 <div className="mt-3 flex flex-wrap gap-2">
                   <button type="button" onClick={() => setRefreshKey((n) => n + 1)} className="rounded-lg bg-amber-900 px-3 py-2 text-sm font-semibold text-white">Try again</button>
-                  {/google authorization has expired|reconnect google sheets/i.test(itineraryError) && <button type="button" onClick={() => { window.location.assign("/api/sheets/connect"); }} className="rounded-lg border border-amber-900 bg-white px-3 py-2 text-sm font-semibold text-amber-900">Reconnect Google Sheets</button>}
                 </div>
               </div>
             )}
@@ -1584,7 +1589,6 @@ function App() {
                       <h2 className="text-lg font-bold">Your trip</h2>
                       <p className="mt-1 text-sm text-slate-500">Jump to a part of your travel companion.</p>
                     </div>
-                    <button type="button" onClick={() => setRefreshKey((n) => n + 1)} disabled={isLoadingItinerary} className="text-sm font-semibold text-emerald-800 hover:underline disabled:opacity-50">Refresh itinerary</button>
                   </div>
                   <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3">
                     {[
@@ -2111,6 +2115,14 @@ function App() {
         )}
       </main>
 
+      {verifiedEmail && !selectedTripId && (
+        <div className="fixed inset-x-0 bottom-0 z-30 border-t border-slate-200 bg-white/95 px-4 py-2 pb-[env(safe-area-inset-bottom)] text-center shadow-[0_-4px_16px_rgba(15,23,42,0.06)] backdrop-blur" aria-live="polite">
+          <span className={`mr-2 inline-block h-2 w-2 rounded-full align-middle ${googleConnection?.needsReconnect ? "bg-amber-500" : googleConnection?.connected ? "bg-emerald-600" : "bg-slate-400"}`} />
+          <span className="text-xs font-semibold text-slate-600">Google connection: </span>
+          <span className={`text-xs ${googleConnection?.needsReconnect ? "font-semibold text-amber-800" : googleConnection?.connected ? "font-semibold text-emerald-800" : "text-slate-500"}`}>{googleConnection?.needsReconnect ? "Reconnect required" : googleConnection?.connected ? "Connected" : "Checking status…"}</span>
+        </div>
+      )}
+
       {showChecklistAddModal && (
         <div className="fixed inset-0 z-[80] flex items-end justify-center bg-slate-950/50 p-0 sm:items-center sm:p-4" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) setShowChecklistAddModal(false); }}>
           <section role="dialog" aria-modal="true" aria-labelledby="add-checklist-title" className="w-full max-w-lg rounded-t-2xl bg-white p-5 shadow-2xl sm:rounded-2xl sm:p-6">
@@ -2183,11 +2195,16 @@ function App() {
 
       {verifiedEmail && selectedTripId && (
         <nav className="fixed inset-x-0 bottom-0 z-30 border-t border-slate-200 bg-white/95 px-3 pb-[env(safe-area-inset-bottom)] shadow-[0_-4px_16px_rgba(15,23,42,0.06)] backdrop-blur">
-          <div className="mx-auto flex max-w-6xl items-center justify-between gap-3 border-b border-slate-100 py-2">
-            <p className="min-w-0 truncate text-xs font-semibold text-slate-600 sm:text-sm">Shared travel companion @ 2026</p>
-            <div className="flex shrink-0 items-center gap-2">
-              <button type="button" onClick={() => { window.scrollTo({ top: 0, behavior: "smooth" }); }} aria-label="Back to top" title="Back to top" className="group flex h-9 w-9 items-center justify-center rounded-full bg-emerald-800 text-lg font-bold text-white shadow-sm transition duration-150 hover:scale-110 hover:bg-emerald-700 hover:shadow-md focus-visible:scale-110 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-emerald-500 focus-visible:ring-offset-2 active:scale-105">▲</button>
-              <button type="button" onClick={() => setRefreshKey((n) => n + 1)} disabled={isLoadingItinerary} className="rounded-lg border border-slate-300 bg-white px-3 py-2 text-xs font-semibold text-slate-800 transition hover:bg-slate-50 disabled:opacity-50 sm:text-sm">{isLoadingItinerary ? "Refreshing…" : "Refresh itinerary"}</button>
+          <div className="mx-auto max-w-6xl border-b border-slate-100 py-2">
+            <div className="flex items-center justify-between gap-3">
+              <p className="min-w-0 truncate text-xs font-semibold text-slate-600 sm:text-sm">Shared travel companion @ 2026</p>
+              <button type="button" onClick={() => { window.scrollTo({ top: 0, behavior: "smooth" }); }} aria-label="Back to top" title="Back to top" className="group flex h-9 w-9 shrink-0 items-center justify-center rounded-full bg-emerald-800 text-lg font-bold text-white shadow-sm transition duration-150 hover:scale-110 hover:bg-emerald-700 hover:shadow-md focus-visible:scale-110 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-emerald-500 focus-visible:ring-offset-2 active:scale-105">▲</button>
+            </div>
+            <div className="mt-1 flex flex-wrap items-center gap-x-2 gap-y-1 text-[11px] sm:text-xs" aria-live="polite">
+              <span className={`inline-block h-2 w-2 rounded-full ${googleConnection?.needsReconnect ? "bg-amber-500" : googleConnection?.connected ? "bg-emerald-600" : "bg-slate-400"}`} />
+              <span className="font-semibold text-slate-600">Google connection:</span>
+              <span className={googleConnection?.needsReconnect ? "font-semibold text-amber-800" : googleConnection?.connected ? "font-semibold text-emerald-800" : "text-slate-500"}>{googleConnection?.needsReconnect ? "Reconnect required" : googleConnection?.connected ? "Connected" : "Checking status…"}</span>
+              {googleConnection?.connected && googleConnection.estimatedTestingExpiryAt && <span className="text-slate-500">· Testing expiry estimate {new Date(googleConnection.estimatedTestingExpiryAt).toLocaleDateString()}</span>}
             </div>
           </div>
           <div className="mx-auto grid max-w-3xl grid-cols-6 gap-1 py-2">
