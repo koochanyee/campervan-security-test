@@ -10,11 +10,12 @@ type ViewName =
   | "expenses"
   | "memories"
   | "map"
-  | "documents";
+  | "documents"
+  | "collaboration";
 
 type ApiResponse = {
   success?: boolean;
-  user?: { email?: string; googleId?: string };
+  user?: { email?: string; googleId?: string; guest?: boolean; guestTripId?: string | null };
   data?: ItineraryRow[];
   count?: number;
   error?: string;
@@ -38,6 +39,11 @@ type ApiResponse = {
 };
 
 type TripConfigSummary = { id: string; name: string; itineraryTab?: string };
+type TripMember = { googleId: string; email: string; displayName: string; role: "ADMIN" | "EDITOR" | "VIEWER"; status: string };
+type ChatMessage = { messageId: string; messageType: "GROUP" | "PRIVATE"; body: string; senderGoogleId: string; senderName: string; recipientGoogleId?: string | null; recipientName?: string | null; createdAt: string };
+type GuestRequest = { requestId: string; guestName: string; guestEmail: string; status: string; requestedAt: string };
+type UploadPermission = { uploadId: string; uploadType: string; uploaderGoogleId: string; viewerGoogleId: string; viewerEmail: string; status: string; requestedAt: string; canReview: number | boolean };
+type UserProfile = { email: string; displayName: string; preferredChatName: string; photoUrl: string; contactPhone: string; notificationPreferences: Record<string, unknown> };
 
 type TripDay = {
   key: string;
@@ -61,11 +67,16 @@ type TripMemory = {
   created_at?: string;
   updated_at?: string;
   photo_ids?: string;
+  requiresApproval?: boolean;
+  requestPending?: boolean;
 };
 
-type TripDocument = { category: string; title: string; url: string; kind: "drive_folder" | "link" };
+type TripDocument = { category: string; title: string; url: string; kind: "drive_folder" | "link"; uploadId?: string; canView?: boolean; requiresApproval?: boolean; requestPending?: boolean };
 
 type MemoryInteraction = { interaction_id: string; memory_id: string; photo_id: string; kind: "REACTION" | "COMMENT"; value: string; author: string; created_at: string };
+
+type ExpenseCategory = { id: string; name: string; color: string; active?: boolean };
+type CashMovement = { record_type: "INITIAL_CASH" | "CASH_CONTRIBUTION"; record_id: string; amount: number; currency: string; date: string; recorded_by: string; notes: string; contributor?: string };
 
 type TripExpense = {
   expense_id: string;
@@ -223,8 +234,13 @@ function dateIsSameDay(a: Date, b: Date): boolean {
 
 function App() {
   const [authMessage, setAuthMessage] = useState("");
+  const [guestNameDraft, setGuestNameDraft] = useState("");
+  const [guestEmailDraft, setGuestEmailDraft] = useState("");
+  const [guestRequestStatus, setGuestRequestStatus] = useState("");
+  const [guestRequestSaving, setGuestRequestSaving] = useState(false);
   const [isVerifying, setIsVerifying] = useState(false);
   const [verifiedEmail, setVerifiedEmail] = useState("");
+  const [guestMode, setGuestMode] = useState(false);
   const [googleConnection, setGoogleConnection] = useState<{ connected: boolean; needsReconnect: boolean; status: string; estimatedTestingExpiryAt?: string | null } | null>(null);
   const [isLoggingOut, setIsLoggingOut] = useState(false);
   const [logoutError, setLogoutError] = useState("");
@@ -238,7 +254,7 @@ function App() {
   const [activeView, setActiveViewState] = useState<ViewName>(() => {
     try {
       const saved = window.sessionStorage.getItem("campervan-active-view");
-      return saved && ["home", "checklist", "companion", "itinerary", "expenses", "memories", "map", "documents"].includes(saved) ? saved as ViewName : "home";
+      return saved && ["home", "checklist", "companion", "itinerary", "expenses", "memories", "map", "documents", "collaboration"].includes(saved) ? saved as ViewName : "home";
     } catch { return "home"; }
   });
   const [selectedTripId, setSelectedTripId] = useState(() => {
@@ -253,6 +269,23 @@ function App() {
   const [tripTabDraft, setTripTabDraft] = useState("FINAL ITINERARY");
   const [tripMessage, setTripMessage] = useState("");
   const [tripSaving, setTripSaving] = useState(false);
+  const [tripMembers, setTripMembers] = useState<TripMember[]>([]);
+  const [myTripRole, setMyTripRole] = useState<string>("");
+  const [memberInviteEmail, setMemberInviteEmail] = useState("");
+  const [memberInviteRole, setMemberInviteRole] = useState<"EDITOR" | "VIEWER" | "ADMIN">("VIEWER");
+  const [memberMessage, setMemberMessage] = useState("");
+  const [chatMessages, setChatMessages] = useState<ChatMessage[]>([]);
+  const [chatDraft, setChatDraft] = useState("");
+  const [chatRecipient, setChatRecipient] = useState("");
+  const [chatMessageStatus, setChatMessageStatus] = useState("");
+  const [collaborationLoading, setCollaborationLoading] = useState(false);
+  const [guestRequests, setGuestRequests] = useState<GuestRequest[]>([]);
+  const [guestRequestMessage, setGuestRequestMessage] = useState("");
+  const [uploadPermissions, setUploadPermissions] = useState<UploadPermission[]>([]);
+  const [uploadPermissionMessage, setUploadPermissionMessage] = useState("");
+  const [userProfile, setUserProfile] = useState<UserProfile | null>(null);
+  const [profileSaving, setProfileSaving] = useState(false);
+  const [profileMessage, setProfileMessage] = useState("");
   const [highlightPhoto, setHighlightPhoto] = useState<{ id: string; url: string; date?: string } | null>(null);
   const [highlightPhotoSaving, setHighlightPhotoSaving] = useState(false);
   const [highlightPhotoMessage, setHighlightPhotoMessage] = useState("");
@@ -336,8 +369,22 @@ function App() {
   const [newChecklistQuantity, setNewChecklistQuantity] = useState("");
   const [newChecklistNotes, setNewChecklistNotes] = useState("");
   const [expenses, setExpenses] = useState<TripExpense[]>([]);
+  const [expenseCategories, setExpenseCategories] = useState<ExpenseCategory[]>([]);
+  const [cashMovements, setCashMovements] = useState<CashMovement[]>([]);
+  const [newExpenseCategory, setNewExpenseCategory] = useState("");
+  const [cashEntryType, setCashEntryType] = useState<"initial" | "contribution">("initial");
+  const [cashEntryAmount, setCashEntryAmount] = useState("");
+  const [cashEntryCurrency, setCashEntryCurrency] = useState("NZD");
+  const [cashEntryDate, setCashEntryDate] = useState(() => new Date().toISOString().slice(0, 10));
+  const [cashEntryNotes, setCashEntryNotes] = useState("");
+  const [cashEntryContributor, setCashEntryContributor] = useState("");
+  const [expenseSettingsMessage, setExpenseSettingsMessage] = useState("");
+  const [expenseSettingsSaving, setExpenseSettingsSaving] = useState(false);
   const [expenseMessage, setExpenseMessage] = useState("");
   const [expenseSaving, setExpenseSaving] = useState(false);
+  const [showExpenseForm, setShowExpenseForm] = useState(false);
+  const [showExpenseSummary, setShowExpenseSummary] = useState(true);
+  const [showExpenseItems, setShowExpenseItems] = useState(true);
   const [editingExpenseId, setEditingExpenseId] = useState("");
   const [expenseDate, setExpenseDate] = useState(() => new Date().toISOString().slice(0, 10));
   const [expenseType, setExpenseType] = useState<"pre-trip" | "actual-trip">(() => new Date().toISOString().slice(0, 10) >= "2026-11-07" ? "actual-trip" : "pre-trip");
@@ -426,7 +473,10 @@ function App() {
         const result = (await response.json()) as ApiResponse;
         if (!cancelled && result.success && result.user?.email) {
           setVerifiedEmail(result.user.email);
-          setAuthMessage("Existing session restored.");
+          setGuestMode(Boolean(result.user.guest));
+          if (result.user.guestTripId) setSelectedTripId(result.user.guestTripId);
+          if (result.user.guest) setActiveViewState("itinerary");
+          setAuthMessage(result.user.guest ? "Guest session restored. Itinerary-only access." : "Existing session restored.");
         }
       } catch (error) {
         console.error("Session restoration failed:", error);
@@ -459,6 +509,141 @@ function App() {
     return () => { cancelled = true; };
   }, [verifiedEmail]);
 
+  useEffect(() => {
+    if (!verifiedEmail || !selectedTripId || activeView !== "collaboration") return;
+    let cancelled = false;
+    async function loadCollaboration() {
+      setCollaborationLoading(true);
+      setMemberMessage(""); setChatMessageStatus("");
+      try {
+        const [memberResponse, chatResponse] = await Promise.all([
+          fetch(`/api/trip-members?tripId=${encodeURIComponent(selectedTripId)}`, { credentials: "same-origin", cache: "no-store" }),
+          fetch(`/api/chat?tripId=${encodeURIComponent(selectedTripId)}`, { credentials: "same-origin", cache: "no-store" }),
+        ]);
+        const [memberData, chatData] = await Promise.all([memberResponse.json(), chatResponse.json()]) as [ApiResponse & { members?: TripMember[]; myRole?: string }, ApiResponse & { messages?: ChatMessage[] }];
+        if (!memberResponse.ok || !memberData.success) throw new Error(memberData.error || "Could not load trip members.");
+        if (!chatResponse.ok || !chatData.success) throw new Error(chatData.error || "Could not load trip chat.");
+        let requests: GuestRequest[] = [];
+        if (memberData.myRole === "ADMIN") {
+          const guestResponse = await fetch(`/api/guest-requests?tripId=${encodeURIComponent(selectedTripId)}`, { credentials: "same-origin", cache: "no-store" });
+          const guestData = await guestResponse.json() as ApiResponse & { requests?: GuestRequest[] };
+          if (guestResponse.ok && guestData.success) requests = guestData.requests || [];
+        }
+        const permissionResponse = await fetch(`/api/upload-permissions?tripId=${encodeURIComponent(selectedTripId)}`, { credentials: "same-origin", cache: "no-store" });
+        const permissionData = await permissionResponse.json() as ApiResponse & { permissions?: UploadPermission[] };
+        const profileResponse = await fetch("/api/profile", { credentials: "same-origin", cache: "no-store" });
+        const profileData = await profileResponse.json() as ApiResponse & { profile?: UserProfile };
+        if (!cancelled) { setTripMembers(memberData.members || []); setMyTripRole(memberData.myRole || ""); setChatMessages(chatData.messages || []); setGuestRequests(requests); setUploadPermissions(permissionResponse.ok && permissionData.success ? permissionData.permissions || [] : []); if (profileResponse.ok && profileData.success && profileData.profile) setUserProfile(profileData.profile); }
+      } catch (error) { if (!cancelled) setMemberMessage(error instanceof Error ? error.message : "Could not load collaboration data."); }
+      finally { if (!cancelled) setCollaborationLoading(false); }
+    }
+    void loadCollaboration();
+    return () => { cancelled = true; };
+  }, [verifiedEmail, selectedTripId, activeView]);
+
+  const saveUserProfile = async (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault(); if (!userProfile) return; setProfileSaving(true); setProfileMessage("");
+    try {
+      const response = await fetch("/api/profile", { method: "POST", credentials: "same-origin", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ displayName: userProfile.displayName, preferredChatName: userProfile.preferredChatName, photoUrl: userProfile.photoUrl, contactPhone: userProfile.contactPhone, notificationPreferences: userProfile.notificationPreferences }) });
+      const result = await response.json() as ApiResponse & { profile?: UserProfile };
+      if (!response.ok || !result.success) throw new Error(result.error || "Could not save profile.");
+      if (result.profile) setUserProfile(result.profile);
+      setProfileMessage("Profile saved.");
+    } catch (error) { setProfileMessage(error instanceof Error ? error.message : "Could not save profile."); }
+    finally { setProfileSaving(false); }
+  };
+
+  const reviewUploadPermission = async (permission: UploadPermission, action: "approve" | "revoke") => {
+    setUploadPermissionMessage("");
+    try {
+      const response = await fetch(`/api/upload-permissions?tripId=${encodeURIComponent(selectedTripId)}`, { method: "POST", credentials: "same-origin", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ action, uploadId: permission.uploadId, viewerGoogleId: permission.viewerGoogleId }) });
+      const result = await response.json() as ApiResponse;
+      if (!response.ok || !result.success) throw new Error(result.error || "Could not update upload access.");
+      setUploadPermissionMessage(result.message || "Permission updated.");
+      setUploadPermissions((items) => items.map((item) => item.uploadId === permission.uploadId && item.viewerGoogleId === permission.viewerGoogleId ? { ...item, status: action === "approve" ? "APPROVED" : "REVOKED" } : item));
+    } catch (error) { setUploadPermissionMessage(error instanceof Error ? error.message : "Could not update upload access."); }
+  };
+
+  const requestMemoryAccess = async (memory: TripMemory) => {
+    try {
+      const response = await fetch(`/api/upload-permissions?tripId=${encodeURIComponent(selectedTripId)}`, { method: "POST", credentials: "same-origin", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ action: "request", uploadId: memory.memory_id, uploadType: "MEMORY" }) });
+      const result = await response.json() as ApiResponse;
+      if (!response.ok || !result.success) throw new Error(result.error || "Could not request memory access.");
+      setMemories((items) => items.map((item) => item.memory_id === memory.memory_id ? { ...item, requestPending: true } : item));
+      setMemoryMessage(result.message || "Access request sent to the uploader.");
+    } catch (error) { setMemoryMessage(error instanceof Error ? error.message : "Could not request memory access."); }
+  };
+
+  const requestDocumentAccess = async (document: TripDocument) => {
+    try {
+      const response = await fetch(`/api/upload-permissions?tripId=${encodeURIComponent(selectedTripId)}`, { method: "POST", credentials: "same-origin", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ action: "request", uploadId: document.uploadId, uploadType: "DOCUMENT" }) });
+      const result = await response.json() as ApiResponse;
+      if (!response.ok || !result.success) throw new Error(result.error || "Could not request document access.");
+      setTripDocuments((items) => items.map((item) => item.uploadId === document.uploadId ? { ...item, requestPending: true } : item));
+      setDocumentsMessage(result.message || "Access request sent to the uploader.");
+    } catch (error) { setDocumentsMessage(error instanceof Error ? error.message : "Could not request document access."); }
+  };
+
+  const reviewGuestRequest = async (requestId: string, action: "approve" | "reject") => {
+    setGuestRequestMessage("");
+    try {
+      const response = await fetch(`/api/guest-requests?tripId=${encodeURIComponent(selectedTripId)}`, { method: "POST", credentials: "same-origin", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ tripId: selectedTripId, requestId, action }) });
+      const result = await response.json() as ApiResponse;
+      if (!response.ok || !result.success) throw new Error(result.error || "Could not review guest request.");
+      setGuestRequestMessage(result.message || "Guest request updated.");
+      setGuestRequests((items) => items.map((item) => item.requestId === requestId ? { ...item, status: action === "approve" ? "APPROVED" : "REJECTED" } : item));
+    } catch (error) { setGuestRequestMessage(error instanceof Error ? error.message : "Could not review guest request."); }
+  };
+
+  const submitGuestRequest = async (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault(); setGuestRequestSaving(true); setGuestRequestStatus("");
+    try {
+      const response = await fetch("/api/guest-requests", { method: "POST", credentials: "same-origin", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ tripId: "nz-south-island", name: guestNameDraft.trim(), email: guestEmailDraft.trim() }) });
+      const result = await response.json() as ApiResponse;
+      if (!response.ok || !result.success) throw new Error(result.error || "Could not submit guest request.");
+      setGuestRequestStatus("Request submitted. The trip Admin must approve it before you can sign in."); setGuestNameDraft(""); setGuestEmailDraft("");
+    } catch (error) { setGuestRequestStatus(error instanceof Error ? error.message : "Could not submit guest request."); }
+    finally { setGuestRequestSaving(false); }
+  };
+
+  const removeTripMember = async (member: TripMember) => {
+    if (!window.confirm(`Remove ${member.email} from this trip?`)) return;
+    setMemberMessage("");
+    try {
+      const response = await fetch(`/api/trip-members?tripId=${encodeURIComponent(selectedTripId)}`, { method: "DELETE", credentials: "same-origin", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ googleId: member.googleId }) });
+      const result = await response.json() as ApiResponse;
+      if (!response.ok || !result.success) throw new Error(result.error || "Could not remove member.");
+      setTripMembers((items) => items.filter((item) => item.googleId !== member.googleId));
+      setMemberMessage(result.message || "Member removed.");
+    } catch (error) { setMemberMessage(error instanceof Error ? error.message : "Could not remove member."); }
+  };
+
+  const inviteTripMember = async (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault(); setMemberMessage("");
+    try {
+      const response = await fetch(`/api/trip-members?tripId=${encodeURIComponent(selectedTripId)}`, { method: "POST", credentials: "same-origin", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ email: memberInviteEmail.trim(), role: memberInviteRole }) });
+      const result = await response.json() as ApiResponse;
+      if (!response.ok || !result.success) throw new Error(result.error || "Could not invite member.");
+      setMemberMessage(result.message || "Invitation saved."); setMemberInviteEmail("");
+      const refreshed = await fetch(`/api/trip-members?tripId=${encodeURIComponent(selectedTripId)}`, { credentials: "same-origin", cache: "no-store" });
+      const data = await refreshed.json() as ApiResponse & { members?: TripMember[]; myRole?: string };
+      if (refreshed.ok && data.success) { setTripMembers(data.members || []); setMyTripRole(data.myRole || ""); }
+    } catch (error) { setMemberMessage(error instanceof Error ? error.message : "Could not invite member."); }
+  };
+
+  const sendTripChat = async (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault(); setChatMessageStatus("");
+    try {
+      const response = await fetch(`/api/chat?tripId=${encodeURIComponent(selectedTripId)}`, { method: "POST", credentials: "same-origin", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ message: chatDraft.trim(), recipientGoogleId: chatRecipient || undefined }) });
+      const result = await response.json() as { success?: boolean; error?: string; message?: ChatMessage };
+      if (!response.ok || !result.success) throw new Error(result.error || "Could not send message.");
+      setChatDraft("");
+      const refreshed = await fetch(`/api/chat?tripId=${encodeURIComponent(selectedTripId)}`, { credentials: "same-origin", cache: "no-store" });
+      const data = await refreshed.json() as ApiResponse & { messages?: ChatMessage[] };
+      if (refreshed.ok && data.success) setChatMessages(data.messages || []);
+    } catch (error) { setChatMessageStatus(error instanceof Error ? error.message : "Could not send message."); }
+  };
+
   const handleLogout = async () => {
     if (isLoggingOut) return;
     if (!window.confirm("Log out of the travel companion? Your Google Sheets connection and trip data will be kept.")) return;
@@ -473,6 +658,7 @@ function App() {
       try {
         ["campervan-selected-trip", "campervan-active-view", "campervan-memory-attraction", "campervan-memory-content", "campervan-memory-preview", "campervan-drive-reconnect-pending"].forEach((key) => window.sessionStorage.removeItem(key));
       } catch { /* Session cookie is already cleared by the Worker. */ }
+      setGuestMode(false);
       window.location.replace("/");
     } catch (error) {
       setLogoutError(error instanceof Error ? error.message : "Could not sign out.");
@@ -516,7 +702,10 @@ function App() {
               throw new Error(data.error || "Google verification failed.");
             }
             setVerifiedEmail(data.user.email);
-            setAuthMessage("Google identity verified. Loading trip selection…");
+            setGuestMode(Boolean(data.user.guest));
+            if (data.user.guestTripId) setSelectedTripId(data.user.guestTripId);
+            if (data.user.guest) setActiveViewState("itinerary");
+            setAuthMessage(data.user.guest ? "Guest approved. Loading the read-only itinerary…" : "Google identity verified. Loading trip selection…");
           } catch (error) {
             setAuthMessage(error instanceof Error ? error.message : "Google verification failed. Please try again.");
           } finally {
@@ -681,6 +870,72 @@ function App() {
     return () => { cancelled = true; };
   }, [verifiedEmail, selectedTripId, activeView, refreshKey]);
 
+  useEffect(() => {
+    if (!verifiedEmail || !selectedTripId) return;
+    let cancelled = false;
+    fetch(`/api/expense-settings?tripId=${encodeURIComponent(selectedTripId)}`, { credentials: "same-origin", cache: "no-store" })
+      .then(async (response) => ({ response, result: await response.json() as { success?: boolean; categories?: ExpenseCategory[]; cashMovements?: CashMovement[]; error?: string } }))
+      .then(({ response, result }) => {
+        if (!response.ok || !result.success) throw new Error(result.error || "Could not load expense settings.");
+        if (!cancelled) {
+          setExpenseCategories(Array.isArray(result.categories) ? result.categories : []);
+          setCashMovements(Array.isArray(result.cashMovements) ? result.cashMovements : []);
+          setExpenseSettingsMessage("");
+        }
+      })
+      .catch((error) => { if (!cancelled) setExpenseSettingsMessage(error instanceof Error ? error.message : "Could not load expense settings."); });
+    return () => { cancelled = true; };
+  }, [verifiedEmail, selectedTripId, activeView, refreshKey]);
+
+  const saveExpenseSetting = async (payload: Record<string, unknown>) => {
+    setExpenseSettingsSaving(true);
+    setExpenseSettingsMessage("");
+    try {
+      const response = await fetch(`/api/expense-settings?tripId=${encodeURIComponent(selectedTripId)}`, {
+        method: "POST", credentials: "same-origin", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ ...payload, tripId: selectedTripId }),
+      });
+      const result = await response.json() as { success?: boolean; error?: string };
+      if (!response.ok || !result.success) throw new Error(result.error || "Could not save expense settings.");
+      const refreshed = await fetch(`/api/expense-settings?tripId=${encodeURIComponent(selectedTripId)}`, { credentials: "same-origin", cache: "no-store" });
+      const data = await refreshed.json() as { success?: boolean; categories?: ExpenseCategory[]; cashMovements?: CashMovement[] };
+      if (refreshed.ok && data.success) {
+        setExpenseCategories(Array.isArray(data.categories) ? data.categories : []);
+        setCashMovements(Array.isArray(data.cashMovements) ? data.cashMovements : []);
+      }
+      setExpenseSettingsMessage("Saved.");
+      return true;
+    } catch (error) {
+      setExpenseSettingsMessage(error instanceof Error ? error.message : "Could not save expense settings.");
+      return false;
+    } finally { setExpenseSettingsSaving(false); }
+  };
+
+  const addExpenseCategory = async (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    const name = newExpenseCategory.trim();
+    if (!name) return;
+    if (await saveExpenseSetting({ action: "category_add", name })) setNewExpenseCategory("");
+  };
+
+  const editExpenseCategory = async (category: ExpenseCategory) => {
+    const name = window.prompt("Category name", category.name);
+    if (name === null || !name.trim()) return;
+    const color = window.prompt("Category border colour (hex, e.g. #64748b)", category.color) ?? category.color;
+    await saveExpenseSetting({ action: "category_update", id: category.id, name: name.trim(), color });
+  };
+
+  const saveCashMovement = async (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    const amount = Number(cashEntryAmount);
+    if (!Number.isFinite(amount) || amount <= 0 || !cashEntryDate) { setExpenseSettingsMessage("Enter a valid cash amount and date."); return; }
+    const action = cashEntryType === "initial" ? "set_initial_cash" : "add_contribution";
+    if (!window.confirm(cashEntryType === "initial" ? "Save this as the trip's initial shared exchange cash?" : "Record this additional shared cash contribution?")) return;
+    if (await saveExpenseSetting({ action, amount, currency: cashEntryCurrency, date: cashEntryDate, notes: cashEntryNotes, contributor: cashEntryContributor })) {
+      setCashEntryAmount(""); setCashEntryNotes(""); setCashEntryContributor("");
+    }
+  };
+
   // Keep both travellers' shared checklist views in sync without requiring a manual refresh.
   useEffect(() => {
     if (!verifiedEmail || !selectedTripId || activeView !== "checklist") return;
@@ -706,6 +961,7 @@ function App() {
       setExpenseMessage("Enter a date, description and amount greater than zero.");
       return;
     }
+    if (!window.confirm(editingExpenseId ? "Confirm saving these expense changes?" : "Confirm adding this expense record?")) return;
     setExpenseSaving(true);
     setExpenseMessage("");
     const record: TripExpense = {
@@ -738,6 +994,7 @@ function App() {
       setExpenseDescription(""); setExpenseAmount(""); setExpenseNotes("");
       setExpenseLatitude(""); setExpenseLongitude(""); setExpenseLocation("");
       setEditingExpenseId("");
+      setShowExpenseForm(false);
       setExpenseMessage(editingExpenseId ? "Expense updated in Google Sheets." : expenseShareType === "personal" ? "Personal expense saved to the trip sheet." : "Shared expense saved to the trip sheet. Split share: 50:50.");
     } catch (error) {
       setExpenseMessage(error instanceof Error ? error.message : "Could not save the expense.");
@@ -747,6 +1004,7 @@ function App() {
   const beginEditExpense = (expense: TripExpense) => {
     if (expense.source !== "TRIP EXPENSES") return;
     setEditingExpenseId(expense.expense_id);
+    setShowExpenseForm(true);
     setExpenseDate(expense.date || new Date().toISOString().slice(0, 10));
     setExpenseType(expense.expense_type);
     setExpenseTab(expense.share_type === "personal" ? "personal" : expense.expense_type);
@@ -1117,14 +1375,16 @@ function App() {
   const addChecklistCategories = Array.from(new Set(checklistItems.filter((item) => (item.list_type || (item.checklist_type === "grocery" ? "GROCERY" : "BEFORE_DEPARTURE")) === newChecklistType).map((item) => item.category.trim()).filter(Boolean)));
   const paidOrActualExpenses = expenses.filter((expense) => expense.source !== "FINAL EXPENSES" || expense.payment_status === "Paid");
   const paidPreTripExpenses = paidOrActualExpenses.filter((expense) => expense.expense_type === "pre-trip");
-  const cashSpentNZD = expenses.filter((expense) => expense.payment_method === "Cash" && (expense.currency || "NZD") === "NZD").reduce((total, expense) => total + Number(expense.amount || 0), 0);
-  const cashRemainingNZD = 700 - cashSpentNZD;
+  const cashSpentByCurrency = expenses.filter((expense) => expense.payment_method === "Cash").reduce<Record<string, number>>((totals, expense) => { const currency = expense.currency || "NZD"; totals[currency] = (totals[currency] || 0) + Number(expense.amount || 0); return totals; }, {});
+  const cashFundByCurrency = cashMovements.reduce<Record<string, { initial: number; contributions: number }>>((totals, movement) => { const currency = movement.currency || "NZD"; totals[currency] ||= { initial: 0, contributions: 0 }; if (movement.record_type === "INITIAL_CASH") totals[currency].initial = Number(movement.amount || 0); else totals[currency].contributions += Number(movement.amount || 0); return totals; }, {});
+  const cashBalances = Array.from(new Set([...Object.keys(cashFundByCurrency), ...Object.keys(cashSpentByCurrency)])).map((currency) => { const fund = cashFundByCurrency[currency] || { initial: 0, contributions: 0 }; const spent = cashSpentByCurrency[currency] || 0; return { currency, ...fund, spent, balance: fund.initial + fund.contributions - spent }; });
+  const configuredCategoryNames = new Set(expenseCategories.map((category) => category.name));
+  const availableExpenseCategories = Array.from(new Set([...expenseCategories.filter((category) => category.active !== false && category.name.trim()).map((category) => category.name), ...expenses.map((expense) => expense.category).filter((category) => Boolean(category) && !configuredCategoryNames.has(category)), ...(configuredCategoryNames.has(expenseCategory) ? [] : [expenseCategory]), "Other"]));
   const isRalphCardExpense = (expense: TripExpense) => expense.payment_method === "Ralph (Card)" || (expense.payment_method === "Card" && expense.paid_by === "Ralph");
   const isJuneCardExpense = (expense: TripExpense) => expense.payment_method === "June (Card)" || (expense.payment_method === "Card" && expense.paid_by === "June");
   const ralphCardExpenses = expenses.filter(isRalphCardExpense);
   const juneCardExpenses = expenses.filter(isJuneCardExpense);
-  // Settlement uses shared actual-trip card payments only. The NZD 700 cash pool
-  // is treated as equally funded/shared, so it does not create an individual card credit.
+  // Settlement uses shared actual-trip card payments only. Shared cash is reconciled separately and does not create an individual card credit.
   const actualSharedCardExpenses = expenses.filter((expense) => expense.expense_type === "actual-trip" && expense.share_type !== "personal" && (isRalphCardExpense(expense) || isJuneCardExpense(expense)));
   const settlementCurrencies = Array.from(new Set(actualSharedCardExpenses.map((expense) => expense.currency || "NZD")));
   const settlementByCurrency = settlementCurrencies.map((currency) => {
@@ -1404,6 +1664,7 @@ function App() {
             {authMessage && <p className="mt-2 text-sm text-slate-500" aria-live="polite">{authMessage}</p>}
             {isVerifying && <p className="mt-2 text-sm text-slate-500">Verifying account…</p>}
             <div id="google-sign-in-button" className="mt-4 min-h-10" />
+            <details className="mt-5 rounded-xl border border-slate-200 p-4"><summary className="cursor-pointer text-sm font-semibold text-emerald-900">Request guest itinerary access</summary><p className="mt-2 text-xs leading-5 text-slate-600">Guests can request read-only access to the South Island itinerary. The Admin must approve the request, and the Google Sheet must be shared with the guest's Google email.</p><form onSubmit={(event) => void submitGuestRequest(event)} className="mt-3 space-y-2"><input required maxLength={80} value={guestNameDraft} onChange={(event) => setGuestNameDraft(event.target.value)} placeholder="Your name" className="min-h-10 w-full rounded-lg border border-slate-300 px-3 text-sm"/><input required type="email" value={guestEmailDraft} onChange={(event) => setGuestEmailDraft(event.target.value)} placeholder="Your Google email" className="min-h-10 w-full rounded-lg border border-slate-300 px-3 text-sm"/><button type="submit" disabled={guestRequestSaving} className="rounded-lg bg-emerald-800 px-4 py-2 text-sm font-semibold text-white disabled:opacity-50">{guestRequestSaving ? "Submitting…" : "Submit request"}</button></form>{guestRequestStatus && <p role="status" className="mt-2 text-xs text-slate-600">{guestRequestStatus}</p>}</details>
           </section>
         )}
 
@@ -1423,11 +1684,12 @@ function App() {
                     <h3 className="mt-1 text-xl font-bold">{trip.name}</h3>
                     <p className="mt-1 text-sm text-slate-600">Shared trip · Google Sheets itinerary</p>
                   </div>
-                  <button type="button" onClick={() => { setSelectedTripId(trip.id); setViewHistory([]); setActiveViewState("home"); setRefreshKey((n) => n + 1); }} className="rounded-xl bg-emerald-800 px-5 py-3 text-sm font-bold text-white hover:bg-emerald-900">Open trip →</button>
+                  <button type="button" onClick={() => { setSelectedTripId(trip.id); setViewHistory([]); setActiveViewState(guestMode ? "itinerary" : "home"); setRefreshKey((n) => n + 1); }} className="rounded-xl bg-emerald-800 px-5 py-3 text-sm font-bold text-white hover:bg-emerald-900">Open trip →</button>
                 </div>
               </article>
             ))}
             {trips.length === 0 && <p className="rounded-xl bg-white p-4 text-sm text-slate-600">No trips are registered yet. Add a Google Sheet to begin.</p>}
+            {!guestMode && <>
             <article className="rounded-2xl border border-dashed border-slate-300 bg-white p-5 sm:p-6">
               <div className="flex items-start gap-3">
                 <div className="flex h-12 w-12 shrink-0 items-center justify-center rounded-xl bg-slate-100 text-2xl" aria-hidden="true">＋</div>
@@ -1456,6 +1718,7 @@ function App() {
                 </div>
               </div>
             )}
+            </>}
           </section>
         )}
 
@@ -1911,6 +2174,25 @@ function App() {
               </section>
             )}
 
+            {!isLoadingItinerary && !itineraryError && activeView === "collaboration" && (
+              <section className="space-y-5 rounded-2xl border border-slate-200 bg-white p-5 shadow-sm sm:p-7">
+                <div><button type="button" onClick={goToDashboard} className="text-sm font-semibold text-emerald-800 hover:underline">← Back to dashboard</button><p className="mt-5 text-xs font-bold uppercase tracking-[0.16em] text-emerald-800">Trip management</p><h2 className="mt-2 text-2xl font-bold">Members & chat</h2><p className="mt-1 text-sm text-slate-600">Your role: <strong>{myTripRole || "Loading…"}</strong>. Group chat is the default; select a member for a private message.</p></div>
+                {memberMessage && <p role="status" className="rounded-lg bg-amber-50 p-3 text-sm text-amber-900">{memberMessage}</p>}
+                {userProfile && <form onSubmit={(event) => void saveUserProfile(event)} className="rounded-xl border border-slate-200 p-4"><h3 className="font-semibold">My profile</h3><p className="mt-1 text-xs text-slate-500">Verified Google email: {userProfile.email} (cannot be changed here).</p><div className="mt-3 grid gap-3 sm:grid-cols-2"><label className="text-xs font-semibold">Display name<input required maxLength={80} value={userProfile.displayName} onChange={(event) => setUserProfile({ ...userProfile, displayName: event.target.value })} className="mt-1 min-h-10 w-full rounded-lg border border-slate-300 px-3 text-sm font-normal" /></label><label className="text-xs font-semibold">Preferred chat name<input maxLength={40} value={userProfile.preferredChatName} onChange={(event) => setUserProfile({ ...userProfile, preferredChatName: event.target.value })} className="mt-1 min-h-10 w-full rounded-lg border border-slate-300 px-3 text-sm font-normal" /></label><label className="text-xs font-semibold">Profile photo URL<input type="url" value={userProfile.photoUrl} onChange={(event) => setUserProfile({ ...userProfile, photoUrl: event.target.value })} placeholder="https://…" className="mt-1 min-h-10 w-full rounded-lg border border-slate-300 px-3 text-sm font-normal" /></label><label className="text-xs font-semibold">Contact number<input maxLength={40} value={userProfile.contactPhone} onChange={(event) => setUserProfile({ ...userProfile, contactPhone: event.target.value })} className="mt-1 min-h-10 w-full rounded-lg border border-slate-300 px-3 text-sm font-normal" /></label></div>{profileMessage && <p role="status" className="mt-2 text-xs text-emerald-800">{profileMessage}</p>}<button type="submit" disabled={profileSaving} className="mt-3 rounded-lg bg-emerald-800 px-4 py-2 text-sm font-semibold text-white disabled:opacity-50">{profileSaving ? "Saving…" : "Save profile"}</button></form>}
+                <div className="rounded-xl border border-slate-200 p-4"><div className="flex items-center justify-between"><h3 className="font-semibold">Trip members</h3>{collaborationLoading && <span className="text-xs text-slate-500">Loading…</span>}</div>
+                  <div className="mt-3 space-y-2">{tripMembers.map((member) => <div key={member.googleId} className="flex items-center justify-between gap-3 rounded-lg bg-slate-50 p-3"><div className="min-w-0"><p className="truncate text-sm font-semibold">{member.displayName || member.email}</p><p className="truncate text-xs text-slate-500">{member.email}</p></div><div className="flex shrink-0 items-center gap-2"><span className="rounded-full bg-white px-2 py-1 text-xs font-bold text-slate-700">{member.role}</span>{myTripRole === "ADMIN" && member.email.toLowerCase() !== verifiedEmail.toLowerCase() && <button type="button" onClick={() => void removeTripMember(member)} className="rounded-lg border border-rose-200 px-2 py-1 text-[11px] font-semibold text-rose-700">Remove</button>}</div></div>)}{!collaborationLoading && !tripMembers.length && <p className="text-sm text-slate-500">No members found.</p>}</div>
+                  {myTripRole === "ADMIN" && <form onSubmit={(event) => void inviteTripMember(event)} className="mt-4 grid gap-2 sm:grid-cols-[1fr_150px_auto]"><input type="email" required value={memberInviteEmail} onChange={(event) => setMemberInviteEmail(event.target.value)} placeholder="Invite by Google email" className="min-h-11 rounded-lg border border-slate-300 px-3 text-sm"/><select value={memberInviteRole} onChange={(event) => setMemberInviteRole(event.target.value as "ADMIN" | "EDITOR" | "VIEWER")} className="min-h-11 rounded-lg border border-slate-300 px-3 text-sm"><option value="VIEWER">Viewer</option><option value="EDITOR">Editor</option><option value="ADMIN">Admin</option></select><button type="submit" className="min-h-11 rounded-lg bg-emerald-800 px-4 text-sm font-semibold text-white">Invite member</button></form>}
+                </div>
+                {myTripRole === "ADMIN" && <div className="rounded-xl border border-slate-200 p-4"><h3 className="font-semibold">Guest itinerary requests</h3><p className="mt-1 text-xs text-slate-500">Approved guests receive read-only itinerary access for 30 days. The guest must sign in with the same Google email and have the itinerary spreadsheet shared with them.</p>{guestRequestMessage && <p role="status" className="mt-2 text-xs text-emerald-800">{guestRequestMessage}</p>}<div className="mt-3 space-y-2">{guestRequests.map((request) => <div key={request.requestId} className="flex flex-wrap items-center justify-between gap-2 rounded-lg bg-slate-50 p-3"><div><p className="text-sm font-semibold">{request.guestName}</p><p className="text-xs text-slate-500">{request.guestEmail} · {request.status}</p></div>{request.status === "PENDING" && <div className="flex gap-2"><button type="button" onClick={() => void reviewGuestRequest(request.requestId,"approve")} className="rounded-lg bg-emerald-800 px-3 py-2 text-xs font-semibold text-white">Approve</button><button type="button" onClick={() => void reviewGuestRequest(request.requestId,"reject")} className="rounded-lg border border-slate-300 px-3 py-2 text-xs font-semibold">Reject</button></div>}</div>)}{!guestRequests.length && <p className="text-sm text-slate-500">No guest requests.</p>}</div></div>}
+                <div className="rounded-xl border border-slate-200 p-4"><h3 className="font-semibold">Your upload access requests</h3><p className="mt-1 text-xs text-slate-500">Only the person who uploaded a memory or document can approve access to it.</p>{uploadPermissionMessage && <p role="status" className="mt-2 text-xs text-emerald-800">{uploadPermissionMessage}</p>}<div className="mt-3 space-y-2">{uploadPermissions.filter((permission) => permission.status === "PENDING" && permission.canReview).map((permission) => <div key={`${permission.uploadId}-${permission.viewerGoogleId}`} className="flex flex-wrap items-center justify-between gap-2 rounded-lg bg-slate-50 p-3"><div><p className="text-sm font-semibold">{permission.uploadType} · {permission.uploadId}</p><p className="text-xs text-slate-500">Requested by {permission.viewerEmail}</p></div>{permission.viewerGoogleId && <div className="flex gap-2"><button type="button" onClick={() => void reviewUploadPermission(permission,"approve")} className="rounded-lg bg-emerald-800 px-3 py-2 text-xs font-semibold text-white">Approve</button><button type="button" onClick={() => void reviewUploadPermission(permission,"revoke")} className="rounded-lg border border-slate-300 px-3 py-2 text-xs font-semibold">Revoke</button></div>}</div>)}{!uploadPermissions.some((permission) => permission.status === "PENDING" && permission.canReview) && <p className="text-sm text-slate-500">No pending requests for your uploads.</p>}</div></div>
+                <div className="rounded-xl border border-slate-200 p-4"><h3 className="font-semibold">Trip chat</h3><div className="mt-3 max-h-80 space-y-2 overflow-y-auto rounded-lg bg-slate-50 p-3">{chatMessages.map((message) => <article key={message.messageId} className="rounded-lg border border-slate-200 bg-white p-3"><div className="flex flex-wrap items-center justify-between gap-2"><p className="text-xs font-bold text-emerald-900">{message.senderName || "Trip member"}{message.messageType === "PRIVATE" ? ` · Private${message.recipientName ? ` to ${message.recipientName}` : ""}` : " · Group"}</p><time className="text-[11px] text-slate-400">{new Date(message.createdAt).toLocaleString()}</time></div><p className="mt-1 whitespace-pre-wrap break-words text-sm text-slate-700">{message.body}</p></article>)}{!chatMessages.length && <p className="text-sm text-slate-500">No messages yet. Start the group conversation.</p>}</div>
+                  {chatMessageStatus && <p role="status" className="mt-2 text-xs text-rose-700">{chatMessageStatus}</p>}
+                  <form onSubmit={(event) => void sendTripChat(event)} className="mt-3 space-y-2"><select value={chatRecipient} onChange={(event) => setChatRecipient(event.target.value)} className="min-h-10 w-full rounded-lg border border-slate-300 px-3 text-sm"><option value="">Group message (everyone)</option>{tripMembers.filter((member) => member.email.toLowerCase() !== verifiedEmail.toLowerCase()).map((member) => <option key={member.googleId} value={member.googleId}>Private message · {member.displayName || member.email}</option>)}</select><div className="flex gap-2"><input value={chatDraft} onChange={(event) => setChatDraft(event.target.value)} maxLength={5000} placeholder="Write a message…" className="min-h-11 min-w-0 flex-1 rounded-lg border border-slate-300 px-3 text-sm"/><button type="submit" disabled={!chatDraft.trim()} className="rounded-lg bg-emerald-800 px-4 text-sm font-semibold text-white disabled:opacity-50">Send</button></div></form>
+                </div>
+                <p className="text-xs leading-5 text-slate-500">Memory and document uploads are being kept separate from trip membership: the uploader must approve each viewer. Existing Google Drive memories and links are not yet migrated into the new per-upload access layer.</p>
+              </section>
+            )}
+
             {!isLoadingItinerary && !itineraryError && activeView === "documents" && (
               <section className="rounded-2xl border border-slate-200 bg-white p-5 shadow-sm sm:p-7">
                 <button type="button" onClick={goToDashboard} className="text-sm font-semibold text-emerald-800 hover:underline">← Back to dashboard</button>
@@ -1918,7 +2200,7 @@ function App() {
                 <h2 className="mt-2 text-2xl font-bold">Documents & Links</h2>
                 <p className="mt-2 text-sm text-slate-600">Approved trip documents and useful reference websites, loaded from the Google Sheets Link tab.</p>
                 {documentsMessage && <p className="mt-3 rounded-lg bg-amber-50 p-3 text-sm text-amber-900">{documentsMessage}</p>}
-                {tripDocuments.length ? <div className="mt-5 space-y-3">{tripDocuments.map((document, index) => <a key={`${document.title}-${index}`} href={document.url} target="_blank" rel="noreferrer" className="flex items-center gap-3 rounded-xl border border-slate-200 p-4 transition hover:border-emerald-400 hover:bg-emerald-50/40"><span className="flex h-11 w-11 shrink-0 items-center justify-center rounded-xl bg-emerald-50 text-xl">{document.kind === "drive_folder" ? "📁" : "🔗"}</span><span className="min-w-0 flex-1"><span className="block text-xs font-semibold uppercase tracking-wide text-slate-500">{document.category}</span><span className="mt-1 block font-semibold text-slate-900">{document.title}</span><span className="mt-1 block break-all text-xs text-slate-500">{document.kind === "drive_folder" ? "Open shared Google Drive folder" : document.url}</span></span><span className="text-emerald-800">↗</span></a>)}</div> : !documentsMessage ? <p className="mt-4 rounded-xl bg-slate-50 p-4 text-sm text-slate-600">No approved links were found in the Link tab.</p> : null}
+                {tripDocuments.length ? <div className="mt-5 space-y-3">{tripDocuments.map((document, index) => document.canView === false ? <div key={`${document.title}-${index}`} className="flex flex-wrap items-center gap-3 rounded-xl border border-amber-200 bg-amber-50 p-4"><span className="text-xl">🔒</span><span className="min-w-0 flex-1"><span className="block text-xs font-semibold uppercase tracking-wide text-amber-800">{document.category}</span><span className="mt-1 block font-semibold text-slate-900">{document.title}</span><span className="mt-1 block text-xs text-slate-600">Uploader approval is required to open this document.</span></span><button type="button" disabled={document.requestPending} onClick={() => void requestDocumentAccess(document)} className="rounded-lg border border-amber-400 bg-white px-3 py-2 text-xs font-semibold text-amber-900 disabled:opacity-50">{document.requestPending ? "Request pending" : "Request access"}</button></div> : <a key={`${document.title}-${index}`} href={document.url} target="_blank" rel="noreferrer" className="flex items-center gap-3 rounded-xl border border-slate-200 p-4 transition hover:border-emerald-400 hover:bg-emerald-50/40"><span className="flex h-11 w-11 shrink-0 items-center justify-center rounded-xl bg-emerald-50 text-xl">{document.kind === "drive_folder" ? "📁" : "🔗"}</span><span className="min-w-0 flex-1"><span className="block text-xs font-semibold uppercase tracking-wide text-slate-500">{document.category}</span><span className="mt-1 block font-semibold text-slate-900">{document.title}</span><span className="mt-1 block break-all text-xs text-slate-500">{document.kind === "drive_folder" ? "Open shared Google Drive folder" : document.url}</span></span><span className="text-emerald-800">↗</span></a>)}</div> : !documentsMessage ? <p className="mt-4 rounded-xl bg-slate-50 p-4 text-sm text-slate-600">No approved links were found in the Link tab.</p> : null}
               </section>
             )}
 
@@ -2051,44 +2333,68 @@ function App() {
                 <button type="button" onClick={goToDashboard} className="text-sm font-semibold text-emerald-800 hover:underline">← Back to dashboard</button>
                 <div className="mt-6 flex h-14 w-14 items-center justify-center rounded-2xl bg-emerald-50 text-3xl" aria-hidden="true">{activeView === "expenses" ? "💳" : activeView === "memories" ? "📸" : "🗺️"}</div>
                 <h2 className="mt-4 text-2xl font-bold">{activeView === "expenses" ? "Trip expenses" : activeView === "memories" ? "Travel memories" : "Trip map"}</h2>
-                {activeView === "expenses" ? <div className="mt-5 space-y-5">
+                {activeView === "expenses" ? <div className="mt-5 space-y-4">
+                  <button type="button" onClick={() => setShowExpenseSummary((value) => !value)} aria-expanded={showExpenseSummary} className="flex w-full items-center justify-between rounded-xl border border-slate-200 px-3 py-3 text-left text-sm font-semibold"><span>Expense summary</span><span>{showExpenseSummary ? "Hide −" : "Expand +"}</span></button>
+                  {showExpenseSummary && <>
                   <div className="grid gap-3 sm:grid-cols-3">
                     <div className="rounded-xl border border-slate-200 p-4"><p className="text-xs font-semibold uppercase text-slate-500">Paid pre-trip expenses</p><p className="mt-2 text-xl font-bold">{formatExpenseTotal(paidPreTripExpenses.filter((expense) => expense.share_type !== "personal"))}</p><p className="mt-1 text-xs text-slate-500">Unpaid estimates excluded</p></div>
                     <div className="rounded-xl border border-slate-200 p-4"><p className="text-xs font-semibold uppercase text-slate-500">Actual shared spending</p><p className="mt-2 text-xl font-bold">{formatExpenseTotal(paidOrActualExpenses.filter((expense) => expense.expense_type === "actual-trip" && expense.share_type !== "personal"))}</p><p className="mt-1 text-xs text-slate-500">During the trip, split 50:50</p></div>
                     <div className="rounded-xl border border-slate-200 p-4"><p className="text-xs font-semibold uppercase text-slate-500">Personal spending</p><p className="mt-2 text-xl font-bold">{formatExpenseTotal(paidOrActualExpenses.filter((expense) => expense.share_type === "personal"))}</p><p className="mt-1 text-xs text-slate-500">Not included in the shared split</p></div>
                   </div>
                   <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
-                    <div className="rounded-xl border border-emerald-200 bg-emerald-50 p-4"><p className="text-xs font-semibold uppercase text-emerald-800">Cash remaining</p><p className="mt-2 text-xl font-bold">{formatMoney(cashRemainingNZD, "NZD")}</p><p className="mt-1 text-xs text-emerald-800">Starting exchanged cash: NZD 700.00</p></div>
-                    <div className="rounded-xl border border-slate-200 p-4"><p className="text-xs font-semibold uppercase text-slate-500">Cash spent</p><p className="mt-2 text-xl font-bold">{formatMoney(cashSpentNZD, "NZD")}</p><p className="mt-1 text-xs text-slate-500">Deducted from the shared exchanged cash</p></div>
+                    <div className="rounded-xl border border-emerald-200 bg-emerald-50 p-4"><p className="text-xs font-semibold uppercase text-emerald-800">Shared cash balance</p>{cashBalances.length ? cashBalances.map((item) => <div key={item.currency} className="mt-2"><p className="text-xl font-bold">{formatMoney(item.balance, item.currency)}</p><p className="mt-1 text-[11px] text-emerald-800">Initial {formatMoney(item.initial, item.currency)} + contributions {formatMoney(item.contributions, item.currency)} − spent {formatMoney(item.spent, item.currency)}</p></div>) : <p className="mt-2 text-sm font-semibold text-emerald-900">No opening cash recorded</p>}</div>
+                    <div className="rounded-xl border border-slate-200 p-4"><p className="text-xs font-semibold uppercase text-slate-500">Cash spent</p>{Object.entries(cashSpentByCurrency).length ? Object.entries(cashSpentByCurrency).map(([currency, amount]) => <p key={currency} className="mt-2 text-lg font-bold">{formatMoney(amount, currency)}</p>) : <p className="mt-2 text-lg font-bold">{formatMoney(0, "NZD")}</p>}<p className="mt-1 text-xs text-slate-500">Deducted from the shared cash pool</p></div>
                     <div className="rounded-xl border border-slate-200 p-4"><p className="text-xs font-semibold uppercase text-slate-500">Ralph · Card</p><p className="mt-2 text-xl font-bold">{formatExpenseTotal(ralphCardExpenses)}</p><p className="mt-1 text-xs text-slate-500">Ralph's card payments only</p></div>
                     <div className="rounded-xl border border-slate-200 p-4"><p className="text-xs font-semibold uppercase text-slate-500">June · Card</p><p className="mt-2 text-xl font-bold">{formatExpenseTotal(juneCardExpenses)}</p><p className="mt-1 text-xs text-slate-500">June's card payments only</p></div>
                   </div>
+                  <section className="rounded-xl border border-slate-200 p-4 space-y-4">
+                    <div className="flex flex-wrap items-center justify-between gap-2"><div><h3 className="font-semibold">Shared cash pool</h3><p className="text-xs text-slate-500">Record the initial exchange cash and any later contributions. Cash purchases reduce this balance.</p></div></div>
+                    <form onSubmit={(event) => void saveCashMovement(event)} className="grid gap-2 sm:grid-cols-2 lg:grid-cols-5">
+                      <label className="text-xs font-semibold">Cash record<select value={cashEntryType} onChange={(event) => setCashEntryType(event.target.value as "initial" | "contribution")} className="mt-1 block w-full rounded-lg border border-slate-300 px-2 py-2 text-sm font-normal"><option value="initial">Pre-trip initial exchange cash</option><option value="contribution">Additional contribution</option></select></label>
+                      <label className="text-xs font-semibold">Amount<input type="number" min="0.01" step="0.01" required value={cashEntryAmount} onChange={(event) => setCashEntryAmount(event.target.value)} placeholder="0.00" className="mt-1 block w-full rounded-lg border border-slate-300 px-2 py-2 text-sm font-normal" /></label>
+                      <label className="text-xs font-semibold">Currency<select value={cashEntryCurrency} onChange={(event) => setCashEntryCurrency(event.target.value)} className="mt-1 block w-full rounded-lg border border-slate-300 px-2 py-2 text-sm font-normal"><option>NZD</option><option>MYR</option><option>AUD</option><option>USD</option></select></label>
+                      <label className="text-xs font-semibold">Date<input type="date" required value={cashEntryDate} onChange={(event) => setCashEntryDate(event.target.value)} className="mt-1 block w-full rounded-lg border border-slate-300 px-2 py-2 text-sm font-normal" /></label>
+                      <button type="submit" disabled={expenseSettingsSaving} className="self-end rounded-lg bg-emerald-800 px-3 py-2 text-sm font-semibold text-white disabled:opacity-50">{expenseSettingsSaving ? "Saving…" : cashEntryType === "initial" ? "Save initial cash" : "Add contribution"}</button>
+                      <label className="text-xs font-semibold">Contributed by<input value={cashEntryContributor} onChange={(event) => setCashEntryContributor(event.target.value)} maxLength={100} placeholder="Trip member" className="mt-1 block w-full rounded-lg border border-slate-300 px-2 py-2 text-sm font-normal" /></label>
+                      <label className="text-xs font-semibold sm:col-span-2 lg:col-span-4">Notes (optional)<input value={cashEntryNotes} onChange={(event) => setCashEntryNotes(event.target.value)} maxLength={500} placeholder="Exchange details or contribution notes" className="mt-1 block w-full rounded-lg border border-slate-300 px-2 py-2 text-sm font-normal" /></label>
+                    </form>
+                    {cashMovements.length > 0 && <div className="space-y-1">{cashMovements.map((movement) => <div key={movement.record_id} className="flex flex-wrap justify-between gap-2 rounded-lg bg-slate-50 px-3 py-2 text-xs"><span>{movement.record_type === "INITIAL_CASH" ? "Initial exchange cash" : "Additional contribution"} · {movement.date} · {movement.contributor || movement.recorded_by}</span><strong>{formatMoney(movement.amount, movement.currency)}</strong></div>)}</div>}
+                    <div className="border-t border-slate-100 pt-3"><h3 className="text-sm font-semibold">Expense categories</h3><p className="mt-1 text-xs text-slate-500">Add categories for this trip. Existing categories on expense records remain unchanged.</p><form onSubmit={(event) => void addExpenseCategory(event)} className="mt-2 flex gap-2"><input value={newExpenseCategory} onChange={(event) => setNewExpenseCategory(event.target.value)} maxLength={60} placeholder="New category name" className="min-w-0 flex-1 rounded-lg border border-slate-300 px-3 py-2 text-sm" /><button type="submit" disabled={expenseSettingsSaving || !newExpenseCategory.trim()} className="rounded-lg border border-emerald-700 px-3 py-2 text-sm font-semibold text-emerald-800 disabled:opacity-50">Add category</button></form><div className="mt-2 flex flex-wrap gap-2">{expenseCategories.map((category) => <span key={category.id} className={`rounded-full border px-2.5 py-1 text-xs ${category.active === false ? "opacity-50" : ""}`} style={{ borderColor: category.color, color: category.color }}>{category.name}<button type="button" title={`Edit ${category.name}`} onClick={() => void editExpenseCategory(category)} className="ml-2 font-semibold">Edit</button><button type="button" title={category.active === false ? `Reactivate ${category.name}` : `Deactivate ${category.name}`} onClick={() => { const activate = category.active === false; if (activate || window.confirm(`Deactivate category “${category.name}”? Existing expense records will be preserved.`)) void saveExpenseSetting({ action: activate ? "category_activate" : "category_deactivate", id: category.id }); }} className="ml-2 font-bold">{category.active === false ? "↻" : "×"}</button></span>)}</div></div>
+                    {expenseSettingsMessage && <p className="text-xs text-slate-600" role="status">{expenseSettingsMessage}</p>}
+                  </section>
+
                   <section className="rounded-xl border border-slate-200 p-4">
                     <h3 className="font-semibold">Actual-trip card settlement · shared expenses</h3>
-                    <p className="mt-1 text-xs text-slate-500">Compares each person's shared actual-trip card payments against an equal 50:50 share. Personal expenses and pre-trip costs are excluded. Shared cash is treated as a jointly funded NZD 700 pool.</p>
+                    <p className="mt-1 text-xs text-slate-500">Compares each person's shared actual-trip card payments against an equal 50:50 share. Personal expenses and pre-trip costs are excluded. Shared cash is reconciled separately from card settlement.</p>
                     {settlementByCurrency.length ? <div className="mt-3 space-y-2">{settlementByCurrency.map((item) => <div key={item.currency} className="grid gap-2 rounded-lg bg-slate-50 p-3 sm:grid-cols-2"><div><p className="text-xs text-slate-500">Ralph paid {formatMoney(item.ralphPaid, item.currency)}</p><p className="mt-1 text-sm font-semibold">{item.ralphNet >= 0 ? `Ralph to receive ${formatMoney(item.ralphNet, item.currency)}` : `Ralph to pay ${formatMoney(Math.abs(item.ralphNet), item.currency)}`}</p></div><div><p className="text-xs text-slate-500">June paid {formatMoney(item.junePaid, item.currency)}</p><p className="mt-1 text-sm font-semibold">{item.juneNet >= 0 ? `June to receive ${formatMoney(item.juneNet, item.currency)}` : `June to pay ${formatMoney(Math.abs(item.juneNet), item.currency)}`}</p></div></div>)}</div> : <p className="mt-2 text-sm text-slate-500">No shared actual-trip card payments recorded yet.</p>}
                   </section>
+                  </>}
+                  <button type="button" onClick={() => setShowExpenseItems((value) => !value)} aria-expanded={showExpenseItems} className="flex w-full items-center justify-between rounded-xl border border-slate-200 px-3 py-3 text-left text-sm font-semibold"><span>Itemized expenses</span><span>{showExpenseItems ? "Hide −" : "Expand +"}</span></button>
+                  {showExpenseItems && <>
                   <div className="grid grid-cols-3 gap-2" role="tablist" aria-label="Expense sections">
                     {([['pre-trip','Pre-trip'],['actual-trip','Actual trip'],['personal','Personal']] as const).map(([tab,label]) => <button key={tab} type="button" role="tab" aria-selected={expenseTab === tab} onClick={() => { setExpenseTab(tab); setExpenseShareType(tab === "personal" ? "personal" : "shared"); if (tab === "pre-trip") setExpenseType("pre-trip"); else if (tab === "actual-trip") setExpenseType("actual-trip"); }} className={`rounded-xl border px-3 py-3 text-sm font-semibold ${expenseTab === tab ? "border-emerald-800 bg-emerald-800 text-white" : "border-slate-300 bg-white text-slate-700"}`}>{label}</button>)}
                   </div>
-                  {expenseTab === "pre-trip" && <section className="rounded-xl border border-slate-200 p-3"><h3 className="font-semibold text-sm">Pre-trip category summary</h3><div className="mt-2 grid grid-cols-1 gap-1.5 sm:grid-cols-2">{["Transportation", "Camping site", "Hotel stay", "Activity", "Other"].map((category) => { const matches = paidPreTripExpenses.filter((expense) => { if (expense.share_type === "personal") return false; const searchText = `${expense.category || ""} ${expense.description || ""}`; return category === "Transportation" ? /transport|flight|airfare|airline|campervan|motorhome|vehicle hire|camper van rental/i.test(searchText) : category === "Camping site" ? /camp|campsite|holiday park/i.test(searchText) && !/campervan|motorhome|vehicle hire|camper van rental/i.test(searchText) : category === "Hotel stay" ? /hotel|accommodation|motel|lodge/i.test(searchText) : category === "Activity" ? /activity|ticket|tour|attraction|booking/i.test(searchText) : !/transport|flight|airfare|airline|campervan|motorhome|vehicle hire|camper van rental|camp|campsite|holiday park|hotel|accommodation|motel|lodge|activity|ticket|tour|attraction|booking/i.test(searchText); }); const categoryColor = category === "Transportation" ? "bg-black border-black text-white" : category === "Camping site" ? "bg-sky-50 border-sky-200 text-sky-900" : category === "Hotel stay" ? "bg-violet-50 border-violet-200 text-violet-900" : category === "Activity" ? "bg-amber-50 border-amber-200 text-amber-900" : "bg-emerald-50 border-emerald-200 text-emerald-900"; return <div key={category} className={`flex min-h-9 items-center justify-between gap-2 rounded-md border px-2.5 py-1.5 ${categoryColor}`}><span className="text-xs font-medium">{category}</span><span className="whitespace-nowrap text-xs font-semibold">{formatExpenseTotal(matches)}</span></div>; })}</div></section>}
+                  {expenseTab === "pre-trip" && <section className="rounded-xl border border-slate-200 p-3"><h3 className="font-semibold text-sm">Pre-trip category summary</h3><div className="mt-2 grid grid-cols-1 gap-1.5 sm:grid-cols-2">{availableExpenseCategories.map((category) => { const matches = paidPreTripExpenses.filter((expense) => expense.share_type !== "personal" && (expense.category || "Other") === category); const color = expenseCategories.find((item) => item.name === category)?.color || "#64748b"; return <div key={category} className="flex min-h-9 items-center justify-between gap-2 rounded-md border px-2.5 py-1.5" style={{ borderColor: color, color }}><span className="text-xs font-medium">{category}</span><span className="whitespace-nowrap text-xs font-semibold">{formatExpenseTotal(matches)}</span></div>; })}</div></section>}
                   {expenseTab === "personal" && <section className="rounded-xl border border-slate-200 p-4"><h3 className="font-semibold">Trip expense summary</h3><p className="mt-1 text-xs text-slate-500">Paid pre-trip costs and actual trip costs only. Shared items are divided 50:50; each person's own personal costs are added to their share. Unpaid estimates are excluded.</p><div className="mt-3 grid gap-3 sm:grid-cols-2">{(["Ralph", "June"] as const).map((person) => { const personTotal = (type?: "pre-trip" | "actual-trip") => { const totals: Record<string, number> = {}; paidOrActualExpenses.filter((expense) => (!type || expense.expense_type === type)).forEach((expense) => { const currency = expense.currency || "NZD"; if (expense.share_type === "personal") { if (expense.paid_by !== person) return; totals[currency] = (totals[currency] || 0) + Number(expense.amount || 0); } else { totals[currency] = (totals[currency] || 0) + Number(expense.amount || 0) / 2; } }); return Object.entries(totals).length ? Object.entries(totals).map(([currency, total]) => formatMoney(total, currency)).join(" · ") : formatMoney(0, "NZD"); }; return <div key={person} className="rounded-xl border border-slate-200 p-3"><h4 className="font-semibold">{person} · estimated personal share</h4><div className="mt-2 flex justify-between gap-2 text-sm"><span className="text-slate-500">Paid pre-trip</span><strong>{personTotal("pre-trip")}</strong></div><div className="mt-1 flex justify-between gap-2 text-sm"><span className="text-slate-500">Actual trip</span><strong>{personTotal("actual-trip")}</strong></div><div className="mt-2 flex justify-between gap-2 border-t border-slate-100 pt-2 text-sm"><span className="font-semibold">Total</span><strong>{personTotal()}</strong></div></div>; })}</div><div className="mt-4 grid gap-2 sm:grid-cols-3"><div className="rounded-lg bg-slate-50 p-3"><p className="text-xs text-slate-500">Shared expenses · 50:50</p><p className="mt-1 font-bold">{formatExpenseTotal(paidOrActualExpenses.filter((expense) => expense.share_type !== "personal"))}</p></div><div className="rounded-lg bg-slate-50 p-3"><p className="text-xs text-slate-500">Personal expenses</p><p className="mt-1 font-bold">{formatExpenseTotal(expenses.filter((expense) => expense.share_type === "personal"))}</p></div><div className="rounded-lg bg-emerald-50 p-3"><p className="text-xs text-emerald-800">Total recorded trip expenses</p><p className="mt-1 font-bold">{formatExpenseTotal(paidOrActualExpenses)}</p></div></div><p className="mt-2 text-xs text-slate-500">The total excludes unpaid estimates from FINAL EXPENSES; currencies are shown separately and are not converted.</p></section>}
-                  <form onSubmit={(event) => void saveExpense(event)} className="rounded-xl border border-slate-200 p-4">
-                    <h3 className="font-semibold">{editingExpenseId ? "Edit expense record" : `Add ${expenseTab === "pre-trip" ? "pre-trip expense" : expenseTab === "actual-trip" ? "actual trip expense" : "personal expense"}`}</h3>
+                  {showExpenseForm && <div className="fixed inset-0 z-50 flex items-end justify-center bg-slate-950/50 p-2 sm:items-center sm:p-4"><form onSubmit={(event) => void saveExpense(event)} className="max-h-[92vh] w-full max-w-2xl overflow-y-auto rounded-2xl bg-white p-4 shadow-2xl sm:p-6">
+                    <div className="flex items-center justify-between gap-3"><h3 className="font-semibold">{editingExpenseId ? "Edit expense record" : `Add ${expenseTab === "pre-trip" ? "pre-trip expense" : expenseTab === "actual-trip" ? "actual trip expense" : "personal expense"}`}</h3><button type="button" onClick={() => { setShowExpenseForm(false); setEditingExpenseId(""); }} aria-label="Close expense form" className="rounded-full border border-slate-200 px-2.5 py-1 text-lg leading-none">×</button></div>
                     <div className="mt-4 grid gap-3 sm:grid-cols-2">
                       <label className="text-sm font-medium">Date<input type="date" required value={expenseDate} onChange={(event) => { const value = event.target.value; setExpenseDate(value); setExpenseType(value >= "2026-11-07" ? "actual-trip" : "pre-trip"); }} className="mt-1 block w-full rounded-lg border border-slate-300 px-3 py-2 font-normal" /></label>
                       <label className="text-sm font-medium">Expense sharing<select value={expenseShareType} onChange={(event) => setExpenseShareType(event.target.value as "shared" | "personal")} className="mt-1 block w-full rounded-lg border border-slate-300 px-3 py-2 font-normal"><option value="shared">Shared · split 50:50</option><option value="personal">Personal · not split</option></select></label>
                       <label className="text-sm font-medium">Payment method<select value={expensePaymentMethod} onChange={(event) => setExpensePaymentMethod(event.target.value as "Ralph (Card)" | "June (Card)" | "Cash" | "Unspecified")} className="mt-1 block w-full rounded-lg border border-slate-300 px-3 py-2 font-normal">{editingExpenseId && <option value="Unspecified">Select method</option>}<option value="Ralph (Card)">Ralph (Card)</option><option value="June (Card)">June (Card)</option><option value="Cash">Cash</option></select></label>
                       <label className="text-sm font-medium">Description<input required maxLength={200} value={expenseDescription} onChange={(event) => setExpenseDescription(event.target.value)} placeholder="e.g. Campervan deposit" className="mt-1 block w-full rounded-lg border border-slate-300 px-3 py-2 font-normal" /></label>
-                      <label className="text-sm font-medium">Category<select value={expenseCategory} onChange={(event) => setExpenseCategory(event.target.value)} className="mt-1 block w-full rounded-lg border border-slate-300 px-3 py-2 font-normal">{["Transportation", "Camping site", "Hotel stay", "Activity", "Flights", "Campervan", "Accommodation", "Insurance", "Bookings & activities", "Fuel", "Groceries", "Meals", "Parking & transport", "Shopping", "Other"].map((category) => <option key={category}>{category}</option>)}</select></label>
+                      <label className="text-sm font-medium">Category<select value={expenseCategory} onChange={(event) => setExpenseCategory(event.target.value)} className="mt-1 block w-full rounded-lg border border-slate-300 px-3 py-2 font-normal">{availableExpenseCategories.map((category) => <option key={category}>{category}</option>)}</select></label>
                       <div className="grid grid-cols-[1fr_100px] gap-2"><label className="text-sm font-medium">Amount<input type="number" min="0.01" step="0.01" required value={expenseAmount} onChange={(event) => setExpenseAmount(event.target.value)} placeholder="0.00" className="mt-1 block w-full rounded-lg border border-slate-300 px-3 py-2 font-normal" /></label><label className="text-sm font-medium">Currency<select value={expenseCurrency} onChange={(event) => setExpenseCurrency(event.target.value)} className="mt-1 block w-full rounded-lg border border-slate-300 px-2 py-2 font-normal"><option>NZD</option><option>MYR</option><option>AUD</option><option>USD</option></select></label></div>
                       <div className="sm:col-span-2"><div className="flex flex-wrap items-center justify-between gap-2"><span className="text-sm font-medium">Location (GPS)</span><button type="button" onClick={detectExpenseLocation} disabled={isDetectingExpenseLocation} className="rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm font-semibold disabled:opacity-50">{isDetectingExpenseLocation ? "Locating…" : "📍 Use GPS"}</button></div><input readOnly value={expenseLocation} placeholder="Optional — attach current location" className="mt-2 block w-full rounded-lg border border-slate-300 bg-slate-50 px-3 py-2 text-sm" /></div>
                       <label className="text-sm font-medium sm:col-span-2">Notes (optional)<textarea rows={2} maxLength={1000} value={expenseNotes} onChange={(event) => setExpenseNotes(event.target.value)} className="mt-1 block w-full rounded-lg border border-slate-300 px-3 py-2 font-normal" /></label>
                     </div>
-                    <button type="submit" disabled={expenseSaving} className="mt-4 rounded-lg bg-emerald-800 px-4 py-2.5 text-sm font-semibold text-white disabled:opacity-50">{expenseSaving ? "Saving…" : editingExpenseId ? "Save changes" : "Save expense"}</button>{editingExpenseId && <button type="button" onClick={() => { setEditingExpenseId(""); setExpenseMessage("Edit cancelled."); }} className="mt-4 ml-2 rounded-lg border border-slate-300 px-4 py-2.5 text-sm font-semibold">Cancel edit</button>}
+                    <button type="submit" disabled={expenseSaving} className="mt-4 rounded-lg bg-emerald-800 px-4 py-2.5 text-sm font-semibold text-white disabled:opacity-50">{expenseSaving ? "Saving…" : editingExpenseId ? "Save changes" : "Save expense"}</button>{editingExpenseId && <button type="button" onClick={() => { setEditingExpenseId(""); setShowExpenseForm(false); setExpenseMessage("Edit cancelled."); }} className="mt-4 ml-2 rounded-lg border border-slate-300 px-4 py-2.5 text-sm font-semibold">Cancel edit</button>}
                     {expenseMessage && <p className="mt-3 text-sm text-slate-600" aria-live="polite">{expenseMessage}</p>}
-                  </form>
-                  {(() => { const visibleExpenses = expenses.filter((expense) => expenseTab === "personal" ? expense.share_type === "personal" : expense.share_type !== "personal" && expense.expense_type === expenseTab); return <section><h3 className="font-semibold">{expenseTab === "pre-trip" ? "Pre-trip expenses" : expenseTab === "actual-trip" ? "Actual trip expenses" : "Personal expenses"}</h3>{visibleExpenses.length ? <div className="mt-3 space-y-3">{[...visibleExpenses].sort((a,b) => (b.date || "").localeCompare(a.date || "")).map((expense) => <article key={expense.expense_id} className="rounded-xl border border-slate-200 p-4"><div className="flex flex-wrap items-start justify-between gap-3"><div className="min-w-0"><p className="font-semibold">{expense.description}</p><p className="mt-1 text-xs text-slate-500">{expense.date || "Planned / booked"} · {expense.category} · Paid by {expense.paid_by}</p><div className="mt-2 flex flex-wrap gap-2"><span className="inline-block rounded-full bg-slate-100 px-2 py-1 text-xs text-slate-600">{expense.expense_type === "pre-trip" ? "Pre-trip" : "Actual trip"}{expense.source === "FINAL EXPENSES" ? " · From planning sheet" : ""}</span><span className="inline-block rounded-full bg-blue-50 px-2 py-1 text-xs text-blue-800">{expense.share_type === "personal" ? "Personal" : "Shared · 50:50"}</span><span className="inline-block rounded-full bg-violet-50 px-2 py-1 text-xs text-violet-800">{expense.payment_method || "Payment method not set"}</span>{expense.payment_status && <span className={`inline-block rounded-full px-2 py-1 text-xs ${expense.payment_status === "Paid" ? "bg-emerald-100 text-emerald-800" : "bg-amber-100 text-amber-800"}`}>{expense.payment_status}</span>}</div>{typeof expense.split_share === "number" && <p className="mt-2 text-xs text-slate-600">50:50 share: {formatMoney(expense.split_share, expense.currency)}</p>}{expense.location && <a className="mt-2 block text-xs font-semibold text-emerald-800 underline" href={`https://www.google.com/maps?q=${encodeURIComponent(expense.latitude && expense.longitude ? `${expense.latitude},${expense.longitude}` : expense.location)}`} target="_blank" rel="noreferrer">📍 {expense.location} · Open map</a>}{expense.notes && <p className="mt-2 whitespace-pre-wrap text-sm text-slate-600">{expense.notes}</p>}</div><div className="shrink-0 text-right"><p className="font-bold">{formatMoney(Number(expense.amount), expense.currency)}</p>{expense.source === "TRIP EXPENSES" && <div className="mt-3 flex flex-wrap justify-end gap-2"><button type="button" onClick={() => beginEditExpense(expense)} className="min-h-10 rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm font-semibold text-slate-700">Edit</button><button type="button" disabled={expenseSaving} onClick={() => void markExpenseLegacy(expense)} className="min-h-10 rounded-lg border border-rose-200 bg-rose-50 px-3 py-2 text-sm font-semibold text-rose-800 disabled:opacity-50">Remove</button></div>}</div></div></article>)}</div> : <p className="mt-2 rounded-xl bg-slate-50 p-4 text-sm text-slate-600">No {expenseTab === "personal" ? "personal" : expenseTab === "pre-trip" ? "pre-trip" : "actual trip"} expenses found.</p>}</section>; })()}
+                  </form></div>}
+                  {(() => { const visibleExpenses = expenses.filter((expense) => expenseTab === "personal" ? expense.share_type === "personal" : expense.share_type !== "personal" && expense.expense_type === expenseTab); return <section><h3 className="font-semibold">{expenseTab === "pre-trip" ? "Pre-trip expenses" : expenseTab === "actual-trip" ? "Actual trip expenses" : "Personal expenses"}</h3>{visibleExpenses.length ? <div className="mt-3 space-y-3">{[...visibleExpenses].sort((a,b) => (b.date || "").localeCompare(a.date || "")).map((expense) => <article key={expense.expense_id} className="relative rounded-lg border p-3" style={{ borderColor: expenseCategories.find((category) => category.name === expense.category)?.color || "#cbd5e1" }}><div className="flex flex-wrap items-start justify-between gap-2"><div className="min-w-0"><p className="font-semibold">{expense.description}</p><p className="mt-1 text-xs text-slate-500">{expense.date || "Planned / booked"} · {expense.category} · Paid by {expense.paid_by}</p><div className="mt-2 flex flex-wrap gap-2"><span className="inline-block rounded-full bg-slate-100 px-2 py-1 text-xs text-slate-600">{expense.expense_type === "pre-trip" ? "Pre-trip" : "Actual trip"}{expense.source === "FINAL EXPENSES" ? " · From planning sheet" : ""}</span><span className="inline-block rounded-full bg-blue-50 px-2 py-1 text-xs text-blue-800">{expense.share_type === "personal" ? "Personal" : "Shared · 50:50"}</span><span className="inline-block rounded-full bg-violet-50 px-2 py-1 text-xs text-violet-800">{expense.payment_method || "Payment method not set"}</span>{expense.payment_status && <span className={`inline-block rounded-full px-2 py-1 text-xs ${expense.payment_status === "Paid" ? "bg-emerald-100 text-emerald-800" : "bg-amber-100 text-amber-800"}`}>{expense.payment_status}</span>}</div>{typeof expense.split_share === "number" && <p className="mt-2 text-xs text-slate-600">50:50 share: {formatMoney(expense.split_share, expense.currency)}</p>}{expense.location && <a className="mt-2 block text-xs font-semibold text-emerald-800 underline" href={`https://www.google.com/maps?q=${encodeURIComponent(expense.latitude && expense.longitude ? `${expense.latitude},${expense.longitude}` : expense.location)}`} target="_blank" rel="noreferrer">📍 {expense.location} · Open map</a>}{expense.notes && <p className="mt-2 whitespace-pre-wrap text-sm text-slate-600">{expense.notes}</p>}</div><div className="shrink-0 pr-1 text-right"><p className="text-sm font-bold">{formatMoney(Number(expense.amount), expense.currency)}</p>{expense.source === "TRIP EXPENSES" && <div className="mt-2 flex items-center justify-end gap-1"><button type="button" onClick={() => beginEditExpense(expense)} aria-label="Edit expense" title="Edit" className="rounded-md border border-slate-200 px-2 py-1 text-xs font-semibold text-slate-700">Edit</button><button type="button" disabled={expenseSaving} onClick={() => void markExpenseLegacy(expense)} aria-label="Remove expense" title="Remove" className="rounded-md border border-rose-200 px-2 py-1 text-xs font-bold text-rose-700 disabled:opacity-50">×</button></div>}</div></div></article>)}</div> : <p className="mt-2 rounded-xl bg-slate-50 p-4 text-sm text-slate-600">No {expenseTab === "personal" ? "personal" : expenseTab === "pre-trip" ? "pre-trip" : "actual trip"} expenses found.</p>}</section>; })()}
+                  </>}
+                  {expenseMessage && !showExpenseForm && <p className="text-sm text-slate-600" role="status">{expenseMessage}</p>}
+                  <button type="button" onClick={() => { setEditingExpenseId(""); setExpenseMessage(""); setExpenseShareType(expenseTab === "personal" ? "personal" : "shared"); if (expenseTab !== "personal") setExpenseType(expenseTab); setShowExpenseItems(true); setShowExpenseForm(true); }} className="fixed bottom-24 right-5 z-40 flex items-center gap-2 rounded-full bg-emerald-800 px-5 py-3 text-sm font-semibold text-white shadow-xl hover:bg-emerald-900 sm:bottom-8 sm:right-8"><span className="text-xl leading-none">+</span> Add Expenses</button>
                 </div> : activeView === "map" ? <div className="mt-5 space-y-4"><p className="max-w-xl text-sm leading-6 text-slate-600">Open a day's route in Google Maps for driving directions. Flight days open a location search instead of driving directions.</p>{tripDays.map((day, index) => { const routeEntry = getEntriesForDay(day).find((entry) => /^(route|route\s*\/.*|route\s*and.*)$/i.test(entry.label.trim())) || getEntriesForDay(day).find((entry) => /route/i.test(entry.label)); const routeText = routeEntry?.value.trim() || ""; return <article key={day.key} className="rounded-xl border border-slate-200 p-4"><div className="flex items-start justify-between gap-3"><div><p className="text-xs font-semibold uppercase tracking-wide text-emerald-800">Day {index + 1} · {day.date}</p><h3 className="mt-1 font-semibold">{routeText || "Route not entered"}</h3></div><span aria-hidden="true" className="text-2xl">🛣️</span></div>{routeText ? <a href={googleMapsUrl(routeText)} target="_blank" rel="noreferrer" className="mt-3 inline-flex rounded-lg bg-emerald-800 px-4 py-2.5 text-sm font-semibold text-white hover:bg-emerald-900">{/\b(KUL|SIN)\b|flight|airport transfer/i.test(routeText) ? "Open locations in Google Maps ↗" : "Open driving route in Google Maps ↗"}</a> : <p className="mt-2 text-sm text-slate-500">Add route details to this day's itinerary to enable directions.</p>}</article>; })}<p className="text-xs text-slate-500">Google Maps opens separately. Route accuracy depends on the place names in your itinerary.</p></div> : <div className="mt-5 space-y-5">
                   <form onSubmit={(event) => { event.preventDefault(); setMemoryPreviewOpen(true); setMemoryMessage(""); }} className="rounded-xl border border-slate-200 p-4">
                     <h3 className="font-semibold">Add a shared memory</h3><p className="mt-1 text-sm text-slate-500">Review the preview before saving. Memories are shared with both approved travellers.</p>
@@ -2106,7 +2412,7 @@ function App() {
                     <div className="flex flex-wrap items-center justify-between gap-2"><h3 className="font-semibold">Trip photo gallery</h3><span className="text-xs text-slate-500">{memoryGalleryPhotos.length} photo{memoryGalleryPhotos.length === 1 ? "" : "s"}</span></div>
                     {memoryGalleryPhotos.length ? <div className="mt-3 max-h-[420px] overflow-y-auto overscroll-contain rounded-lg border border-slate-100 p-2"><div className="grid grid-cols-2 gap-2 sm:grid-cols-3">{memoryGalleryPhotos.map((photo, index) => <button key={`${photo.memory_id}-${photo.id}-${index}`} type="button" onClick={() => setSelectedMemoryPhoto(photo)} className="overflow-hidden rounded-lg border border-slate-200 bg-white text-left shadow-sm hover:border-emerald-400 focus:outline-none focus:ring-2 focus:ring-emerald-600"><img src={getMemoryPhotoUrl(photo.id)} alt={`Trip photo: ${photo.attraction}`} loading="lazy" className="h-28 w-full bg-slate-100 object-cover sm:h-36" /><span className="block truncate px-2 pt-2 text-xs font-semibold text-slate-800">{photo.attraction}</span><span className="block px-2 pb-2 text-[11px] text-slate-500">{photo.trip_date}</span></button>)}</div></div> : <p className="mt-2 text-sm text-slate-500">Photos added to saved memories will appear here.</p>}
                   </section>
-                  <section><h3 className="font-semibold">Shared memory collection</h3>{memories.length ? <div className="mt-3 space-y-3">{[...memories].sort((a,b) => (a.trip_date || "").localeCompare(b.trip_date || "")).map((memory) => <article key={memory.memory_id} className="rounded-xl border border-slate-200 p-4"><div className="flex flex-wrap items-start justify-between gap-2"><h4 className="font-semibold">{memory.attraction}</h4><span className="text-xs text-slate-500">{memory.trip_date}</span></div><p className="mt-2 whitespace-pre-wrap text-sm leading-6 text-slate-700">{memory.content}</p>{getMemoryPhotoIds(memory.photo_ids).length > 0 && <div className="mt-3 grid grid-cols-3 gap-2 sm:grid-cols-4">{getMemoryPhotoIds(memory.photo_ids).map((photoId) => <button key={photoId} type="button" onClick={() => setSelectedMemoryPhoto({ id: photoId, attraction: memory.attraction, trip_date: memory.trip_date, memory_id: memory.memory_id })} className="overflow-hidden rounded-lg border border-slate-200 bg-white text-left"><img src={getMemoryPhotoUrl(photoId)} alt={`Photo for ${memory.attraction}`} loading="lazy" className="h-20 w-full bg-slate-100 object-cover sm:h-24" /><span className="block px-2 py-1 text-[11px] font-semibold text-emerald-800">View photo</span></button>)}</div>}<p className="mt-2 text-xs text-slate-500">Shared by {memory.author_email || "trip companion"}</p></article>)}</div> : <p className="mt-2 text-sm text-slate-500">No shared memories have been saved yet.</p>}</section>
+                  <section><h3 className="font-semibold">Shared memory collection</h3>{memories.length ? <div className="mt-3 space-y-3">{[...memories].sort((a,b) => (a.trip_date || "").localeCompare(b.trip_date || "")).map((memory) => <article key={memory.memory_id} className="rounded-xl border border-slate-200 p-4"><div className="flex flex-wrap items-start justify-between gap-2"><h4 className="font-semibold">{memory.requiresApproval ? "🔒 Private memory" : memory.attraction}</h4><span className="text-xs text-slate-500">{memory.trip_date}</span></div>{memory.requiresApproval ? <div className="mt-2 flex flex-wrap items-center justify-between gap-2"><p className="text-sm text-slate-600">The uploader has not approved access to this memory.</p><button type="button" disabled={memory.requestPending} onClick={() => void requestMemoryAccess(memory)} className="rounded-lg border border-amber-400 px-3 py-2 text-xs font-semibold text-amber-900 disabled:opacity-50">{memory.requestPending ? "Request pending" : "Request access"}</button></div> : <><p className="mt-2 whitespace-pre-wrap text-sm leading-6 text-slate-700">{memory.content}</p>{getMemoryPhotoIds(memory.photo_ids).length > 0 && <div className="mt-3 grid grid-cols-3 gap-2 sm:grid-cols-4">{getMemoryPhotoIds(memory.photo_ids).map((photoId) => <button key={photoId} type="button" onClick={() => setSelectedMemoryPhoto({ id: photoId, attraction: memory.attraction, trip_date: memory.trip_date, memory_id: memory.memory_id })} className="overflow-hidden rounded-lg border border-slate-200 bg-white text-left"><img src={getMemoryPhotoUrl(photoId)} alt={`Photo for ${memory.attraction}`} loading="lazy" className="h-20 w-full bg-slate-100 object-cover sm:h-24" /><span className="block px-2 py-1 text-[11px] font-semibold text-emerald-800">View photo</span></button>)}</div>}<p className="mt-2 text-xs text-slate-500">Shared by {memory.author_email || "trip companion"}</p></>}</article>)}</div> : <p className="mt-2 text-sm text-slate-500">No shared memories have been saved yet.</p>}</section>
 
                 </div>}
               </section>
@@ -2207,15 +2513,18 @@ function App() {
               {googleConnection?.connected && googleConnection.estimatedTestingExpiryAt && <span className="text-slate-500">· Testing expiry estimate {new Date(googleConnection.estimatedTestingExpiryAt).toLocaleDateString()}</span>}
             </div>
           </div>
-          <div className="mx-auto grid max-w-3xl grid-cols-6 gap-1 py-2">
-            {[
+          <div className="mx-auto grid max-w-3xl grid-cols-7 gap-1 py-2">
+            {(guestMode ? [
+              { view: "itinerary" as ViewName, icon: "▤", label: "Itinerary" },
+            ] : [
               { view: "home" as ViewName, icon: "⌂", label: "Home" },
               { view: "itinerary" as ViewName, icon: "▤", label: "Itinerary" },
               { view: "checklist" as ViewName, icon: "🎒", label: "Checklist" },
               { view: "expenses" as ViewName, icon: "＄", label: "Expenses" },
               { view: "memories" as ViewName, icon: "♡", label: "Memories" },
               { view: "map" as ViewName, icon: "⌖", label: "Map" },
-            ].map((item) => (
+              { view: "collaboration" as ViewName, icon: "👥", label: "Members" },
+            ]).map((item) => (
               <button key={item.view} type="button" onClick={() => item.view === "itinerary" ? navigateToItinerary() : setActiveView(item.view)} className={`flex flex-col items-center gap-1 rounded-xl px-1 py-2 text-xs font-medium transition ${activeView === item.view ? "bg-emerald-50 text-emerald-900" : "text-slate-500 hover:bg-slate-50"}`} aria-current={activeView === item.view ? "page" : undefined}>
                 <span className="text-xl leading-none" aria-hidden="true">{item.icon}</span>
                 <span>{item.label}</span>
