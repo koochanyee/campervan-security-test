@@ -1,0 +1,37 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "campervan-security-test",
+  "main": "worker/index.ts",
+  "compatibility_date": "2025-10-08",
+  "assets": {
+    "directory": "./dist",
+    "not_found_handling": "single-page-application",
+    "run_worker_first": ["/api/*"]
+  },
+  "observability": { "enabled": true },
+  "vars": {
+    "GOOGLE_SHEET_ID": "1L_GUByHbUMIORDakIRutHUwK9pNMYPAsm1H1fe6RMB0",
+    "GOOGLE_SHEET_TAB": "FINAL ITINERARY"
+  },
+  "kv_namespaces": [
+    {
+      "binding": "OAUTH_TOKEN_STORE",
+      "id": "95841caaf7584e2ab56c3dc2915522ff"
+    }
+  ],
+  "d1_databases": [
+    {
+      "binding": "APP_DB",
+      "database_name": "REPLACE_WITH_YOUR_PREVIEW_D1_DATABASE_NAME",
+      "database_id": "REPLACE_WITH_D1_DATABASE_ID",
+      "migrations_dir": "migrations"
+    }
+  ],
+  "r2_buckets": [
+    {
+      "binding": "MEDIA_BUCKET",
+      "bucket_name": "REPLACE_WITH_YOUR_PREVIEW_R2_BUCKET_NAME"
+    }
+  ],
+  "upload_source_maps": true
+}
