@@ -12,7 +12,6 @@ interface Env {
   // Optional during staged rollout. Configure only after creating the D1 database
   // and applying migrations/0001_identity_trip_membership.sql.
   APP_DB?: D1Database;
-  MEDIA_BUCKET?: R2Bucket;
 }
 
 interface GoogleTokenInfo {
@@ -28,7 +27,6 @@ interface SessionPayload {
   email: string;
   googleId: string;
   exp: number;
-  guestTripId?: string;
 }
 
 function jsonResponse(
@@ -395,62 +393,11 @@ async function getTripRegistry(env: Env): Promise<TripConfig[]> {
   return trips;
 }
 
-async function getTripRole(env: Env, tripId: string, googleSub: string): Promise<string | null> {
-  if (!env.APP_DB) return "ADMIN"; // Legacy rollout mode; D1 enforcement starts only after migration is configured.
-  const row = await env.APP_DB.prepare(`SELECT role FROM trip_memberships WHERE trip_id = ? AND google_sub = ? AND status = 'ACTIVE' LIMIT 1`)
-    .bind(tripId, googleSub).first<{ role: string }>();
-  return row?.role || null;
-}
-
-async function requireTripRole(env: Env, tripId: string, googleSub: string, allowed: string[]): Promise<boolean> {
-  const role = await getTripRole(env, tripId, googleSub);
-  return !!role && allowed.includes(role);
-}
-
-async function bootstrapIdentity(session: SessionPayload, env: Env): Promise<void> {
-  if (!env.APP_DB) return;
-  const now = new Date().toISOString();
-  const email = session.email.trim().toLowerCase();
-  const defaultName = email.split("@")[0].replace(/[._-]+/g, " ").trim().slice(0, 80);
-  await env.APP_DB.prepare(`INSERT INTO users (google_sub,email,display_name,created_at,updated_at) VALUES (?,?,?,?,?) ON CONFLICT(google_sub) DO UPDATE SET email=excluded.email,updated_at=excluded.updated_at`)
-    .bind(session.googleId, email, defaultName, now, now).run();
-
-  // The user explicitly confirmed Ralph as the initial Admin. Do not assign June or
-  // any other account a role implicitly; they must be invited by an Admin.
-  if (email === "koochanyee@gmail.com") {
-    await env.APP_DB.prepare(`INSERT INTO trips (trip_id,name,destination,start_date,end_date,spreadsheet_id,itinerary_tab,drive_folder_id,created_by_google_sub,status,created_at,updated_at)
-      VALUES (?,?,?,?,?,?,?,?,?,'ACTIVE',?,?)
-      ON CONFLICT(trip_id) DO NOTHING`)
-      .bind("nz-south-island", "New Zealand — South Island", "New Zealand", "2026-11-07", null,
-        SOUTH_ISLAND_SHEET_ID, "FINAL ITINERARY", "1Tgr_Zx9cHG8njePOnIuX-UB5HAK6l6hV", session.googleId, now, now).run();
-    await env.APP_DB.prepare(`INSERT INTO trip_memberships (trip_id,google_sub,role,status,invited_by_google_sub,joined_at,updated_at)
-      VALUES ('nz-south-island', ?, 'ADMIN', 'ACTIVE', ?, ?, ?)
-      ON CONFLICT(trip_id,google_sub) DO UPDATE SET role='ADMIN',status='ACTIVE',updated_at=excluded.updated_at`)
-      .bind(session.googleId, session.googleId, now, now).run();
-  }
-
-  // Accept a pending email invitation only after the invitee has authenticated
-  // with the same verified Google email.
-  const invites = await env.APP_DB.prepare(`SELECT invitation_id,trip_id,role,invited_by_google_sub FROM trip_invitations WHERE email=? AND status='PENDING'`)
-    .bind(email).all<{ invitation_id: string; trip_id: string; role: string; invited_by_google_sub: string }>();
-  for (const invite of invites.results || []) {
-    await env.APP_DB.prepare(`INSERT INTO trip_memberships (trip_id,google_sub,role,status,invited_by_google_sub,joined_at,updated_at)
-      VALUES (?,?,?,'ACTIVE',?,?,?) ON CONFLICT(trip_id,google_sub) DO UPDATE SET role=excluded.role,status='ACTIVE',updated_at=excluded.updated_at`)
-      .bind(invite.trip_id, session.googleId, invite.role, invite.invited_by_google_sub, now, now).run();
-    await env.APP_DB.prepare(`UPDATE trip_invitations SET status='ACCEPTED',updated_at=? WHERE invitation_id=?`)
-      .bind(now, invite.invitation_id).run();
-  }
-}
-
-async function resolveTrip(request: Request, env: Env, bodyTripId?: string, session?: SessionPayload): Promise<TripConfig | null> {
+async function resolveTrip(request: Request, env: Env, bodyTripId?: string): Promise<TripConfig | null> {
   const url = new URL(request.url);
   const tripId = (url.searchParams.get("tripId") || bodyTripId || "nz-south-island").trim();
   const trips = await getTripRegistry(env);
-  const trip = trips.find((item) => item.id === tripId) || null;
-  if (!trip) return null;
-  if (session?.guestTripId) return session.guestTripId === tripId ? trip : null;
-  if (env.APP_DB && session && !(await getTripRole(env, tripId, session.googleId))) return null;
-  return trip;
+  return trips.find((trip) => trip.id === tripId) || null;
 }
 
 const googleAuthMetaKey = (email: string) => `google-auth-meta:${email.toLowerCase()}`;
@@ -582,18 +529,6 @@ async function uploadSharedMemoryPhoto(accessToken: string, photo: { name?: unkn
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
     const url = new URL(request.url);
-    const activeSession = await readSession(request, env);
-    if (activeSession?.guestTripId) {
-      const guestAllowed = ["/api/health", "/api/auth/session", "/api/auth/logout", "/api/auth/google-status", "/api/auth/google", "/api/sheets/connect", "/api/sheets/callback", "/api/trips", "/api/itinerary"];
-      if (!guestAllowed.includes(url.pathname) || ((url.pathname === "/api/itinerary" || url.pathname === "/api/trips") && request.method !== "GET")) {
-        return jsonResponse({ success: false, error: "Guest access is limited to the approved trip itinerary. Other trip areas are not available." }, 403);
-      }
-      if (env.APP_DB) {
-        const activeGrant = await env.APP_DB.prepare(`SELECT 1 AS allowed FROM guest_access_requests WHERE guest_email=? COLLATE NOCASE AND trip_id=? AND status='APPROVED' AND (expires_at IS NULL OR expires_at>?) LIMIT 1`)
-          .bind(activeSession.email,activeSession.guestTripId,new Date().toISOString()).first();
-        if (!activeGrant) return jsonResponse({success:false,error:"Guest access has expired or was revoked. Contact the trip Admin if you need access again."},403);
-      }
-    }
 
     // Health check
     if (
@@ -723,36 +658,33 @@ export default {
         verifiedEmailMatches: isApprovedEmail(email, env),
       });
 
-      let guestTripId = "";
       if (!isApprovedEmail(email, env)) {
-        if (env.APP_DB) {
-          const guestGrant = await env.APP_DB.prepare(`SELECT trip_id FROM guest_access_requests WHERE guest_email=? COLLATE NOCASE AND status='APPROVED' AND (expires_at IS NULL OR expires_at>?) ORDER BY reviewed_at DESC LIMIT 1`)
-            .bind(email,new Date().toISOString()).first<{trip_id:string}>();
-          guestTripId = guestGrant?.trip_id || "";
-        }
-        if (!guestTripId) return jsonResponse({ success: false, error: "This Google account is not approved for trip access." }, 403);
+        return jsonResponse(
+          {
+            success: false,
+            error: "This Google account is not approved for trip access.",
+          },
+          403,
+        );
       }
 
       try {
-        const sessionPayload: SessionPayload = {
-          email,
-          googleId: token.sub,
-          exp: Math.floor(Date.now() / 1000) + 8 * 60 * 60,
-          ...(guestTripId ? { guestTripId } : {}),
-        };
-        const sessionToken = await createSessionToken(sessionPayload, env.SESSION_SECRET);
-
-        await bootstrapIdentity(sessionPayload, env);
+        const sessionToken = await createSessionToken(
+          {
+            email,
+            googleId: token.sub,
+            exp: Math.floor(Date.now() / 1000) + 8 * 60 * 60,
+          },
+          env.SESSION_SECRET,
+        );
 
         const response = jsonResponse({
           success: true,
           user: {
             googleId: token.sub,
             email,
-            guest: Boolean(guestTripId),
-            guestTripId: guestTripId || null,
           },
-          message: guestTripId ? "Guest identity verified. Read-only itinerary access granted." : "Google identity verified. Trip access granted.",
+          message: "Google identity verified. Trip access granted.",
         });
 
         response.headers.append(
@@ -791,8 +723,6 @@ export default {
         user: {
           email: session.email,
           googleId: session.googleId,
-          guest: Boolean(session.guestTripId),
-          guestTripId: session.guestTripId || null,
         },
       });
     }
@@ -809,10 +739,14 @@ export default {
       }
 
       try {
-        await bootstrapIdentity(session, env);
         const now = new Date().toISOString();
         const email = session.email.trim().toLowerCase();
         const defaultName = email.split("@")[0].replace(/[._-]+/g, " ").trim().slice(0, 80);
+        await env.APP_DB.prepare(`
+          INSERT INTO users (google_sub, email, display_name, created_at, updated_at)
+          VALUES (?, ?, ?, ?, ?)
+          ON CONFLICT(google_sub) DO UPDATE SET email = excluded.email, updated_at = excluded.updated_at
+        `).bind(session.googleId, email, defaultName, now, now).run();
 
         if (request.method === "POST") {
           let body: { displayName?: unknown; preferredChatName?: unknown; photoUrl?: unknown; contactPhone?: unknown; notificationPreferences?: unknown };
@@ -1188,20 +1122,8 @@ export default {
       if (!session) return jsonResponse({ success: false, error: "Authentication required." }, 401);
       if (request.method === "POST" && request.headers.get("Origin") !== url.origin) return jsonResponse({ success: false, error: "Invalid request origin." }, 403);
       try {
-        await bootstrapIdentity(session, env);
         const trips = await getTripRegistry(env);
-        if (request.method === "GET") {
-          if (session.guestTripId) {
-            const guestTrip = trips.find(item => item.id === session.guestTripId);
-            return jsonResponse({ success: true, trips: guestTrip ? [{ id: guestTrip.id, name: guestTrip.name, itineraryTab: guestTrip.itineraryTab }] : [] });
-          }
-          if (env.APP_DB) {
-            const rows = await env.APP_DB.prepare(`SELECT t.trip_id AS id,t.name,t.itinerary_tab AS itineraryTab FROM trips t JOIN trip_memberships m ON m.trip_id=t.trip_id WHERE m.google_sub=? AND m.status='ACTIVE' AND t.status='ACTIVE' ORDER BY t.updated_at DESC`)
-              .bind(session.googleId).all<Record<string, unknown>>();
-            return jsonResponse({ success: true, trips: rows.results || [] });
-          }
-          return jsonResponse({ success: true, trips: trips.map(({ id, name, itineraryTab }) => ({ id, name, itineraryTab })) });
-        }
+        if (request.method === "GET") return jsonResponse({ success: true, trips: trips.map(({ id, name, itineraryTab }) => ({ id, name, itineraryTab })) });
         const body = await request.json() as { name?: unknown; sheetId?: unknown; itineraryTab?: unknown };
         const name = typeof body.name === "string" ? body.name.trim() : "";
         const sheetId = typeof body.sheetId === "string" ? body.sheetId.trim() : "";
@@ -1219,236 +1141,8 @@ export default {
         const trip: TripConfig = { id, name, sheetId, itineraryTab, createdAt: new Date().toISOString() };
         trips.push(trip);
         await env.OAUTH_TOKEN_STORE.put(TRIP_REGISTRY_KEY, JSON.stringify(trips));
-        if (env.APP_DB) {
-          const now = new Date().toISOString();
-          await env.APP_DB.prepare(`INSERT INTO trips (trip_id,name,destination,spreadsheet_id,itinerary_tab,drive_folder_id,created_by_google_sub,status,created_at,updated_at) VALUES (?,?,?,?,?,'',?,'ACTIVE',?,?)`)
-            .bind(id,name,"",sheetId,itineraryTab,session.googleId,now,now).run();
-          await env.APP_DB.prepare(`INSERT INTO trip_memberships (trip_id,google_sub,role,status,invited_by_google_sub,joined_at,updated_at) VALUES (?,?, 'ADMIN','ACTIVE',?,?,?)`)
-            .bind(id,session.googleId,session.googleId,now,now).run();
-        }
         return jsonResponse({ success: true, trip: { id: trip.id, name: trip.name, itineraryTab: trip.itineraryTab } }, 201);
       } catch (error) { return jsonResponse({ success: false, error: error instanceof Error ? error.message : "Could not manage trips." }, 500); }
-    }
-
-    // D1-backed trip membership, invitations, per-uploader access and chat.
-    if (url.pathname === "/api/trip-members" && (request.method === "GET" || request.method === "POST" || request.method === "DELETE")) {
-      const session = await readSession(request, env);
-      if (!session) return jsonResponse({ success: false, error: "Authentication required." }, 401);
-      if (!env.APP_DB) return jsonResponse({ success: false, error: "Trip membership database is not configured." }, 503);
-      if (request.method !== "GET" && request.headers.get("Origin") !== url.origin) return jsonResponse({ success: false, error: "Invalid request origin." }, 403);
-      try {
-        await bootstrapIdentity(session, env);
-        const tripId = (url.searchParams.get("tripId") || "nz-south-island").trim();
-        const role = await getTripRole(env, tripId, session.googleId);
-        if (!role) return jsonResponse({ success: false, error: "You are not a member of this trip." }, 403);
-        if (request.method === "GET") {
-          const rows = await env.APP_DB.prepare(`SELECT m.google_sub AS googleId,u.email,u.display_name AS displayName,u.photo_url AS photoUrl,m.role,m.status,m.joined_at AS joinedAt FROM trip_memberships m JOIN users u ON u.google_sub=m.google_sub WHERE m.trip_id=? ORDER BY CASE m.role WHEN 'ADMIN' THEN 0 WHEN 'EDITOR' THEN 1 ELSE 2 END,u.display_name`)
-            .bind(tripId).all<Record<string, unknown>>();
-          return jsonResponse({ success: true, members: rows.results || [], myRole: role });
-        }
-        if (role !== "ADMIN") return jsonResponse({ success: false, error: "Only a trip Admin can manage members." }, 403);
-        const body = await request.json() as Record<string, unknown>;
-        const now = new Date().toISOString();
-        if (request.method === "POST") {
-          const email = typeof body.email === "string" ? body.email.trim().toLowerCase() : "";
-          const memberRole = typeof body.role === "string" ? body.role.toUpperCase() : "VIEWER";
-          if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email) || !["ADMIN","EDITOR","VIEWER"].includes(memberRole)) return jsonResponse({ success: false, error: "Enter a valid email and role." }, 400);
-          const target = await env.APP_DB.prepare(`SELECT google_sub FROM users WHERE email=? COLLATE NOCASE LIMIT 1`).bind(email).first<{ google_sub: string }>();
-          if (target) {
-            const current = await env.APP_DB.prepare(`SELECT role FROM trip_memberships WHERE trip_id=? AND google_sub=? AND status='ACTIVE'`).bind(tripId,target.google_sub).first<{role:string}>();
-            if (current?.role === "ADMIN" && memberRole !== "ADMIN") {
-              const adminCount = await env.APP_DB.prepare(`SELECT COUNT(*) AS count FROM trip_memberships WHERE trip_id=? AND role='ADMIN' AND status='ACTIVE'`).bind(tripId).first<{count:number}>();
-              if (Number(adminCount?.count || 0) <= 1) return jsonResponse({success:false,error:"The last Admin cannot be demoted."},409);
-            }
-            await env.APP_DB.prepare(`INSERT INTO trip_memberships (trip_id,google_sub,role,status,invited_by_google_sub,joined_at,updated_at) VALUES (?,?,?,'ACTIVE',?,?,?) ON CONFLICT(trip_id,google_sub) DO UPDATE SET role=excluded.role,status='ACTIVE',invited_by_google_sub=excluded.invited_by_google_sub,updated_at=excluded.updated_at`)
-              .bind(tripId,target.google_sub,memberRole,session.googleId,now,now).run();
-            return jsonResponse({ success: true, message: "Trip membership updated. The user can now access this trip.", invited: true }, 201);
-          }
-          const invitationId = crypto.randomUUID();
-          await env.APP_DB.prepare(`INSERT INTO trip_invitations (invitation_id,trip_id,email,role,status,invited_by_google_sub,created_at,updated_at) VALUES (?,?,?,?,'PENDING',?,?,?) ON CONFLICT(trip_id,email) DO UPDATE SET role=excluded.role,status='PENDING',invited_by_google_sub=excluded.invited_by_google_sub,updated_at=excluded.updated_at`)
-            .bind(invitationId,tripId,email,memberRole,session.googleId,now,now).run();
-          return jsonResponse({ success: true, message: "Invitation saved. It will activate when this email signs in with Google.", invited: false }, 201);
-        }
-        const googleSub = typeof body.googleId === "string" ? body.googleId : "";
-        if (!googleSub || googleSub === session.googleId) return jsonResponse({ success: false, error: "Select another member. You cannot remove yourself here." }, 400);
-        const target = await env.APP_DB.prepare(`SELECT role FROM trip_memberships WHERE trip_id=? AND google_sub=? AND status='ACTIVE'`).bind(tripId,googleSub).first<{ role: string }>();
-        if (!target) return jsonResponse({ success: false, error: "Active member not found." }, 404);
-        if (target.role === "ADMIN") {
-          const admins = await env.APP_DB.prepare(`SELECT COUNT(*) AS count FROM trip_memberships WHERE trip_id=? AND role='ADMIN' AND status='ACTIVE'`).bind(tripId).first<{ count: number }>();
-          if (Number(admins?.count || 0) <= 1) return jsonResponse({ success: false, error: "The last Admin cannot be removed." }, 409);
-        }
-        await env.APP_DB.prepare(`UPDATE trip_memberships SET status='REMOVED',updated_at=? WHERE trip_id=? AND google_sub=?`).bind(now,tripId,googleSub).run();
-        return jsonResponse({ success: true, message: "Member access removed." });
-      } catch (error) { console.error("Trip member error",error); return jsonResponse({ success: false, error: "Could not manage trip members." },500); }
-    }
-
-    if (url.pathname === "/api/upload-permissions" && (request.method === "GET" || request.method === "POST")) {
-      const session = await readSession(request, env);
-      if (!session) return jsonResponse({ success: false, error: "Authentication required." }, 401);
-      if (!env.APP_DB) return jsonResponse({ success: false, error: "Upload permission database is not configured." }, 503);
-      if (request.method === "POST" && request.headers.get("Origin") !== url.origin) return jsonResponse({ success: false, error: "Invalid request origin." }, 403);
-      try {
-        const tripId = (url.searchParams.get("tripId") || "nz-south-island").trim();
-        if (!(await getTripRole(env,tripId,session.googleId))) return jsonResponse({ success: false, error: "You are not a member of this trip." },403);
-        if (request.method === "GET") {
-          const rows = await env.APP_DB.prepare(`SELECT p.upload_id AS uploadId,p.upload_type AS uploadType,p.uploader_google_sub AS uploaderGoogleId,p.viewer_google_sub AS viewerGoogleId,u.email AS viewerEmail,p.status,p.requested_at AS requestedAt,p.reviewed_at AS reviewedAt,CASE WHEN p.uploader_google_sub=? THEN 1 ELSE 0 END AS canReview FROM upload_permissions p JOIN users u ON u.google_sub=p.viewer_google_sub WHERE p.trip_id=? AND (p.uploader_google_sub=? OR p.viewer_google_sub=?) ORDER BY p.requested_at DESC LIMIT 300`)
-            .bind(session.googleId,tripId,session.googleId,session.googleId).all<Record<string,unknown>>();
-          return jsonResponse({ success:true, permissions: rows.results || [] });
-        }
-        const body = await request.json() as Record<string,unknown>;
-        const uploadId = String(body.uploadId || "").trim();
-        const viewerEmail = String(body.viewerEmail || "").trim().toLowerCase();
-        const action = String(body.action || "request").toLowerCase();
-        if (!uploadId || uploadId.length > 180) return jsonResponse({success:false,error:"Upload ID is required."},400);
-        if (action === "request") {
-          const uploadType = String(body.uploadType || "MEMORY").toUpperCase();
-          let ownerGoogleSub = (await env.APP_DB.prepare(`SELECT uploader_google_sub FROM trip_media WHERE media_id=? AND trip_id=?`).bind(uploadId,tripId).first<{uploader_google_sub:string}>())?.uploader_google_sub || "";
-          if (!ownerGoogleSub && uploadType === "DOCUMENT") {
-            const tripOwner = await env.APP_DB.prepare(`SELECT created_by_google_sub FROM trips WHERE trip_id=?`).bind(tripId).first<{created_by_google_sub:string}>();
-            ownerGoogleSub = tripOwner?.created_by_google_sub || "";
-          }
-          if (!ownerGoogleSub && uploadType === "MEMORY") {
-            const trip = (await getTripRegistry(env)).find(item => item.id === tripId);
-            if (trip) {
-              const googleToken = await googleAccessToken(session,env);
-              const memoryTab = await findExistingTab(googleToken,trip.sheetId,["TRIP_MEMORIES","TRIP MEMORIES"],"TRIP_MEMORIES");
-              const memoryRows = await readSheetRows(googleToken,trip.sheetId,memoryTab);
-              const memory = memoryRows.slice(1).find(row => String(row[0] || "") === uploadId);
-              if (memory) ownerGoogleSub = (await env.APP_DB.prepare(`SELECT google_sub FROM users WHERE email=? COLLATE NOCASE LIMIT 1`).bind(String(memory[3] || "").trim().toLowerCase()).first<{google_sub:string}>())?.google_sub || "";
-            }
-          }
-          if (!ownerGoogleSub) return jsonResponse({success:false,error:"Upload not found or uploader has not registered a profile."},404);
-          if (ownerGoogleSub === session.googleId) return jsonResponse({success:true,message:"Uploader already has access."});
-          await env.APP_DB.prepare(`INSERT INTO upload_permissions (upload_id,trip_id,uploader_google_sub,upload_type,viewer_google_sub,status,requested_at) VALUES (?,?,?,?,?,'PENDING',?) ON CONFLICT(upload_id,viewer_google_sub) DO UPDATE SET status='PENDING',requested_at=excluded.requested_at`)
-            .bind(uploadId,tripId,ownerGoogleSub,uploadType,session.googleId,new Date().toISOString()).run();
-          return jsonResponse({success:true,message:"Access request sent to the uploader."},201);
-        }
-        if (action === "approve" || action === "revoke") {
-          const permission = await env.APP_DB.prepare(`SELECT uploader_google_sub FROM upload_permissions WHERE upload_id=? AND trip_id=? AND viewer_google_sub=?`).bind(uploadId,tripId,viewerEmail ? (await env.APP_DB.prepare(`SELECT google_sub FROM users WHERE email=? COLLATE NOCASE`).bind(viewerEmail).first<{google_sub:string}>())?.google_sub || "" : String(body.viewerGoogleId || "")).first<{uploader_google_sub:string}>();
-          if (!permission || permission.uploader_google_sub !== session.googleId) return jsonResponse({success:false,error:"Only the uploader can approve or revoke access."},403);
-          const viewerGoogleId = viewerEmail ? (await env.APP_DB.prepare(`SELECT google_sub FROM users WHERE email=? COLLATE NOCASE`).bind(viewerEmail).first<{google_sub:string}>())?.google_sub || "" : String(body.viewerGoogleId || "");
-          await env.APP_DB.prepare(`UPDATE upload_permissions SET status=?,reviewed_at=? WHERE upload_id=? AND trip_id=? AND viewer_google_sub=?`).bind(action === "approve" ? "APPROVED" : "REVOKED",new Date().toISOString(),uploadId,tripId,viewerGoogleId).run();
-          return jsonResponse({success:true,message:action === "approve" ? "Access approved." : "Access revoked."});
-        }
-        return jsonResponse({success:false,error:"Unsupported permission action."},400);
-      } catch (error) { console.error("Upload permission error",error); return jsonResponse({success:false,error:"Could not update upload permissions."},500); }
-    }
-
-    if (url.pathname === "/api/chat" && (request.method === "GET" || request.method === "POST")) {
-      const session = await readSession(request,env);
-      if (!session) return jsonResponse({success:false,error:"Authentication required."},401);
-      if (!env.APP_DB) return jsonResponse({success:false,error:"Chat database is not configured."},503);
-      if (request.method === "POST" && request.headers.get("Origin") !== url.origin) return jsonResponse({success:false,error:"Invalid request origin."},403);
-      try {
-        const tripId = (url.searchParams.get("tripId") || "nz-south-island").trim();
-        if (!(await getTripRole(env,tripId,session.googleId))) return jsonResponse({success:false,error:"You are not a member of this trip."},403);
-        if (request.method === "GET") {
-          const before = url.searchParams.get("before") || "9999-12-31T23:59:59.999Z";
-          const rows = await env.APP_DB.prepare(`SELECT m.message_id AS messageId,m.message_type AS messageType,m.body,m.sender_google_sub AS senderGoogleId,COALESCE(NULLIF(s.preferred_chat_name,''),s.display_name) AS senderName,m.recipient_google_sub AS recipientGoogleId,COALESCE(NULLIF(r.preferred_chat_name,''),r.display_name) AS recipientName,m.reply_to_message_id AS replyToMessageId,m.created_at AS createdAt FROM trip_chat_messages m JOIN users s ON s.google_sub=m.sender_google_sub LEFT JOIN users r ON r.google_sub=m.recipient_google_sub WHERE m.trip_id=? AND m.deleted_at IS NULL AND m.created_at<? AND ((m.message_type='GROUP') OR (m.message_type='PRIVATE' AND (m.sender_google_sub=? OR m.recipient_google_sub=?))) ORDER BY m.created_at DESC LIMIT 100`)
-            .bind(tripId,before,session.googleId,session.googleId).all<Record<string,unknown>>();
-          return jsonResponse({success:true,messages:(rows.results || []).reverse()});
-        }
-        const body = await request.json() as Record<string,unknown>;
-        const message = typeof body.message === "string" ? body.message.trim() : "";
-        const recipient = typeof body.recipientGoogleId === "string" ? body.recipientGoogleId : "";
-        const replyTo = typeof body.replyToMessageId === "string" ? body.replyToMessageId : null;
-        const type = recipient ? "PRIVATE" : "GROUP";
-        if (!message || message.length > 5000) return jsonResponse({success:false,error:"Message must contain 1–5,000 characters."},400);
-        if (recipient && !(await getTripRole(env,tripId,recipient))) return jsonResponse({success:false,error:"Private-message recipient is not a member of this trip."},400);
-        if (replyTo) {
-          const parent = await env.APP_DB.prepare(`SELECT message_id FROM trip_chat_messages WHERE message_id=? AND trip_id=? AND (message_type='GROUP' OR sender_google_sub=? OR recipient_google_sub=?)`).bind(replyTo,tripId,session.googleId,session.googleId).first();
-          if (!parent) return jsonResponse({success:false,error:"Reply target is not available."},400);
-        }
-        const messageId = crypto.randomUUID(); const now = new Date().toISOString();
-        await env.APP_DB.prepare(`INSERT INTO trip_chat_messages (message_id,trip_id,sender_google_sub,recipient_google_sub,message_type,body,reply_to_message_id,created_at) VALUES (?,?,?,?,?,?,?,?)`)
-          .bind(messageId,tripId,session.googleId,recipient || null,type,message,replyTo,now).run();
-        return jsonResponse({success:true,message:{messageId,messageType:type,body:message,senderGoogleId:session.googleId,recipientGoogleId:recipient || null,createdAt:now}},201);
-      } catch (error) { console.error("Chat error",error); return jsonResponse({success:false,error:"Could not load or send chat messages."},500); }
-    }
-
-    if (url.pathname === "/api/media" && (request.method === "GET" || request.method === "POST" || request.method === "DELETE")) {
-      const session = await readSession(request,env);
-      if (!session) return jsonResponse({success:false,error:"Authentication required."},401);
-      if (!env.APP_DB || !env.MEDIA_BUCKET) return jsonResponse({success:false,error:"Media storage is not configured. Bind D1 as APP_DB and R2 as MEDIA_BUCKET."},503);
-      if (request.method !== "GET" && request.headers.get("Origin") !== url.origin) return jsonResponse({success:false,error:"Invalid request origin."},403);
-      try {
-        if (request.method === "POST") {
-          const form = await request.formData();
-          const tripId = String(form.get("tripId") || "nz-south-island");
-          const mediaType = String(form.get("mediaType") || "MEMORY").toUpperCase();
-          const file = form.get("file");
-          if (!(file instanceof File) || !["MEMORY","DOCUMENT","CHAT_ATTACHMENT"].includes(mediaType)) return jsonResponse({success:false,error:"A file and valid media type are required."},400);
-          if (!(await requireTripRole(env,tripId,session.googleId,["ADMIN","EDITOR"]))) return jsonResponse({success:false,error:"Editor or Admin access is required to upload."},403);
-          if (file.size < 1 || file.size > 20*1024*1024) return jsonResponse({success:false,error:"Files must be no larger than 20 MB."},413);
-          const safeName = file.name.replace(/[^a-zA-Z0-9._-]/g,"_").slice(0,120) || "upload.bin";
-          const mediaId = crypto.randomUUID(); const objectKey = `trips/${tripId}/${mediaType.toLowerCase()}/${mediaId}/${safeName}`; const now = new Date().toISOString();
-          await env.MEDIA_BUCKET.put(objectKey,file.stream(),{httpMetadata:{contentType:file.type || "application/octet-stream"},customMetadata:{tripId,uploader:session.googleId,mediaId}});
-          await env.APP_DB.prepare(`INSERT INTO trip_media (media_id,trip_id,uploader_google_sub,media_type,object_key,file_name,content_type,size_bytes,created_at) VALUES (?,?,?,?,?,?,?,?,?)`)
-            .bind(mediaId,tripId,session.googleId,mediaType,objectKey,safeName,file.type || "application/octet-stream",file.size,now).run();
-          return jsonResponse({success:true,media:{mediaId,tripId,mediaType,fileName:safeName,contentType:file.type || "application/octet-stream",sizeBytes:file.size,createdAt:now}},201);
-        }
-        const tripId = (url.searchParams.get("tripId") || "nz-south-island").trim();
-        if (!(await getTripRole(env,tripId,session.googleId))) return jsonResponse({success:false,error:"You are not a member of this trip."},403);
-        const mediaId = url.searchParams.get("mediaId");
-        if (request.method === "GET" && !mediaId) {
-          const rows = await env.APP_DB.prepare(`SELECT m.media_id AS mediaId,m.media_type AS mediaType,m.file_name AS fileName,m.content_type AS contentType,m.size_bytes AS sizeBytes,m.uploader_google_sub AS uploaderGoogleId,u.display_name AS uploaderName,m.created_at AS createdAt FROM trip_media m JOIN users u ON u.google_sub=m.uploader_google_sub WHERE m.trip_id=? AND (m.uploader_google_sub=? OR EXISTS (SELECT 1 FROM upload_permissions p WHERE p.upload_id=m.media_id AND p.viewer_google_sub=? AND p.status='APPROVED')) ORDER BY m.created_at DESC LIMIT 300`)
-            .bind(tripId,session.googleId,session.googleId).all<Record<string,unknown>>();
-          return jsonResponse({success:true,media:rows.results || []});
-        }
-        if (!mediaId) return jsonResponse({success:false,error:"Media ID is required."},400);
-        const item = await env.APP_DB.prepare(`SELECT m.object_key,m.file_name,m.content_type,m.uploader_google_sub FROM trip_media m WHERE m.media_id=? AND m.trip_id=?`).bind(mediaId,tripId).first<{object_key:string;file_name:string;content_type:string;uploader_google_sub:string}>();
-        if (!item) return jsonResponse({success:false,error:"Media not found."},404);
-        const isOwner = item.uploader_google_sub === session.googleId;
-        const permission = isOwner ? true : await env.APP_DB.prepare(`SELECT 1 AS allowed FROM upload_permissions WHERE upload_id=? AND viewer_google_sub=? AND status='APPROVED' LIMIT 1`).bind(mediaId,session.googleId).first();
-        if (!permission) return jsonResponse({success:false,error:"The uploader has not approved access to this upload."},403);
-        if (request.method === "DELETE") {
-          if (!isOwner) return jsonResponse({success:false,error:"Only the uploader can delete this upload."},403);
-          await env.MEDIA_BUCKET.delete(item.object_key);
-          await env.APP_DB.prepare(`DELETE FROM upload_permissions WHERE upload_id=?`).bind(mediaId).run();
-          await env.APP_DB.prepare(`DELETE FROM trip_media WHERE media_id=?`).bind(mediaId).run();
-          return jsonResponse({success:true,message:"Upload deleted."});
-        }
-        const object = await env.MEDIA_BUCKET.get(item.object_key);
-        if (!object) return jsonResponse({success:false,error:"Stored media object is missing."},404);
-        const headers = new Headers(); object.writeHttpMetadata(headers); headers.set("Content-Disposition",`inline; filename="${item.file_name.replace(/["\\r\\n]/g,"_")}"`); headers.set("Cache-Control","private, no-store"); headers.set("X-Content-Type-Options","nosniff");
-        return new Response(object.body,{headers});
-      } catch (error) { console.error("Media API error",error); return jsonResponse({success:false,error:"Could not manage media upload."},500); }
-    }
-
-    if (url.pathname === "/api/guest-requests" && (request.method === "GET" || request.method === "POST")) {
-      if (!env.APP_DB) return jsonResponse({success:false,error:"Guest access database is not configured."},503);
-      if (request.method === "POST" && request.headers.get("Origin") && request.headers.get("Origin") !== url.origin) return jsonResponse({success:false,error:"Invalid request origin."},403);
-      if (request.method === "POST" && request.headers.get("Origin") !== url.origin) return jsonResponse({success:false,error:"Invalid request origin."},403);
-      try {
-        if (request.method === "POST") {
-          const body = await request.json() as Record<string,unknown>;
-          const action = String(body.action || "request").toLowerCase();
-          const tripId = String(body.tripId || "nz-south-island");
-          if (action === "approve" || action === "reject" || action === "revoke") {
-            const session = await readSession(request,env);
-            if (!session) return jsonResponse({success:false,error:"Authentication required."},401);
-            if (!(await requireTripRole(env,tripId,session.googleId,["ADMIN"]))) return jsonResponse({success:false,error:"Only a trip Admin can review guest requests."},403);
-            const requestId = String(body.requestId || "");
-            if (!requestId) return jsonResponse({success:false,error:"Guest request ID is required."},400);
-            const status = action === "approve" ? "APPROVED" : action === "reject" ? "REJECTED" : "REVOKED";
-            const now = new Date().toISOString();
-            await env.APP_DB.prepare(`UPDATE guest_access_requests SET status=?,reviewed_at=?,reviewed_by_google_sub=?,expires_at=? WHERE request_id=? AND trip_id=?`)
-              .bind(status,now,session.googleId,action === "approve" ? new Date(Date.now()+30*86400000).toISOString() : null,requestId,tripId).run();
-            return jsonResponse({success:true,status,message:action === "approve" ? "Guest approved. They can sign in with this verified Google email; their session is restricted to this trip's read-only itinerary." : "Guest request updated."});
-          }
-          const name = String(body.name || "").trim(); const email = String(body.email || "").trim().toLowerCase();
-          if (name.length < 1 || name.length > 80 || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) return jsonResponse({success:false,error:"Enter your name and a valid email address."},400);
-          const requestId = crypto.randomUUID(); const now = new Date().toISOString();
-          await env.APP_DB.prepare(`INSERT INTO guest_access_requests (request_id,trip_id,guest_name,guest_email,status,requested_at) VALUES (?,?,?,?,'PENDING',?)`).bind(requestId,tripId,name,email,now).run();
-          return jsonResponse({success:true,requestId,message:"Guest access request submitted for Admin approval. It does not grant access yet."},201);
-        }
-        const session = await readSession(request,env);
-        if (!session) return jsonResponse({success:false,error:"Authentication required."},401);
-        const tripId = (url.searchParams.get("tripId") || "nz-south-island").trim();
-        if (!(await requireTripRole(env,tripId,session.googleId,["ADMIN"]))) return jsonResponse({success:false,error:"Only a trip Admin can review guest requests."},403);
-        const rows = await env.APP_DB.prepare(`SELECT request_id AS requestId,guest_name AS guestName,guest_email AS guestEmail,status,requested_at AS requestedAt FROM guest_access_requests WHERE trip_id=? ORDER BY requested_at DESC LIMIT 200`).bind(tripId).all<Record<string,unknown>>();
-        return jsonResponse({success:true,requests:rows.results || []});
-      } catch (error) { console.error("Guest request error",error); return jsonResponse({success:false,error:"Could not process guest request."},500); }
     }
 
     // Per-trip expense configuration and shared cash pool ledger.
@@ -1459,9 +1153,8 @@ export default {
       if (request.method === "POST" && request.headers.get("Origin") !== url.origin) return jsonResponse({ success: false, error: "Invalid request origin." }, 403);
       try {
         const body = request.method === "POST" ? await request.json() as Record<string, unknown> : {};
-        const trip = await resolveTrip(request, env, typeof body.tripId === "string" ? body.tripId : undefined, session);
+        const trip = await resolveTrip(request, env, typeof body.tripId === "string" ? body.tripId : undefined);
         if (!trip) return jsonResponse({ success: false, error: "Select a valid trip first." }, 404);
-        if (request.method === "POST" && !(await requireTripRole(env, trip.id, session.googleId, ["ADMIN", "EDITOR"]))) return jsonResponse({ success: false, error: "Viewer access is read-only." }, 403);
         const token = await googleAccessToken(session, env);
         const tab = "TRIP EXPENSE SETTINGS";
         const headers = ["record_type", "record_id", "name", "color", "active", "amount", "currency", "date", "recorded_by", "notes", "created_at", "contributor"];
@@ -1544,9 +1237,8 @@ export default {
       try {
         let body: Record<string, unknown> = {};
         if (request.method === "POST") body = await request.json() as Record<string, unknown>;
-        const trip = await resolveTrip(request, env, typeof body.tripId === "string" ? body.tripId : undefined, session);
+        const trip = await resolveTrip(request, env, typeof body.tripId === "string" ? body.tripId : undefined);
         if (!trip) return jsonResponse({ success: false, error: "Select a valid trip first." }, 404);
-        if (request.method === "POST" && !(await requireTripRole(env, trip.id, session.googleId, ["ADMIN", "EDITOR"]))) return jsonResponse({ success: false, error: "Viewer access is read-only." }, 403);
         const token = await googleAccessToken(session, env);
         const tab = "TRIP EXPENSES";
         if (request.method === "POST") {
@@ -1728,7 +1420,7 @@ export default {
       const session = await readSession(request, env);
       if (!session) return jsonResponse({ success: false, error: "Authentication required." }, 401);
       try {
-        const trip = await resolveTrip(request, env, undefined, session);
+        const trip = await resolveTrip(request, env);
         if (!trip) return jsonResponse({ success: false, error: "Select a valid trip first." }, 404);
         const token = await googleAccessToken(session, env);
         const linkTab = await findExistingTab(token, trip.sheetId, ["Link", "Links"], "Link");
@@ -1743,21 +1435,7 @@ export default {
           const category = title.toLowerCase() === "all document" ? "Documents" : title.toLowerCase() === "doc website" ? "Booking" : /drive/i.test(sourceCategory) ? "Documents" : sourceCategory;
           return [{ category, title, url: resourceUrl, kind: /drive\.google\.com\/drive\/folders/i.test(resourceUrl) ? "drive_folder" : "link" }];
         });
-        let visibleDocuments = documents.map(doc => ({ ...doc, uploadId: `doc:${doc.title}`, canView: true, requiresApproval: false }));
-        if (env.APP_DB) {
-          const tripOwner = await env.APP_DB.prepare(`SELECT created_by_google_sub FROM trips WHERE trip_id=?`).bind(trip.id).first<{created_by_google_sub:string}>();
-          const ownerSub = tripOwner?.created_by_google_sub || "";
-          const approved = await env.APP_DB.prepare(`SELECT upload_id FROM upload_permissions WHERE trip_id=? AND viewer_google_sub=? AND status='APPROVED' AND upload_type='DOCUMENT'`).bind(trip.id,session.googleId).all<{upload_id:string}>();
-          const pending = await env.APP_DB.prepare(`SELECT upload_id FROM upload_permissions WHERE trip_id=? AND viewer_google_sub=? AND status='PENDING' AND upload_type='DOCUMENT'`).bind(trip.id,session.googleId).all<{upload_id:string}>();
-          const allowedIds = new Set((approved.results || []).map(item => item.upload_id));
-          const pendingIds = new Set((pending.results || []).map(item => item.upload_id));
-          visibleDocuments = documents.map(doc => {
-            const uploadId = `doc:${doc.title}`;
-            const canView = ownerSub === session.googleId || allowedIds.has(uploadId);
-            return { ...doc, uploadId, canView, requiresApproval: !canView, requestPending: pendingIds.has(uploadId), url: canView ? doc.url : "" };
-          });
-        }
-        return jsonResponse({ success: true, documents: visibleDocuments, tripId: trip.id });
+        return jsonResponse({ success: true, documents, tripId: trip.id });
       } catch (error) { return jsonResponse({ success: false, error: error instanceof Error ? error.message : "Could not load trip documents and links." }, 500); }
     }
 
@@ -1770,9 +1448,8 @@ export default {
       try {
         let body: Record<string, unknown> = {};
         if (request.method === "POST") body = await request.json() as Record<string, unknown>;
-        const trip = await resolveTrip(request, env, typeof body.tripId === "string" ? body.tripId : undefined, session);
+        const trip = await resolveTrip(request, env, typeof body.tripId === "string" ? body.tripId : undefined);
         if (!trip) return jsonResponse({ success: false, error: "Select a valid trip first." }, 404);
-        if (request.method === "POST" && !(await requireTripRole(env, trip.id, session.googleId, ["ADMIN", "EDITOR"]))) return jsonResponse({ success: false, error: "Viewer access is read-only." }, 403);
         const token = await googleAccessToken(session, env);
         const profile = session.email.toLowerCase() === "koochanyee@gmail.com" ? "Ralph" : session.email.toLowerCase() === "wookahwai@gmail.com" ? "June" : "";
         if (!profile) return jsonResponse({ success: false, error: "This account is not assigned a checklist profile." }, 403);
@@ -1980,7 +1657,7 @@ export default {
     // Read the signed-in user's Google Sheets itinerary.
     if (request.method === "GET" && url.pathname === "/api/itinerary") {
       const session = await readSession(request, env);
-      const trip = await resolveTrip(request, env, undefined, session);
+      const trip = await resolveTrip(request, env);
       if (!trip) return jsonResponse({ success: false, error: "Select a valid trip first." }, 404);
       const activeSheetId = trip.sheetId;
       const activeItineraryTab = trip.itineraryTab;
@@ -2156,7 +1833,7 @@ export default {
         const supplementaryTabs: Record<string, string[][]> = {};
         let supplementaryError: string | undefined;
 
-        if (!session.guestTripId && url.searchParams.get("lite") !== "1") {
+        if (url.searchParams.get("lite") !== "1") {
         try {
           const metadataUrl =
             `https://sheets.googleapis.com/v4/spreadsheets/` +
@@ -2270,9 +1947,8 @@ export default {
       url.pathname === "/api/session-location"
     ) {
       const session = await readSession(request, env);
-      const trip = await resolveTrip(request, env, undefined, session);
+      const trip = await resolveTrip(request, env);
       if (!trip) return jsonResponse({ success: false, error: "Select a valid trip first." }, 404);
-      if (session && !(await requireTripRole(env, trip.id, session.googleId, ["ADMIN", "EDITOR"]))) return jsonResponse({ success: false, error: "Viewer access is read-only." }, 403);
 
       if (!session) {
         return jsonResponse(
@@ -2584,24 +2260,11 @@ export default {
     if (request.method === "GET" && url.pathname === "/api/memory-photo") {
       const session = await readSession(request, env);
       if (!session) return jsonResponse({ success: false, error: "Authentication required." }, 401);
-      const trip = await resolveTrip(request, env, undefined, session);
+      const trip = await resolveTrip(request, env);
       if (!trip) return jsonResponse({ success: false, error: "Select a valid trip first." }, 404);
       const fileId = (url.searchParams.get("fileId") || "").trim();
       if (!/^[a-zA-Z0-9_-]{10,200}$/.test(fileId)) return jsonResponse({ success: false, error: "Invalid photo ID." }, 400);
       try {
-        if (env.APP_DB) {
-          const accessTokenForAcl = await googleAccessToken(session, env);
-          const memoryTabForAcl = await findExistingTab(accessTokenForAcl, trip.sheetId, ["TRIP_MEMORIES", "TRIP MEMORIES"], "TRIP_MEMORIES");
-          const memoryRowsForAcl = await readSheetRows(accessTokenForAcl, trip.sheetId, memoryTabForAcl);
-          const owningMemory = memoryRowsForAcl.slice(1).find(row => {
-            const ids = String(row[7] || "");
-            return ids.includes(fileId);
-          });
-          if (!owningMemory) return jsonResponse({ success: false, error: "Photo is not linked to a trip memory." }, 404);
-          const uploader = await env.APP_DB.prepare(`SELECT google_sub FROM users WHERE email=? COLLATE NOCASE LIMIT 1`).bind(String(owningMemory[3] || "").trim().toLowerCase()).first<{google_sub:string}>();
-          const allowed = uploader?.google_sub === session.googleId || Boolean(await env.APP_DB.prepare(`SELECT 1 AS allowed FROM upload_permissions WHERE upload_id=? AND trip_id=? AND uploader_google_sub=? AND viewer_google_sub=? AND status='APPROVED' AND upload_type='MEMORY' LIMIT 1`).bind(String(owningMemory[0]),trip.id,uploader?.google_sub || "",session.googleId).first());
-          if (!allowed) return jsonResponse({ success: false, error: "The memory uploader has not approved access to this photo." }, 403);
-        }
         const accessToken = await googleAccessToken(session, env);
         const driveResponse = await fetch(`https://www.googleapis.com/drive/v3/files/${encodeURIComponent(fileId)}?alt=media`, {
           headers: { Authorization: `Bearer ${accessToken}` },
@@ -2636,9 +2299,8 @@ export default {
         let body: Record<string, unknown> = {};
         if (request.method === "POST") body = await request.json() as Record<string, unknown>;
         const tripId = typeof body.tripId === "string" ? body.tripId : url.searchParams.get("tripId") || undefined;
-        const trip = await resolveTrip(request, env, tripId, session);
+        const trip = await resolveTrip(request, env, tripId);
         if (!trip) return jsonResponse({ success: false, error: "Select a valid trip first." }, 404);
-        if (request.method === "POST" && !(await requireTripRole(env, trip.id, session.googleId, ["ADMIN", "EDITOR"]))) return jsonResponse({ success: false, error: "Viewer access is read-only." }, 403);
         const date = (request.method === "POST" ? body.date : url.searchParams.get("date")) as string | null;
         if (!date || !String(date).trim() || String(date).length > 40) return jsonResponse({ success: false, error: "Select a valid itinerary date." }, 400);
         const dateKey = String(date).trim().toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "");
@@ -2676,7 +2338,7 @@ export default {
       url.pathname === "/api/memories"
     ) {
       const session = await readSession(request, env);
-      const trip = await resolveTrip(request, env, undefined, session);
+      const trip = await resolveTrip(request, env);
       if (!trip) return jsonResponse({ success: false, error: "Select a valid trip first." }, 404);
 
       if (!session) {
@@ -2685,7 +2347,6 @@ export default {
           401,
         );
       }
-      if (request.method === "POST" && !(await requireTripRole(env, trip.id, session.googleId, ["ADMIN", "EDITOR"]))) return jsonResponse({ success: false, error: "Viewer access is read-only." }, 403);
 
       if (
         !env.GOOGLE_CLIENT_ID ||
@@ -2804,35 +2465,21 @@ export default {
           };
 
           const rows = sheetData.values || [];
-          const memorySourceRows = rows.slice(1).filter(
-            (row) => typeof row[0] === "string" && typeof row[1] === "string" && typeof row[4] === "string" && String(row[0]).trim() !== "",
-          );
-          const memories = await Promise.all(memorySourceRows.map(async (row) => {
-            let canView = true;
-            let requestPending = false;
-            if (env.APP_DB) {
-              const uploader = await env.APP_DB.prepare(`SELECT google_sub FROM users WHERE email=? COLLATE NOCASE LIMIT 1`).bind(String(row[3] || "").trim().toLowerCase()).first<{google_sub:string}>();
-              canView = Boolean(uploader && uploader.google_sub === session.googleId);
-              if (!canView && uploader) {
-                const grant = await env.APP_DB.prepare(`SELECT status FROM upload_permissions WHERE upload_id=? AND trip_id=? AND uploader_google_sub=? AND viewer_google_sub=? AND upload_type='MEMORY' LIMIT 1`)
-                  .bind(String(row[0]),trip.id,uploader.google_sub,session.googleId).first<{status:string}>();
-                canView = grant?.status === "APPROVED";
-                requestPending = grant?.status === "PENDING";
-              }
-              if (!uploader) canView = false;
-            }
-            return {
-              memory_id: String(row[0] || ""),
-              trip_date: String(row[1] || ""),
-              attraction: String(row[2] || "Private trip memory"),
-              author_email: String(row[3] || ""),
-              content: canView ? String(row[4] || "") : "",
-              created_at: String(row[5] || ""),
-              updated_at: String(row[6] || ""),
-              photo_ids: canView ? String(row[7] || "") : "",
-              requiresApproval: !canView,
-              requestPending,
-            };
+          const memories = rows.slice(1).filter(
+            (row) =>
+              typeof row[0] === "string" &&
+              typeof row[1] === "string" &&
+              typeof row[4] === "string" &&
+              String(row[0]).trim() !== "",
+          ).map((row) => ({
+            memory_id: String(row[0] || ""),
+            trip_date: String(row[1] || ""),
+            attraction: String(row[2] || ""),
+            author_email: String(row[3] || ""),
+            content: String(row[4] || ""),
+            created_at: String(row[5] || ""),
+            updated_at: String(row[6] || ""),
+            photo_ids: String(row[7] || ""),
           }));
 
           return jsonResponse({
@@ -2991,9 +2638,8 @@ export default {
       if (request.method === "POST" && request.headers.get("Origin") !== url.origin) return jsonResponse({ success: false, error: "Invalid request origin." }, 403);
       try {
         const body = request.method === "POST" ? await request.json() as Record<string, unknown> : {};
-        const trip = await resolveTrip(request, env, typeof body.tripId === "string" ? body.tripId : undefined, session);
+        const trip = await resolveTrip(request, env, typeof body.tripId === "string" ? body.tripId : undefined);
         if (!trip) return jsonResponse({ success: false, error: "Select a valid trip first." }, 404);
-        if (request.method === "POST" && !(await requireTripRole(env, trip.id, session.googleId, ["ADMIN", "EDITOR"]))) return jsonResponse({ success: false, error: "Viewer access is read-only." }, 403);
         const token = await googleAccessToken(session, env);
         const tab = "TRIP_MEMORY_INTERACTIONS";
         const headers = ["interaction_id", "memory_id", "photo_id", "kind", "value", "author_email", "created_at"];
