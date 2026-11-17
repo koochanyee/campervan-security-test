@@ -10,12 +10,11 @@ type ViewName =
   | "expenses"
   | "memories"
   | "map"
-  | "documents"
-  | "collaboration";
+  | "documents";
 
 type ApiResponse = {
   success?: boolean;
-  user?: { email?: string; googleId?: string; guest?: boolean; guestTripId?: string | null };
+  user?: { email?: string; googleId?: string };
   data?: ItineraryRow[];
   count?: number;
   error?: string;
@@ -39,11 +38,6 @@ type ApiResponse = {
 };
 
 type TripConfigSummary = { id: string; name: string; itineraryTab?: string };
-type TripMember = { googleId: string; email: string; displayName: string; role: "ADMIN" | "EDITOR" | "VIEWER"; status: string };
-type ChatMessage = { messageId: string; messageType: "GROUP" | "PRIVATE"; body: string; senderGoogleId: string; senderName: string; recipientGoogleId?: string | null; recipientName?: string | null; createdAt: string };
-type GuestRequest = { requestId: string; guestName: string; guestEmail: string; status: string; requestedAt: string };
-type UploadPermission = { uploadId: string; uploadType: string; uploaderGoogleId: string; viewerGoogleId: string; viewerEmail: string; status: string; requestedAt: string; canReview: number | boolean };
-type UserProfile = { email: string; displayName: string; preferredChatName: string; photoUrl: string; contactPhone: string; notificationPreferences: Record<string, unknown> };
 
 type TripDay = {
   key: string;
@@ -67,11 +61,9 @@ type TripMemory = {
   created_at?: string;
   updated_at?: string;
   photo_ids?: string;
-  requiresApproval?: boolean;
-  requestPending?: boolean;
 };
 
-type TripDocument = { category: string; title: string; url: string; kind: "drive_folder" | "link"; uploadId?: string; canView?: boolean; requiresApproval?: boolean; requestPending?: boolean };
+type TripDocument = { category: string; title: string; url: string; kind: "drive_folder" | "link" };
 
 type MemoryInteraction = { interaction_id: string; memory_id: string; photo_id: string; kind: "REACTION" | "COMMENT"; value: string; author: string; created_at: string };
 
@@ -234,13 +226,8 @@ function dateIsSameDay(a: Date, b: Date): boolean {
 
 function App() {
   const [authMessage, setAuthMessage] = useState("");
-  const [guestNameDraft, setGuestNameDraft] = useState("");
-  const [guestEmailDraft, setGuestEmailDraft] = useState("");
-  const [guestRequestStatus, setGuestRequestStatus] = useState("");
-  const [guestRequestSaving, setGuestRequestSaving] = useState(false);
   const [isVerifying, setIsVerifying] = useState(false);
   const [verifiedEmail, setVerifiedEmail] = useState("");
-  const [guestMode, setGuestMode] = useState(false);
   const [googleConnection, setGoogleConnection] = useState<{ connected: boolean; needsReconnect: boolean; status: string; estimatedTestingExpiryAt?: string | null } | null>(null);
   const [isLoggingOut, setIsLoggingOut] = useState(false);
   const [logoutError, setLogoutError] = useState("");
@@ -254,7 +241,7 @@ function App() {
   const [activeView, setActiveViewState] = useState<ViewName>(() => {
     try {
       const saved = window.sessionStorage.getItem("campervan-active-view");
-      return saved && ["home", "checklist", "companion", "itinerary", "expenses", "memories", "map", "documents", "collaboration"].includes(saved) ? saved as ViewName : "home";
+      return saved && ["home", "checklist", "companion", "itinerary", "expenses", "memories", "map", "documents"].includes(saved) ? saved as ViewName : "home";
     } catch { return "home"; }
   });
   const [selectedTripId, setSelectedTripId] = useState(() => {
@@ -269,23 +256,6 @@ function App() {
   const [tripTabDraft, setTripTabDraft] = useState("FINAL ITINERARY");
   const [tripMessage, setTripMessage] = useState("");
   const [tripSaving, setTripSaving] = useState(false);
-  const [tripMembers, setTripMembers] = useState<TripMember[]>([]);
-  const [myTripRole, setMyTripRole] = useState<string>("");
-  const [memberInviteEmail, setMemberInviteEmail] = useState("");
-  const [memberInviteRole, setMemberInviteRole] = useState<"EDITOR" | "VIEWER" | "ADMIN">("VIEWER");
-  const [memberMessage, setMemberMessage] = useState("");
-  const [chatMessages, setChatMessages] = useState<ChatMessage[]>([]);
-  const [chatDraft, setChatDraft] = useState("");
-  const [chatRecipient, setChatRecipient] = useState("");
-  const [chatMessageStatus, setChatMessageStatus] = useState("");
-  const [collaborationLoading, setCollaborationLoading] = useState(false);
-  const [guestRequests, setGuestRequests] = useState<GuestRequest[]>([]);
-  const [guestRequestMessage, setGuestRequestMessage] = useState("");
-  const [uploadPermissions, setUploadPermissions] = useState<UploadPermission[]>([]);
-  const [uploadPermissionMessage, setUploadPermissionMessage] = useState("");
-  const [userProfile, setUserProfile] = useState<UserProfile | null>(null);
-  const [profileSaving, setProfileSaving] = useState(false);
-  const [profileMessage, setProfileMessage] = useState("");
   const [highlightPhoto, setHighlightPhoto] = useState<{ id: string; url: string; date?: string } | null>(null);
   const [highlightPhotoSaving, setHighlightPhotoSaving] = useState(false);
   const [highlightPhotoMessage, setHighlightPhotoMessage] = useState("");
@@ -473,10 +443,7 @@ function App() {
         const result = (await response.json()) as ApiResponse;
         if (!cancelled && result.success && result.user?.email) {
           setVerifiedEmail(result.user.email);
-          setGuestMode(Boolean(result.user.guest));
-          if (result.user.guestTripId) setSelectedTripId(result.user.guestTripId);
-          if (result.user.guest) setActiveViewState("itinerary");
-          setAuthMessage(result.user.guest ? "Guest session restored. Itinerary-only access." : "Existing session restored.");
+          setAuthMessage("Existing session restored.");
         }
       } catch (error) {
         console.error("Session restoration failed:", error);
@@ -509,141 +476,6 @@ function App() {
     return () => { cancelled = true; };
   }, [verifiedEmail]);
 
-  useEffect(() => {
-    if (!verifiedEmail || !selectedTripId || activeView !== "collaboration") return;
-    let cancelled = false;
-    async function loadCollaboration() {
-      setCollaborationLoading(true);
-      setMemberMessage(""); setChatMessageStatus("");
-      try {
-        const [memberResponse, chatResponse] = await Promise.all([
-          fetch(`/api/trip-members?tripId=${encodeURIComponent(selectedTripId)}`, { credentials: "same-origin", cache: "no-store" }),
-          fetch(`/api/chat?tripId=${encodeURIComponent(selectedTripId)}`, { credentials: "same-origin", cache: "no-store" }),
-        ]);
-        const [memberData, chatData] = await Promise.all([memberResponse.json(), chatResponse.json()]) as [ApiResponse & { members?: TripMember[]; myRole?: string }, ApiResponse & { messages?: ChatMessage[] }];
-        if (!memberResponse.ok || !memberData.success) throw new Error(memberData.error || "Could not load trip members.");
-        if (!chatResponse.ok || !chatData.success) throw new Error(chatData.error || "Could not load trip chat.");
-        let requests: GuestRequest[] = [];
-        if (memberData.myRole === "ADMIN") {
-          const guestResponse = await fetch(`/api/guest-requests?tripId=${encodeURIComponent(selectedTripId)}`, { credentials: "same-origin", cache: "no-store" });
-          const guestData = await guestResponse.json() as ApiResponse & { requests?: GuestRequest[] };
-          if (guestResponse.ok && guestData.success) requests = guestData.requests || [];
-        }
-        const permissionResponse = await fetch(`/api/upload-permissions?tripId=${encodeURIComponent(selectedTripId)}`, { credentials: "same-origin", cache: "no-store" });
-        const permissionData = await permissionResponse.json() as ApiResponse & { permissions?: UploadPermission[] };
-        const profileResponse = await fetch("/api/profile", { credentials: "same-origin", cache: "no-store" });
-        const profileData = await profileResponse.json() as ApiResponse & { profile?: UserProfile };
-        if (!cancelled) { setTripMembers(memberData.members || []); setMyTripRole(memberData.myRole || ""); setChatMessages(chatData.messages || []); setGuestRequests(requests); setUploadPermissions(permissionResponse.ok && permissionData.success ? permissionData.permissions || [] : []); if (profileResponse.ok && profileData.success && profileData.profile) setUserProfile(profileData.profile); }
-      } catch (error) { if (!cancelled) setMemberMessage(error instanceof Error ? error.message : "Could not load collaboration data."); }
-      finally { if (!cancelled) setCollaborationLoading(false); }
-    }
-    void loadCollaboration();
-    return () => { cancelled = true; };
-  }, [verifiedEmail, selectedTripId, activeView]);
-
-  const saveUserProfile = async (event: FormEvent<HTMLFormElement>) => {
-    event.preventDefault(); if (!userProfile) return; setProfileSaving(true); setProfileMessage("");
-    try {
-      const response = await fetch("/api/profile", { method: "POST", credentials: "same-origin", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ displayName: userProfile.displayName, preferredChatName: userProfile.preferredChatName, photoUrl: userProfile.photoUrl, contactPhone: userProfile.contactPhone, notificationPreferences: userProfile.notificationPreferences }) });
-      const result = await response.json() as ApiResponse & { profile?: UserProfile };
-      if (!response.ok || !result.success) throw new Error(result.error || "Could not save profile.");
-      if (result.profile) setUserProfile(result.profile);
-      setProfileMessage("Profile saved.");
-    } catch (error) { setProfileMessage(error instanceof Error ? error.message : "Could not save profile."); }
-    finally { setProfileSaving(false); }
-  };
-
-  const reviewUploadPermission = async (permission: UploadPermission, action: "approve" | "revoke") => {
-    setUploadPermissionMessage("");
-    try {
-      const response = await fetch(`/api/upload-permissions?tripId=${encodeURIComponent(selectedTripId)}`, { method: "POST", credentials: "same-origin", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ action, uploadId: permission.uploadId, viewerGoogleId: permission.viewerGoogleId }) });
-      const result = await response.json() as ApiResponse;
-      if (!response.ok || !result.success) throw new Error(result.error || "Could not update upload access.");
-      setUploadPermissionMessage(result.message || "Permission updated.");
-      setUploadPermissions((items) => items.map((item) => item.uploadId === permission.uploadId && item.viewerGoogleId === permission.viewerGoogleId ? { ...item, status: action === "approve" ? "APPROVED" : "REVOKED" } : item));
-    } catch (error) { setUploadPermissionMessage(error instanceof Error ? error.message : "Could not update upload access."); }
-  };
-
-  const requestMemoryAccess = async (memory: TripMemory) => {
-    try {
-      const response = await fetch(`/api/upload-permissions?tripId=${encodeURIComponent(selectedTripId)}`, { method: "POST", credentials: "same-origin", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ action: "request", uploadId: memory.memory_id, uploadType: "MEMORY" }) });
-      const result = await response.json() as ApiResponse;
-      if (!response.ok || !result.success) throw new Error(result.error || "Could not request memory access.");
-      setMemories((items) => items.map((item) => item.memory_id === memory.memory_id ? { ...item, requestPending: true } : item));
-      setMemoryMessage(result.message || "Access request sent to the uploader.");
-    } catch (error) { setMemoryMessage(error instanceof Error ? error.message : "Could not request memory access."); }
-  };
-
-  const requestDocumentAccess = async (document: TripDocument) => {
-    try {
-      const response = await fetch(`/api/upload-permissions?tripId=${encodeURIComponent(selectedTripId)}`, { method: "POST", credentials: "same-origin", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ action: "request", uploadId: document.uploadId, uploadType: "DOCUMENT" }) });
-      const result = await response.json() as ApiResponse;
-      if (!response.ok || !result.success) throw new Error(result.error || "Could not request document access.");
-      setTripDocuments((items) => items.map((item) => item.uploadId === document.uploadId ? { ...item, requestPending: true } : item));
-      setDocumentsMessage(result.message || "Access request sent to the uploader.");
-    } catch (error) { setDocumentsMessage(error instanceof Error ? error.message : "Could not request document access."); }
-  };
-
-  const reviewGuestRequest = async (requestId: string, action: "approve" | "reject") => {
-    setGuestRequestMessage("");
-    try {
-      const response = await fetch(`/api/guest-requests?tripId=${encodeURIComponent(selectedTripId)}`, { method: "POST", credentials: "same-origin", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ tripId: selectedTripId, requestId, action }) });
-      const result = await response.json() as ApiResponse;
-      if (!response.ok || !result.success) throw new Error(result.error || "Could not review guest request.");
-      setGuestRequestMessage(result.message || "Guest request updated.");
-      setGuestRequests((items) => items.map((item) => item.requestId === requestId ? { ...item, status: action === "approve" ? "APPROVED" : "REJECTED" } : item));
-    } catch (error) { setGuestRequestMessage(error instanceof Error ? error.message : "Could not review guest request."); }
-  };
-
-  const submitGuestRequest = async (event: FormEvent<HTMLFormElement>) => {
-    event.preventDefault(); setGuestRequestSaving(true); setGuestRequestStatus("");
-    try {
-      const response = await fetch("/api/guest-requests", { method: "POST", credentials: "same-origin", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ tripId: "nz-south-island", name: guestNameDraft.trim(), email: guestEmailDraft.trim() }) });
-      const result = await response.json() as ApiResponse;
-      if (!response.ok || !result.success) throw new Error(result.error || "Could not submit guest request.");
-      setGuestRequestStatus("Request submitted. The trip Admin must approve it before you can sign in."); setGuestNameDraft(""); setGuestEmailDraft("");
-    } catch (error) { setGuestRequestStatus(error instanceof Error ? error.message : "Could not submit guest request."); }
-    finally { setGuestRequestSaving(false); }
-  };
-
-  const removeTripMember = async (member: TripMember) => {
-    if (!window.confirm(`Remove ${member.email} from this trip?`)) return;
-    setMemberMessage("");
-    try {
-      const response = await fetch(`/api/trip-members?tripId=${encodeURIComponent(selectedTripId)}`, { method: "DELETE", credentials: "same-origin", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ googleId: member.googleId }) });
-      const result = await response.json() as ApiResponse;
-      if (!response.ok || !result.success) throw new Error(result.error || "Could not remove member.");
-      setTripMembers((items) => items.filter((item) => item.googleId !== member.googleId));
-      setMemberMessage(result.message || "Member removed.");
-    } catch (error) { setMemberMessage(error instanceof Error ? error.message : "Could not remove member."); }
-  };
-
-  const inviteTripMember = async (event: FormEvent<HTMLFormElement>) => {
-    event.preventDefault(); setMemberMessage("");
-    try {
-      const response = await fetch(`/api/trip-members?tripId=${encodeURIComponent(selectedTripId)}`, { method: "POST", credentials: "same-origin", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ email: memberInviteEmail.trim(), role: memberInviteRole }) });
-      const result = await response.json() as ApiResponse;
-      if (!response.ok || !result.success) throw new Error(result.error || "Could not invite member.");
-      setMemberMessage(result.message || "Invitation saved."); setMemberInviteEmail("");
-      const refreshed = await fetch(`/api/trip-members?tripId=${encodeURIComponent(selectedTripId)}`, { credentials: "same-origin", cache: "no-store" });
-      const data = await refreshed.json() as ApiResponse & { members?: TripMember[]; myRole?: string };
-      if (refreshed.ok && data.success) { setTripMembers(data.members || []); setMyTripRole(data.myRole || ""); }
-    } catch (error) { setMemberMessage(error instanceof Error ? error.message : "Could not invite member."); }
-  };
-
-  const sendTripChat = async (event: FormEvent<HTMLFormElement>) => {
-    event.preventDefault(); setChatMessageStatus("");
-    try {
-      const response = await fetch(`/api/chat?tripId=${encodeURIComponent(selectedTripId)}`, { method: "POST", credentials: "same-origin", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ message: chatDraft.trim(), recipientGoogleId: chatRecipient || undefined }) });
-      const result = await response.json() as { success?: boolean; error?: string; message?: ChatMessage };
-      if (!response.ok || !result.success) throw new Error(result.error || "Could not send message.");
-      setChatDraft("");
-      const refreshed = await fetch(`/api/chat?tripId=${encodeURIComponent(selectedTripId)}`, { credentials: "same-origin", cache: "no-store" });
-      const data = await refreshed.json() as ApiResponse & { messages?: ChatMessage[] };
-      if (refreshed.ok && data.success) setChatMessages(data.messages || []);
-    } catch (error) { setChatMessageStatus(error instanceof Error ? error.message : "Could not send message."); }
-  };
-
   const handleLogout = async () => {
     if (isLoggingOut) return;
     if (!window.confirm("Log out of the travel companion? Your Google Sheets connection and trip data will be kept.")) return;
@@ -658,7 +490,6 @@ function App() {
       try {
         ["campervan-selected-trip", "campervan-active-view", "campervan-memory-attraction", "campervan-memory-content", "campervan-memory-preview", "campervan-drive-reconnect-pending"].forEach((key) => window.sessionStorage.removeItem(key));
       } catch { /* Session cookie is already cleared by the Worker. */ }
-      setGuestMode(false);
       window.location.replace("/");
     } catch (error) {
       setLogoutError(error instanceof Error ? error.message : "Could not sign out.");
@@ -702,10 +533,7 @@ function App() {
               throw new Error(data.error || "Google verification failed.");
             }
             setVerifiedEmail(data.user.email);
-            setGuestMode(Boolean(data.user.guest));
-            if (data.user.guestTripId) setSelectedTripId(data.user.guestTripId);
-            if (data.user.guest) setActiveViewState("itinerary");
-            setAuthMessage(data.user.guest ? "Guest approved. Loading the read-only itinerary…" : "Google identity verified. Loading trip selection…");
+            setAuthMessage("Google identity verified. Loading trip selection…");
           } catch (error) {
             setAuthMessage(error instanceof Error ? error.message : "Google verification failed. Please try again.");
           } finally {
@@ -1664,7 +1492,6 @@ function App() {
             {authMessage && <p className="mt-2 text-sm text-slate-500" aria-live="polite">{authMessage}</p>}
             {isVerifying && <p className="mt-2 text-sm text-slate-500">Verifying account…</p>}
             <div id="google-sign-in-button" className="mt-4 min-h-10" />
-            <details className="mt-5 rounded-xl border border-slate-200 p-4"><summary className="cursor-pointer text-sm font-semibold text-emerald-900">Request guest itinerary access</summary><p className="mt-2 text-xs leading-5 text-slate-600">Guests can request read-only access to the South Island itinerary. The Admin must approve the request, and the Google Sheet must be shared with the guest's Google email.</p><form onSubmit={(event) => void submitGuestRequest(event)} className="mt-3 space-y-2"><input required maxLength={80} value={guestNameDraft} onChange={(event) => setGuestNameDraft(event.target.value)} placeholder="Your name" className="min-h-10 w-full rounded-lg border border-slate-300 px-3 text-sm"/><input required type="email" value={guestEmailDraft} onChange={(event) => setGuestEmailDraft(event.target.value)} placeholder="Your Google email" className="min-h-10 w-full rounded-lg border border-slate-300 px-3 text-sm"/><button type="submit" disabled={guestRequestSaving} className="rounded-lg bg-emerald-800 px-4 py-2 text-sm font-semibold text-white disabled:opacity-50">{guestRequestSaving ? "Submitting…" : "Submit request"}</button></form>{guestRequestStatus && <p role="status" className="mt-2 text-xs text-slate-600">{guestRequestStatus}</p>}</details>
           </section>
         )}
 
@@ -1684,12 +1511,11 @@ function App() {
                     <h3 className="mt-1 text-xl font-bold">{trip.name}</h3>
                     <p className="mt-1 text-sm text-slate-600">Shared trip · Google Sheets itinerary</p>
                   </div>
-                  <button type="button" onClick={() => { setSelectedTripId(trip.id); setViewHistory([]); setActiveViewState(guestMode ? "itinerary" : "home"); setRefreshKey((n) => n + 1); }} className="rounded-xl bg-emerald-800 px-5 py-3 text-sm font-bold text-white hover:bg-emerald-900">Open trip →</button>
+                  <button type="button" onClick={() => { setSelectedTripId(trip.id); setViewHistory([]); setActiveViewState("home"); setRefreshKey((n) => n + 1); }} className="rounded-xl bg-emerald-800 px-5 py-3 text-sm font-bold text-white hover:bg-emerald-900">Open trip →</button>
                 </div>
               </article>
             ))}
             {trips.length === 0 && <p className="rounded-xl bg-white p-4 text-sm text-slate-600">No trips are registered yet. Add a Google Sheet to begin.</p>}
-            {!guestMode && <>
             <article className="rounded-2xl border border-dashed border-slate-300 bg-white p-5 sm:p-6">
               <div className="flex items-start gap-3">
                 <div className="flex h-12 w-12 shrink-0 items-center justify-center rounded-xl bg-slate-100 text-2xl" aria-hidden="true">＋</div>
@@ -1718,7 +1544,6 @@ function App() {
                 </div>
               </div>
             )}
-            </>}
           </section>
         )}
 
@@ -2174,25 +1999,6 @@ function App() {
               </section>
             )}
 
-            {!isLoadingItinerary && !itineraryError && activeView === "collaboration" && (
-              <section className="space-y-5 rounded-2xl border border-slate-200 bg-white p-5 shadow-sm sm:p-7">
-                <div><button type="button" onClick={goToDashboard} className="text-sm font-semibold text-emerald-800 hover:underline">← Back to dashboard</button><p className="mt-5 text-xs font-bold uppercase tracking-[0.16em] text-emerald-800">Trip management</p><h2 className="mt-2 text-2xl font-bold">Members & chat</h2><p className="mt-1 text-sm text-slate-600">Your role: <strong>{myTripRole || "Loading…"}</strong>. Group chat is the default; select a member for a private message.</p></div>
-                {memberMessage && <p role="status" className="rounded-lg bg-amber-50 p-3 text-sm text-amber-900">{memberMessage}</p>}
-                {userProfile && <form onSubmit={(event) => void saveUserProfile(event)} className="rounded-xl border border-slate-200 p-4"><h3 className="font-semibold">My profile</h3><p className="mt-1 text-xs text-slate-500">Verified Google email: {userProfile.email} (cannot be changed here).</p><div className="mt-3 grid gap-3 sm:grid-cols-2"><label className="text-xs font-semibold">Display name<input required maxLength={80} value={userProfile.displayName} onChange={(event) => setUserProfile({ ...userProfile, displayName: event.target.value })} className="mt-1 min-h-10 w-full rounded-lg border border-slate-300 px-3 text-sm font-normal" /></label><label className="text-xs font-semibold">Preferred chat name<input maxLength={40} value={userProfile.preferredChatName} onChange={(event) => setUserProfile({ ...userProfile, preferredChatName: event.target.value })} className="mt-1 min-h-10 w-full rounded-lg border border-slate-300 px-3 text-sm font-normal" /></label><label className="text-xs font-semibold">Profile photo URL<input type="url" value={userProfile.photoUrl} onChange={(event) => setUserProfile({ ...userProfile, photoUrl: event.target.value })} placeholder="https://…" className="mt-1 min-h-10 w-full rounded-lg border border-slate-300 px-3 text-sm font-normal" /></label><label className="text-xs font-semibold">Contact number<input maxLength={40} value={userProfile.contactPhone} onChange={(event) => setUserProfile({ ...userProfile, contactPhone: event.target.value })} className="mt-1 min-h-10 w-full rounded-lg border border-slate-300 px-3 text-sm font-normal" /></label></div>{profileMessage && <p role="status" className="mt-2 text-xs text-emerald-800">{profileMessage}</p>}<button type="submit" disabled={profileSaving} className="mt-3 rounded-lg bg-emerald-800 px-4 py-2 text-sm font-semibold text-white disabled:opacity-50">{profileSaving ? "Saving…" : "Save profile"}</button></form>}
-                <div className="rounded-xl border border-slate-200 p-4"><div className="flex items-center justify-between"><h3 className="font-semibold">Trip members</h3>{collaborationLoading && <span className="text-xs text-slate-500">Loading…</span>}</div>
-                  <div className="mt-3 space-y-2">{tripMembers.map((member) => <div key={member.googleId} className="flex items-center justify-between gap-3 rounded-lg bg-slate-50 p-3"><div className="min-w-0"><p className="truncate text-sm font-semibold">{member.displayName || member.email}</p><p className="truncate text-xs text-slate-500">{member.email}</p></div><div className="flex shrink-0 items-center gap-2"><span className="rounded-full bg-white px-2 py-1 text-xs font-bold text-slate-700">{member.role}</span>{myTripRole === "ADMIN" && member.email.toLowerCase() !== verifiedEmail.toLowerCase() && <button type="button" onClick={() => void removeTripMember(member)} className="rounded-lg border border-rose-200 px-2 py-1 text-[11px] font-semibold text-rose-700">Remove</button>}</div></div>)}{!collaborationLoading && !tripMembers.length && <p className="text-sm text-slate-500">No members found.</p>}</div>
-                  {myTripRole === "ADMIN" && <form onSubmit={(event) => void inviteTripMember(event)} className="mt-4 grid gap-2 sm:grid-cols-[1fr_150px_auto]"><input type="email" required value={memberInviteEmail} onChange={(event) => setMemberInviteEmail(event.target.value)} placeholder="Invite by Google email" className="min-h-11 rounded-lg border border-slate-300 px-3 text-sm"/><select value={memberInviteRole} onChange={(event) => setMemberInviteRole(event.target.value as "ADMIN" | "EDITOR" | "VIEWER")} className="min-h-11 rounded-lg border border-slate-300 px-3 text-sm"><option value="VIEWER">Viewer</option><option value="EDITOR">Editor</option><option value="ADMIN">Admin</option></select><button type="submit" className="min-h-11 rounded-lg bg-emerald-800 px-4 text-sm font-semibold text-white">Invite member</button></form>}
-                </div>
-                {myTripRole === "ADMIN" && <div className="rounded-xl border border-slate-200 p-4"><h3 className="font-semibold">Guest itinerary requests</h3><p className="mt-1 text-xs text-slate-500">Approved guests receive read-only itinerary access for 30 days. The guest must sign in with the same Google email and have the itinerary spreadsheet shared with them.</p>{guestRequestMessage && <p role="status" className="mt-2 text-xs text-emerald-800">{guestRequestMessage}</p>}<div className="mt-3 space-y-2">{guestRequests.map((request) => <div key={request.requestId} className="flex flex-wrap items-center justify-between gap-2 rounded-lg bg-slate-50 p-3"><div><p className="text-sm font-semibold">{request.guestName}</p><p className="text-xs text-slate-500">{request.guestEmail} · {request.status}</p></div>{request.status === "PENDING" && <div className="flex gap-2"><button type="button" onClick={() => void reviewGuestRequest(request.requestId,"approve")} className="rounded-lg bg-emerald-800 px-3 py-2 text-xs font-semibold text-white">Approve</button><button type="button" onClick={() => void reviewGuestRequest(request.requestId,"reject")} className="rounded-lg border border-slate-300 px-3 py-2 text-xs font-semibold">Reject</button></div>}</div>)}{!guestRequests.length && <p className="text-sm text-slate-500">No guest requests.</p>}</div></div>}
-                <div className="rounded-xl border border-slate-200 p-4"><h3 className="font-semibold">Your upload access requests</h3><p className="mt-1 text-xs text-slate-500">Only the person who uploaded a memory or document can approve access to it.</p>{uploadPermissionMessage && <p role="status" className="mt-2 text-xs text-emerald-800">{uploadPermissionMessage}</p>}<div className="mt-3 space-y-2">{uploadPermissions.filter((permission) => permission.status === "PENDING" && permission.canReview).map((permission) => <div key={`${permission.uploadId}-${permission.viewerGoogleId}`} className="flex flex-wrap items-center justify-between gap-2 rounded-lg bg-slate-50 p-3"><div><p className="text-sm font-semibold">{permission.uploadType} · {permission.uploadId}</p><p className="text-xs text-slate-500">Requested by {permission.viewerEmail}</p></div>{permission.viewerGoogleId && <div className="flex gap-2"><button type="button" onClick={() => void reviewUploadPermission(permission,"approve")} className="rounded-lg bg-emerald-800 px-3 py-2 text-xs font-semibold text-white">Approve</button><button type="button" onClick={() => void reviewUploadPermission(permission,"revoke")} className="rounded-lg border border-slate-300 px-3 py-2 text-xs font-semibold">Revoke</button></div>}</div>)}{!uploadPermissions.some((permission) => permission.status === "PENDING" && permission.canReview) && <p className="text-sm text-slate-500">No pending requests for your uploads.</p>}</div></div>
-                <div className="rounded-xl border border-slate-200 p-4"><h3 className="font-semibold">Trip chat</h3><div className="mt-3 max-h-80 space-y-2 overflow-y-auto rounded-lg bg-slate-50 p-3">{chatMessages.map((message) => <article key={message.messageId} className="rounded-lg border border-slate-200 bg-white p-3"><div className="flex flex-wrap items-center justify-between gap-2"><p className="text-xs font-bold text-emerald-900">{message.senderName || "Trip member"}{message.messageType === "PRIVATE" ? ` · Private${message.recipientName ? ` to ${message.recipientName}` : ""}` : " · Group"}</p><time className="text-[11px] text-slate-400">{new Date(message.createdAt).toLocaleString()}</time></div><p className="mt-1 whitespace-pre-wrap break-words text-sm text-slate-700">{message.body}</p></article>)}{!chatMessages.length && <p className="text-sm text-slate-500">No messages yet. Start the group conversation.</p>}</div>
-                  {chatMessageStatus && <p role="status" className="mt-2 text-xs text-rose-700">{chatMessageStatus}</p>}
-                  <form onSubmit={(event) => void sendTripChat(event)} className="mt-3 space-y-2"><select value={chatRecipient} onChange={(event) => setChatRecipient(event.target.value)} className="min-h-10 w-full rounded-lg border border-slate-300 px-3 text-sm"><option value="">Group message (everyone)</option>{tripMembers.filter((member) => member.email.toLowerCase() !== verifiedEmail.toLowerCase()).map((member) => <option key={member.googleId} value={member.googleId}>Private message · {member.displayName || member.email}</option>)}</select><div className="flex gap-2"><input value={chatDraft} onChange={(event) => setChatDraft(event.target.value)} maxLength={5000} placeholder="Write a message…" className="min-h-11 min-w-0 flex-1 rounded-lg border border-slate-300 px-3 text-sm"/><button type="submit" disabled={!chatDraft.trim()} className="rounded-lg bg-emerald-800 px-4 text-sm font-semibold text-white disabled:opacity-50">Send</button></div></form>
-                </div>
-                <p className="text-xs leading-5 text-slate-500">Memory and document uploads are being kept separate from trip membership: the uploader must approve each viewer. Existing Google Drive memories and links are not yet migrated into the new per-upload access layer.</p>
-              </section>
-            )}
-
             {!isLoadingItinerary && !itineraryError && activeView === "documents" && (
               <section className="rounded-2xl border border-slate-200 bg-white p-5 shadow-sm sm:p-7">
                 <button type="button" onClick={goToDashboard} className="text-sm font-semibold text-emerald-800 hover:underline">← Back to dashboard</button>
@@ -2200,7 +2006,7 @@ function App() {
                 <h2 className="mt-2 text-2xl font-bold">Documents & Links</h2>
                 <p className="mt-2 text-sm text-slate-600">Approved trip documents and useful reference websites, loaded from the Google Sheets Link tab.</p>
                 {documentsMessage && <p className="mt-3 rounded-lg bg-amber-50 p-3 text-sm text-amber-900">{documentsMessage}</p>}
-                {tripDocuments.length ? <div className="mt-5 space-y-3">{tripDocuments.map((document, index) => document.canView === false ? <div key={`${document.title}-${index}`} className="flex flex-wrap items-center gap-3 rounded-xl border border-amber-200 bg-amber-50 p-4"><span className="text-xl">🔒</span><span className="min-w-0 flex-1"><span className="block text-xs font-semibold uppercase tracking-wide text-amber-800">{document.category}</span><span className="mt-1 block font-semibold text-slate-900">{document.title}</span><span className="mt-1 block text-xs text-slate-600">Uploader approval is required to open this document.</span></span><button type="button" disabled={document.requestPending} onClick={() => void requestDocumentAccess(document)} className="rounded-lg border border-amber-400 bg-white px-3 py-2 text-xs font-semibold text-amber-900 disabled:opacity-50">{document.requestPending ? "Request pending" : "Request access"}</button></div> : <a key={`${document.title}-${index}`} href={document.url} target="_blank" rel="noreferrer" className="flex items-center gap-3 rounded-xl border border-slate-200 p-4 transition hover:border-emerald-400 hover:bg-emerald-50/40"><span className="flex h-11 w-11 shrink-0 items-center justify-center rounded-xl bg-emerald-50 text-xl">{document.kind === "drive_folder" ? "📁" : "🔗"}</span><span className="min-w-0 flex-1"><span className="block text-xs font-semibold uppercase tracking-wide text-slate-500">{document.category}</span><span className="mt-1 block font-semibold text-slate-900">{document.title}</span><span className="mt-1 block break-all text-xs text-slate-500">{document.kind === "drive_folder" ? "Open shared Google Drive folder" : document.url}</span></span><span className="text-emerald-800">↗</span></a>)}</div> : !documentsMessage ? <p className="mt-4 rounded-xl bg-slate-50 p-4 text-sm text-slate-600">No approved links were found in the Link tab.</p> : null}
+                {tripDocuments.length ? <div className="mt-5 space-y-3">{tripDocuments.map((document, index) => <a key={`${document.title}-${index}`} href={document.url} target="_blank" rel="noreferrer" className="flex items-center gap-3 rounded-xl border border-slate-200 p-4 transition hover:border-emerald-400 hover:bg-emerald-50/40"><span className="flex h-11 w-11 shrink-0 items-center justify-center rounded-xl bg-emerald-50 text-xl">{document.kind === "drive_folder" ? "📁" : "🔗"}</span><span className="min-w-0 flex-1"><span className="block text-xs font-semibold uppercase tracking-wide text-slate-500">{document.category}</span><span className="mt-1 block font-semibold text-slate-900">{document.title}</span><span className="mt-1 block break-all text-xs text-slate-500">{document.kind === "drive_folder" ? "Open shared Google Drive folder" : document.url}</span></span><span className="text-emerald-800">↗</span></a>)}</div> : !documentsMessage ? <p className="mt-4 rounded-xl bg-slate-50 p-4 text-sm text-slate-600">No approved links were found in the Link tab.</p> : null}
               </section>
             )}
 
@@ -2412,7 +2218,7 @@ function App() {
                     <div className="flex flex-wrap items-center justify-between gap-2"><h3 className="font-semibold">Trip photo gallery</h3><span className="text-xs text-slate-500">{memoryGalleryPhotos.length} photo{memoryGalleryPhotos.length === 1 ? "" : "s"}</span></div>
                     {memoryGalleryPhotos.length ? <div className="mt-3 max-h-[420px] overflow-y-auto overscroll-contain rounded-lg border border-slate-100 p-2"><div className="grid grid-cols-2 gap-2 sm:grid-cols-3">{memoryGalleryPhotos.map((photo, index) => <button key={`${photo.memory_id}-${photo.id}-${index}`} type="button" onClick={() => setSelectedMemoryPhoto(photo)} className="overflow-hidden rounded-lg border border-slate-200 bg-white text-left shadow-sm hover:border-emerald-400 focus:outline-none focus:ring-2 focus:ring-emerald-600"><img src={getMemoryPhotoUrl(photo.id)} alt={`Trip photo: ${photo.attraction}`} loading="lazy" className="h-28 w-full bg-slate-100 object-cover sm:h-36" /><span className="block truncate px-2 pt-2 text-xs font-semibold text-slate-800">{photo.attraction}</span><span className="block px-2 pb-2 text-[11px] text-slate-500">{photo.trip_date}</span></button>)}</div></div> : <p className="mt-2 text-sm text-slate-500">Photos added to saved memories will appear here.</p>}
                   </section>
-                  <section><h3 className="font-semibold">Shared memory collection</h3>{memories.length ? <div className="mt-3 space-y-3">{[...memories].sort((a,b) => (a.trip_date || "").localeCompare(b.trip_date || "")).map((memory) => <article key={memory.memory_id} className="rounded-xl border border-slate-200 p-4"><div className="flex flex-wrap items-start justify-between gap-2"><h4 className="font-semibold">{memory.requiresApproval ? "🔒 Private memory" : memory.attraction}</h4><span className="text-xs text-slate-500">{memory.trip_date}</span></div>{memory.requiresApproval ? <div className="mt-2 flex flex-wrap items-center justify-between gap-2"><p className="text-sm text-slate-600">The uploader has not approved access to this memory.</p><button type="button" disabled={memory.requestPending} onClick={() => void requestMemoryAccess(memory)} className="rounded-lg border border-amber-400 px-3 py-2 text-xs font-semibold text-amber-900 disabled:opacity-50">{memory.requestPending ? "Request pending" : "Request access"}</button></div> : <><p className="mt-2 whitespace-pre-wrap text-sm leading-6 text-slate-700">{memory.content}</p>{getMemoryPhotoIds(memory.photo_ids).length > 0 && <div className="mt-3 grid grid-cols-3 gap-2 sm:grid-cols-4">{getMemoryPhotoIds(memory.photo_ids).map((photoId) => <button key={photoId} type="button" onClick={() => setSelectedMemoryPhoto({ id: photoId, attraction: memory.attraction, trip_date: memory.trip_date, memory_id: memory.memory_id })} className="overflow-hidden rounded-lg border border-slate-200 bg-white text-left"><img src={getMemoryPhotoUrl(photoId)} alt={`Photo for ${memory.attraction}`} loading="lazy" className="h-20 w-full bg-slate-100 object-cover sm:h-24" /><span className="block px-2 py-1 text-[11px] font-semibold text-emerald-800">View photo</span></button>)}</div>}<p className="mt-2 text-xs text-slate-500">Shared by {memory.author_email || "trip companion"}</p></>}</article>)}</div> : <p className="mt-2 text-sm text-slate-500">No shared memories have been saved yet.</p>}</section>
+                  <section><h3 className="font-semibold">Shared memory collection</h3>{memories.length ? <div className="mt-3 space-y-3">{[...memories].sort((a,b) => (a.trip_date || "").localeCompare(b.trip_date || "")).map((memory) => <article key={memory.memory_id} className="rounded-xl border border-slate-200 p-4"><div className="flex flex-wrap items-start justify-between gap-2"><h4 className="font-semibold">{memory.attraction}</h4><span className="text-xs text-slate-500">{memory.trip_date}</span></div><p className="mt-2 whitespace-pre-wrap text-sm leading-6 text-slate-700">{memory.content}</p>{getMemoryPhotoIds(memory.photo_ids).length > 0 && <div className="mt-3 grid grid-cols-3 gap-2 sm:grid-cols-4">{getMemoryPhotoIds(memory.photo_ids).map((photoId) => <button key={photoId} type="button" onClick={() => setSelectedMemoryPhoto({ id: photoId, attraction: memory.attraction, trip_date: memory.trip_date, memory_id: memory.memory_id })} className="overflow-hidden rounded-lg border border-slate-200 bg-white text-left"><img src={getMemoryPhotoUrl(photoId)} alt={`Photo for ${memory.attraction}`} loading="lazy" className="h-20 w-full bg-slate-100 object-cover sm:h-24" /><span className="block px-2 py-1 text-[11px] font-semibold text-emerald-800">View photo</span></button>)}</div>}<p className="mt-2 text-xs text-slate-500">Shared by {memory.author_email || "trip companion"}</p></article>)}</div> : <p className="mt-2 text-sm text-slate-500">No shared memories have been saved yet.</p>}</section>
 
                 </div>}
               </section>
@@ -2513,18 +2319,15 @@ function App() {
               {googleConnection?.connected && googleConnection.estimatedTestingExpiryAt && <span className="text-slate-500">· Testing expiry estimate {new Date(googleConnection.estimatedTestingExpiryAt).toLocaleDateString()}</span>}
             </div>
           </div>
-          <div className="mx-auto grid max-w-3xl grid-cols-7 gap-1 py-2">
-            {(guestMode ? [
-              { view: "itinerary" as ViewName, icon: "▤", label: "Itinerary" },
-            ] : [
+          <div className="mx-auto grid max-w-3xl grid-cols-6 gap-1 py-2">
+            {[
               { view: "home" as ViewName, icon: "⌂", label: "Home" },
               { view: "itinerary" as ViewName, icon: "▤", label: "Itinerary" },
               { view: "checklist" as ViewName, icon: "🎒", label: "Checklist" },
               { view: "expenses" as ViewName, icon: "＄", label: "Expenses" },
               { view: "memories" as ViewName, icon: "♡", label: "Memories" },
               { view: "map" as ViewName, icon: "⌖", label: "Map" },
-              { view: "collaboration" as ViewName, icon: "👥", label: "Members" },
-            ]).map((item) => (
+            ].map((item) => (
               <button key={item.view} type="button" onClick={() => item.view === "itinerary" ? navigateToItinerary() : setActiveView(item.view)} className={`flex flex-col items-center gap-1 rounded-xl px-1 py-2 text-xs font-medium transition ${activeView === item.view ? "bg-emerald-50 text-emerald-900" : "text-slate-500 hover:bg-slate-50"}`} aria-current={activeView === item.view ? "page" : undefined}>
                 <span className="text-xl leading-none" aria-hidden="true">{item.icon}</span>
                 <span>{item.label}</span>
