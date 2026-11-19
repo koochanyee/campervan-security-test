@@ -530,6 +530,21 @@ export default {
   async fetch(request: Request, env: Env): Promise<Response> {
     const url = new URL(request.url);
 
+    // Public Google Identity Services configuration.
+    // The OAuth client ID is intended for browser use; secrets remain server-side.
+    if (
+      request.method === "GET" &&
+      url.pathname === "/api/auth/config"
+    ) {
+      if (!env.GOOGLE_CLIENT_ID) {
+        return jsonResponse(
+          { success: false, error: "Google Client ID is not configured on this Preview Worker." },
+          500,
+        );
+      }
+      return jsonResponse({ success: true, clientId: env.GOOGLE_CLIENT_ID });
+    }
+
     // Health check
     if (
       request.method === "GET" &&
