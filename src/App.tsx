@@ -531,55 +531,84 @@ function App() {
   };
 
   useEffect(() => {
-    const clientId = import.meta.env.VITE_GOOGLE_CLIENT_ID as string | undefined;
-    if (!clientId) {
-      setAuthMessage("Google sign-in configuration is missing.");
-      return;
-    }
-
+    let cancelled = false;
     let attempts = 0;
     let timer: ReturnType<typeof setInterval> | undefined;
-    const setupGoogleSignIn = () => {
-      if (!window.google?.accounts.id) {
-        attempts += 1;
-        if (attempts >= 20 && timer) clearInterval(timer);
-        return;
-      }
-      if (timer) clearInterval(timer);
-      const button = document.getElementById("google-sign-in-button");
-      if (!button) return;
-      button.replaceChildren();
-      window.google.accounts.id.initialize({
-        client_id: clientId,
-        callback: async (response) => {
-          setAuthMessage("Verifying Google account…");
-          setIsVerifying(true);
-          try {
-            const result = await fetch("/api/auth/google", {
-              method: "POST",
-              credentials: "same-origin",
-              headers: { "Content-Type": "application/json" },
-              body: JSON.stringify({ credential: response.credential }),
-            });
-            const data = (await result.json()) as ApiResponse;
-            if (!result.ok || !data.success || !data.user?.email) {
-              throw new Error(data.error || "Google verification failed.");
-            }
-            setVerifiedEmail(data.user.email);
-            setAuthMessage("Google identity verified. Loading trip selection…");
-          } catch (error) {
-            setAuthMessage(error instanceof Error ? error.message : "Google verification failed. Please try again.");
-          } finally {
-            setIsVerifying(false);
+
+    const initializeGoogleButton = (clientId: string) => {
+      const setupGoogleSignIn = () => {
+        if (cancelled) {
+          if (timer) clearInterval(timer);
+          return;
+        }
+        if (!window.google?.accounts.id) {
+          attempts += 1;
+          if (attempts >= 20) {
+            if (timer) clearInterval(timer);
+            setAuthMessage("Google sign-in could not load. Please refresh and try again.");
           }
-        },
-      });
-      window.google.accounts.id.renderButton(button, { theme: "outline", size: "large", text: "signin_with" });
+          return;
+        }
+        if (timer) clearInterval(timer);
+        const button = document.getElementById("google-sign-in-button");
+        if (!button) return;
+        button.replaceChildren();
+        window.google.accounts.id.initialize({
+          client_id: clientId,
+          callback: async (response) => {
+            setAuthMessage("Verifying Google account…");
+            setIsVerifying(true);
+            try {
+              const result = await fetch("/api/auth/google", {
+                method: "POST",
+                credentials: "same-origin",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ credential: response.credential }),
+              });
+              const data = (await result.json()) as ApiResponse;
+              if (!result.ok || !data.success || !data.user?.email) {
+                throw new Error(data.error || "Google verification failed.");
+              }
+              setVerifiedEmail(data.user.email);
+              setAuthMessage("Google identity verified. Loading trip selection…");
+            } catch (error) {
+              setAuthMessage(error instanceof Error ? error.message : "Google verification failed. Please try again.");
+            } finally {
+              setIsVerifying(false);
+            }
+          },
+        });
+        window.google.accounts.id.renderButton(button, { theme: "outline", size: "large", text: "signin_with" });
+      };
+
+      setupGoogleSignIn();
+      if (!window.google?.accounts.id) timer = setInterval(setupGoogleSignIn, 500);
     };
 
-    setupGoogleSignIn();
-    if (!window.google?.accounts.id) timer = setInterval(setupGoogleSignIn, 500);
-    return () => { if (timer) clearInterval(timer); };
+    const loadGoogleConfiguration = async () => {
+      try {
+        const response = await fetch("/api/auth/config", {
+          method: "GET",
+          credentials: "same-origin",
+          cache: "no-store",
+        });
+        const config = await response.json() as { success?: boolean; clientId?: string; error?: string };
+        if (!response.ok || !config.success || !config.clientId) {
+          throw new Error(config.error || "Google sign-in configuration is missing on this Preview Worker.");
+        }
+        if (!cancelled) initializeGoogleButton(config.clientId);
+      } catch (error) {
+        if (!cancelled) {
+          setAuthMessage(error instanceof Error ? error.message : "Could not load Google sign-in configuration.");
+        }
+      }
+    };
+
+    void loadGoogleConfiguration();
+    return () => {
+      cancelled = true;
+      if (timer) clearInterval(timer);
+    };
   }, []);
 
   useEffect(() => {
