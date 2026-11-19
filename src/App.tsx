@@ -228,6 +228,7 @@ function App() {
   const [authMessage, setAuthMessage] = useState("");
   const [isVerifying, setIsVerifying] = useState(false);
   const [verifiedEmail, setVerifiedEmail] = useState("");
+  const [profileSyncStatus, setProfileSyncStatus] = useState<"idle" | "syncing" | "ready" | "error">("idle");
   const [googleConnection, setGoogleConnection] = useState<{ connected: boolean; needsReconnect: boolean; status: string; estimatedTestingExpiryAt?: string | null } | null>(null);
   const [isLoggingOut, setIsLoggingOut] = useState(false);
   const [logoutError, setLogoutError] = useState("");
@@ -452,6 +453,38 @@ function App() {
     void restoreSession();
     return () => { cancelled = true; };
   }, []);
+
+  // Register the verified Google identity in D1 after sign-in or session restore.
+  // This is additive: the existing Google Sheets and KV flows remain unchanged.
+  useEffect(() => {
+    if (!verifiedEmail) {
+      setProfileSyncStatus("idle");
+      return;
+    }
+
+    let cancelled = false;
+    async function syncProfile() {
+      setProfileSyncStatus("syncing");
+      try {
+        const response = await fetch("/api/profile", {
+          method: "GET",
+          credentials: "same-origin",
+          cache: "no-store",
+        });
+        const result = await response.json() as ApiResponse;
+        if (!response.ok || !result.success) {
+          throw new Error(result.error || `Profile sync failed (HTTP ${response.status}).`);
+        }
+        if (!cancelled) setProfileSyncStatus("ready");
+      } catch (error) {
+        console.error("D1 profile sync failed:", error);
+        if (!cancelled) setProfileSyncStatus("error");
+      }
+    }
+
+    void syncProfile();
+    return () => { cancelled = true; };
+  }, [verifiedEmail]);
 
   useEffect(() => {
     if (!verifiedEmail) { setGoogleConnection(null); return; }
@@ -1453,6 +1486,14 @@ function App() {
           </button>
           <div className="flex flex-wrap items-center gap-2">
             {verifiedEmail && <span className="text-sm font-semibold text-slate-700">Welcome, {welcomeName}</span>}
+            {verifiedEmail && profileSyncStatus !== "idle" && (
+              <span
+                title={profileSyncStatus === "error" ? "D1 profile could not be synchronized. Existing trip access remains available." : undefined}
+                className={`rounded-full px-2 py-1 text-xs font-semibold ${profileSyncStatus === "ready" ? "bg-emerald-50 text-emerald-800" : profileSyncStatus === "error" ? "bg-amber-50 text-amber-800" : "bg-slate-100 text-slate-600"}`}
+              >
+                {profileSyncStatus === "ready" ? "Profile synced" : profileSyncStatus === "error" ? "Profile sync unavailable" : "Syncing profile…"}
+              </span>
+            )}
             {verifiedEmail && (
               <details className="relative">
                 <summary className="flex min-h-10 cursor-pointer list-none items-center gap-2 rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm font-semibold text-slate-700 shadow-sm hover:bg-slate-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-emerald-600">
