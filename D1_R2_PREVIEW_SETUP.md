@@ -3,36 +3,34 @@
 This package is based on the `m3-google-auth` source checkpoint and includes:
 - Phase 1 expense settings implementation.
 - Phase 2A identity/profile API and additive D1 migration `0001_identity_trip_membership.sql`.
-- A separate Wrangler configuration template for preview D1 and R2 bindings.
+- Preview-only D1 and R2 bindings in `wrangler.jsonc`, scoped under `previews`.
+- Automatic frontend profile synchronization after Google sign-in/session restore.
 
 ## Important scope and safety notes
 
-- The existing `wrangler.jsonc` is intentionally unchanged. It preserves the current Worker/KV/Google configuration.
-- `wrangler.d1-r2.template.jsonc` is a **template**, not a ready-to-deploy config. Replace the D1 database name, D1 database ID, and R2 bucket name with resources created in your own Cloudflare account.
-- Do not deploy the template until all placeholders have been replaced and the preview environment has been checked.
-- D1 is used by the Phase 2A profile API when `APP_DB` is bound and migration 0001 has been applied.
-- R2 is configured as the `MEDIA_BUCKET` binding in the template, but this Phase 1 + 2A checkpoint does not yet implement media upload/download endpoints or use the bucket in application code. R2 is provisioned for a later media phase; this is not a claim that media storage is already functional.
+- Production-level settings in `wrangler.jsonc` remain unchanged. The feature branch now has its D1 and R2 resources under the `previews` block only.
+- `wrangler.d1-r2.template.jsonc` remains a standalone reference template. Do not use it as the deployment config for this feature branch; it places bindings at the top level rather than under `previews`.
+- Preview D1 binding: `APP_DB` → `campervan-trip-companion-feature-db` (`bec49875-e47a-4c7e-9f0a-a2c990147d6a`).
+- Preview R2 binding: `MEDIA_BUCKET` → `campervan-trip-companion-feature-media`.
+- D1 is used by the Phase 2A profile API when `APP_DB` is bound and migration 0001 has been applied. The frontend now calls `GET /api/profile` after Google sign-in or session restoration; failure to sync the profile does not block existing trip access.
+- R2 is configured as the preview `MEDIA_BUCKET` binding, but this Phase 1 + 2A checkpoint does not yet implement media upload/download endpoints or use the bucket in application code. R2 is provisioned for a later media phase; this is not a claim that media storage is already functional.
 - Existing Google Sheets tabs, `TRIP EXPENSES`, `FINAL EXPENSES`, and KV OAuth records are not migrated or modified by migration 0001.
 - Do not change production resources or the existing `m3-google-auth` branch as part of this preview setup.
 
 ## Cloudflare resource setup
 
-Create preview-only resources in the intended Cloudflare account:
+The preview resources have already been created and their IDs/names are configured in `wrangler.jsonc` under `previews`. Keep these bindings in the feature branch; do not move them to the top-level production configuration.
+
+Create preview-only resources only if rebuilding this environment from scratch:
 
 ```bash
 npx wrangler d1 create campervan-trip-companion-feature-db
 npx wrangler r2 bucket create campervan-trip-companion-feature-media
 ```
 
-Copy the returned D1 database ID into `wrangler.d1-r2.template.jsonc`. Set the matching D1 database name and R2 bucket name. Keep the existing OAuth KV namespace binding as-is for this preview only if that is the intended preview namespace.
+For a rebuilt environment, update the matching preview bindings in `wrangler.jsonc` and keep them under `previews`; do not add preview resources to the top-level production bindings.
 
-Apply the migration to the new D1 database:
-
-```bash
-npx wrangler d1 migrations apply campervan-trip-companion-feature-db --remote --config wrangler.d1-r2.template.jsonc
-```
-
-Before using this command, confirm that the template points to the newly created preview database and not any production database.
+The D1 tables were applied manually in the Cloudflare D1 Console and verified there. Do not rerun migrations blindly. The current ZIP includes migration `0001_identity_trip_membership.sql`; it does not include the `0002_trip_collaboration.sql` file even though the database currently contains the seven collaboration tables. Reconcile the migration files and Wrangler migration history before using `wrangler d1 migrations apply` for future changes.
 
 ## Secrets and preview variables
 
@@ -44,4 +42,8 @@ Create the feature branch from `m3-google-auth`, then add the contents of this p
 
 ## Validation status
 
-This ZIP packages the source checkpoint and migration/configuration template. It does not create Cloudflare resources, apply the migration remotely, or deploy the Worker. A full live Cloudflare integration test remains to be done after the account-specific IDs and secrets are configured.
+This ZIP updates the feature-branch Preview configuration and frontend profile-sync call. It does not deploy the Worker or change Cloudflare secrets. A live integration test remains to be done after the branch is committed and its Preview build succeeds.
+
+## Profile synchronization added in this checkpoint
+
+After `/api/auth/session` restores a valid session or `/api/auth/google` completes sign-in, the frontend calls `GET /api/profile`. The Worker derives `google_sub` and email from the signed session and upserts the user row. The frontend shows `Profile synced`, `Syncing profile…`, or `Profile sync unavailable`. This does not change Google Sheets trip data, the KV OAuth token store, or trip authorization.
