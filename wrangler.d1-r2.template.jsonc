@@ -22,16 +22,14 @@
   "d1_databases": [
     {
       "binding": "APP_DB",
-      "database_name": "REPLACE_WITH_YOUR_PREVIEW_D1_DATABASE_NAME",
-      "database_id": "REPLACE_WITH_D1_DATABASE_ID",
+      "database_name": "campervan-trip-companion-feature-db",
+      "database_id": "bec49875-e47a-4c7e-9f0a-a2c990147d6a",
       "migrations_dir": "migrations"
     }
   ],
   "r2_buckets": [
     {
       "binding": "MEDIA_BUCKET",
-      "bucket_name": "REPLACE_WITH_YOUR_PREVIEW_R2_BUCKET_NAME"
+      "bucket_name": "campervan-trip-companion-feature-media"
     }
-  ],
-  "upload_source_maps": true
-}
+  ]
