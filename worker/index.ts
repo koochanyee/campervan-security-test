@@ -9,9 +9,11 @@ interface Env {
   GOOGLE_SHEET_ID: string;
   GOOGLE_SHEET_TAB: string;
   OAUTH_TOKEN_STORE: KVNamespace;
-  // Optional during staged rollout. Configure only after creating the D1 database
-  // and applying migrations/0001_identity_trip_membership.sql.
+  // Preview bindings for the identity, collaboration and private media layers.
+  // Keep these resources isolated from production.
   APP_DB?: D1Database;
+  // Preview-only private object storage for trip media.
+  MEDIA_BUCKET?: R2Bucket;
 }
 
 interface GoogleTokenInfo {
@@ -497,38 +499,154 @@ async function readSheetRows(accessToken: string, sheetId: string, tabName: stri
 }
 
 
-async function uploadSharedMemoryPhoto(accessToken: string, photo: { name?: unknown; mime_type?: unknown; data_base64?: unknown }, maxBytes = 4 * 1024 * 1024): Promise<{ id: string; url: string }> {
-  const name = typeof photo.name === "string" ? photo.name.replace(/[^a-zA-Z0-9._-]/g, "_").slice(0, 120) : "travel-memory.jpg";
-  const mimeType = typeof photo.mime_type === "string" && /^image\/(jpeg|png|webp|gif|heic|heif)$/.test(photo.mime_type) ? photo.mime_type : "";
-  const encoded = typeof photo.data_base64 === "string" ? photo.data_base64.replace(/^data:image\/[^;]+;base64,/, "") : "";
-  if (!mimeType || !encoded) throw new Error("A selected photo has an unsupported image format.");
+async function ensureD1MediaTrip(env: Env, session: SessionPayload, trip: TripConfig): Promise<void> {
+  if (!env.APP_DB) throw new Error("D1 database binding APP_DB is not configured.");
+  if (!env.MEDIA_BUCKET) throw new Error("R2 bucket binding MEDIA_BUCKET is not configured.");
+
+  const user = await env.APP_DB.prepare(
+    "SELECT google_sub FROM users WHERE google_sub = ? AND email = ? COLLATE NOCASE",
+  ).bind(session.googleId, session.email).first<{ google_sub: string }>();
+  if (!user) throw new Error("Your D1 profile is not ready. Sign out and sign in again, then retry.");
+
+  let tripRow = await env.APP_DB.prepare(
+    "SELECT trip_id FROM trips WHERE trip_id = ?",
+  ).bind(trip.id).first<{ trip_id: string }>();
+
+  // One-time bridge for the already-existing South Island workbook. Ralph was
+  // explicitly confirmed as its initial Admin. Do not grant June or other users
+  // an Admin role here; trip membership permissions are handled separately.
+  if (!tripRow && trip.id === "nz-south-island" && session.email.toLowerCase() === "koochanyee@gmail.com") {
+    const now = new Date().toISOString();
+    await env.APP_DB.prepare(`
+      INSERT OR IGNORE INTO trips
+        (trip_id, name, destination, spreadsheet_id, itinerary_tab, drive_folder_id,
+         created_by_google_sub, status, created_at, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, 'ACTIVE', ?, ?)
+    `).bind(
+      trip.id,
+      trip.name || "New Zealand — South Island",
+      "New Zealand",
+      trip.sheetId,
+      trip.itineraryTab || "FINAL ITINERARY",
+      TRIP_MEMORY_FOLDER_ID,
+      user.google_sub,
+      now,
+      now,
+    ).run();
+    tripRow = await env.APP_DB.prepare(
+      "SELECT trip_id FROM trips WHERE trip_id = ?",
+    ).bind(trip.id).first<{ trip_id: string }>();
+  }
+
+  // Keep the explicitly confirmed initial Admin membership even if the trip
+  // record was created earlier through a separate registration step.
+  if (trip.id === "nz-south-island" && session.email.toLowerCase() === "koochanyee@gmail.com" && tripRow) {
+    const now = new Date().toISOString();
+    await env.APP_DB.prepare(`
+      INSERT OR IGNORE INTO trip_memberships
+        (trip_id, google_sub, role, status, invited_by_google_sub, joined_at, updated_at)
+      VALUES (?, ?, 'ADMIN', 'ACTIVE', NULL, ?, ?)
+    `).bind(trip.id, user.google_sub, now, now).run();
+  }
+
+  if (!tripRow) {
+    throw new Error("This trip has not been registered in D1 yet. Register the trip before uploading media.");
+  }
+}
+
+function decodeTripPhoto(photo: { name?: unknown; mime_type?: unknown; data_base64?: unknown }, maxBytes: number): { name: string; mimeType: string; bytes: Uint8Array; extension: string } {
+  const rawName = typeof photo.name === "string" ? photo.name : "trip-photo";
+  const name = rawName.replace(/[\\/\\\\\u0000-\u001f]/g, "_").slice(0, 120) || "trip-photo";
+  const mimeType = typeof photo.mime_type === "string" ? photo.mime_type.split(";")[0].trim().toLowerCase() : "";
+  const extensions: Record<string, string> = {
+    "image/jpeg": "jpg", "image/png": "png", "image/webp": "webp",
+    "image/gif": "gif", "image/heic": "heic", "image/heif": "heif",
+  };
+  if (!extensions[mimeType]) throw new Error("Unsupported image format. Use JPEG, PNG, WebP, GIF, HEIC or HEIF.");
+  const encoded = typeof photo.data_base64 === "string" ? photo.data_base64.replace(/^data:image\/[^;]+;base64,/i, "").replace(/\s/g, "") : "";
+  if (!encoded || !/^[A-Za-z0-9+/]*={0,2}$/.test(encoded) || encoded.length % 4 === 1) throw new Error("The selected photo data is invalid.");
   const binary = atob(encoded);
-  if (binary.length > maxBytes) throw new Error(`Each photo must be ${Math.floor(maxBytes / (1024 * 1024))} MB or smaller.`);
+  if (!binary.length || binary.length > maxBytes) throw new Error(`Each photo must be ${Math.floor(maxBytes / (1024 * 1024))} MB or smaller.`);
   const bytes = new Uint8Array(binary.length);
   for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
-  const form = new FormData();
-  form.append("metadata", new Blob([JSON.stringify({ name, mimeType, parents: [TRIP_MEMORY_FOLDER_ID], description: "Shared campervan travel memory" })], { type: "application/json" }));
-  form.append("file", new Blob([bytes], { type: mimeType }), name);
-  const upload = await fetch("https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart&fields=id,name,mimeType,webViewLink", {
-    method: "POST", headers: { Authorization: `Bearer ${accessToken}` }, body: form,
-  });
-  if (!upload.ok) {
-    const detail = (await upload.text().catch(() => "")).slice(0, 400);
-    if (upload.status === 401 || /insufficient authentication scopes/i.test(detail)) {
-      throw new Error(`Google Drive authorization is missing the required upload scope (HTTP ${upload.status}). Reconnect Google access once to approve Drive permissions. ${detail}`);
-    }
-    if (upload.status === 403 && /has not been used in project|is disabled|enable.*drive\.googleapis\.com/i.test(detail)) throw new Error(`Google Drive API is disabled for Google Cloud project 269076730966. Enable it at https://console.developers.google.com/apis/api/drive.googleapis.com/overview?project=269076730966, wait a few minutes, then retry. ${detail}`);
-    if (upload.status === 403) throw new Error(`Google Drive denied access to the photo folder. Confirm the connected Google account can add files to folder ${TRIP_MEMORY_FOLDER_ID} and that the Drive API is enabled. ${detail}`);
-    if (upload.status === 404) throw new Error(`The configured trip-photo folder could not be found or accessed (${TRIP_MEMORY_FOLDER_ID}). ${detail}`);
-    throw new Error(`Google Drive could not upload the selected photo (HTTP ${upload.status}). ${detail}`);
-  }
-  const file = await upload.json() as { id?: string; webViewLink?: string };
-  if (!file.id) throw new Error("Google Drive did not return a photo ID.");
-  // Files inherit access from the destination folder. Avoid a second per-file
-  // permission call, which can fail under Workspace sharing policies and used
-  // to trigger the reconnect loop (and delete the successfully uploaded photo).
-  return { id: file.id, url: file.webViewLink || `https://drive.google.com/uc?export=view&id=${encodeURIComponent(file.id)}` };
+  return { name, mimeType, bytes, extension: extensions[mimeType] };
 }
+
+async function uploadTripMediaToR2(
+  env: Env,
+  session: SessionPayload,
+  trip: TripConfig,
+  photo: { name?: unknown; mime_type?: unknown; data_base64?: unknown },
+  maxBytes = 10 * 1024 * 1024,
+): Promise<{ id: string; url: string; objectKey: string }> {
+  await ensureD1MediaTrip(env, session, trip);
+  const decoded = decodeTripPhoto(photo, maxBytes);
+  const mediaId = crypto.randomUUID();
+  const objectKey = `${trip.id}/memory/${mediaId}.${decoded.extension}`;
+  const createdAt = new Date().toISOString();
+
+  await env.MEDIA_BUCKET!.put(objectKey, decoded.bytes, {
+    httpMetadata: { contentType: decoded.mimeType, cacheControl: "private, max-age=300" },
+    customMetadata: {
+      mediaId,
+      tripId: trip.id,
+      uploaderGoogleSub: session.googleId,
+      originalFileName: decoded.name,
+    },
+  });
+
+  try {
+    await env.APP_DB!.prepare(`
+      INSERT INTO trip_media
+        (media_id, trip_id, uploader_google_sub, media_type, object_key,
+         file_name, content_type, size_bytes, created_at)
+      VALUES (?, ?, ?, 'MEMORY', ?, ?, ?, ?, ?)
+    `).bind(mediaId, trip.id, session.googleId, objectKey, decoded.name, decoded.mimeType, decoded.bytes.byteLength, createdAt).run();
+  } catch (error) {
+    await env.MEDIA_BUCKET!.delete(objectKey).catch(() => undefined);
+    throw error;
+  }
+
+  return {
+    id: mediaId,
+    objectKey,
+    url: `/api/memory-photo?tripId=${encodeURIComponent(trip.id)}&fileId=${encodeURIComponent(mediaId)}`,
+  };
+}
+
+async function deleteTripMediaFromR2(env: Env, tripId: string, mediaId: string): Promise<void> {
+  if (!env.APP_DB || !env.MEDIA_BUCKET) return;
+  const media = await env.APP_DB.prepare(
+    "SELECT object_key FROM trip_media WHERE media_id = ? AND trip_id = ?",
+  ).bind(mediaId, tripId).first<{ object_key: string }>();
+  if (!media) return;
+  await env.MEDIA_BUCKET.delete(media.object_key);
+  await env.APP_DB.prepare(
+    "DELETE FROM trip_media WHERE media_id = ? AND trip_id = ?",
+  ).bind(mediaId, tripId).run();
+}
+
+async function getR2TripMediaResponse(env: Env, tripId: string, mediaId: string): Promise<Response | null> {
+  if (!env.APP_DB || !env.MEDIA_BUCKET) return null;
+  const media = await env.APP_DB.prepare(`
+    SELECT object_key, content_type, file_name
+    FROM trip_media
+    WHERE media_id = ? AND trip_id = ? AND media_type = 'MEMORY'
+  `).bind(mediaId, tripId).first<{ object_key: string; content_type: string; file_name: string }>();
+  if (!media) return null;
+  const object = await env.MEDIA_BUCKET.get(media.object_key);
+  if (!object) return new Response("Media object not found.", { status: 404 });
+  return new Response(object.body, {
+    status: 200,
+    headers: {
+      "Content-Type": media.content_type,
+      "Cache-Control": "private, max-age=300",
+      "X-Content-Type-Options": "nosniff",
+      "Content-Disposition": "inline",
+    },
+  });
+}
+
 
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
@@ -2300,6 +2418,9 @@ export default {
       const fileId = (url.searchParams.get("fileId") || "").trim();
       if (!/^[a-zA-Z0-9_-]{10,200}$/.test(fileId)) return jsonResponse({ success: false, error: "Invalid photo ID." }, 400);
       try {
+        const r2Response = await getR2TripMediaResponse(env, trip.id, fileId);
+        if (r2Response) return r2Response;
+        // Backward compatibility: older memory rows contain Google Drive file IDs.
         const accessToken = await googleAccessToken(session, env);
         const driveResponse = await fetch(`https://www.googleapis.com/drive/v3/files/${encodeURIComponent(fileId)}?alt=media`, {
           headers: { Authorization: `Bearer ${accessToken}` },
@@ -2346,6 +2467,9 @@ export default {
           if (url.searchParams.get("image") === "1") {
             const fileId = url.searchParams.get("fileId") || photo?.id || "";
             if (!fileId || !photo?.id || fileId !== photo.id) return jsonResponse({ success: false, error: "The saved highlight photo was not found." }, 404);
+            const r2Response = await getR2TripMediaResponse(env, trip.id, fileId);
+            if (r2Response) return r2Response;
+            // Older highlight records continue to load from Google Drive.
             const accessToken = await googleAccessToken(session, env);
             const imageResponse = await fetch(`https://www.googleapis.com/drive/v3/files/${encodeURIComponent(fileId)}?alt=media`, { headers: { Authorization: `Bearer ${accessToken}` } });
             if (!imageResponse.ok) return jsonResponse({ success: false, error: `Could not load the saved highlight photo from Google Drive (HTTP ${imageResponse.status}).` }, 502);
@@ -2356,12 +2480,16 @@ export default {
         }
         const photo = body.photo as { name?: unknown; mime_type?: unknown; data_base64?: unknown } | undefined;
         if (!photo) return jsonResponse({ success: false, error: "Choose a photo first." }, 400);
-        const accessToken = await googleAccessToken(session, env);
-        const uploaded = await uploadSharedMemoryPhoto(accessToken, { ...photo, name: `highlight-${dateKey}-${String(photo.name || "photo")}` });
+        const uploaded = await uploadTripMediaToR2(env, session, trip, { ...photo, name: `highlight-${dateKey}-${String(photo.name || "photo")}` }, 4 * 1024 * 1024);
         const imageUrl = `${url.origin}/api/highlight-photo?tripId=${encodeURIComponent(trip.id)}&date=${encodeURIComponent(String(date))}&image=1&fileId=${encodeURIComponent(uploaded.id)}`;
-        const savedPhoto = { id: uploaded.id, url: imageUrl, date: String(date), uploaded_by: session.email, updated_at: new Date().toISOString() };
-        await env.OAUTH_TOKEN_STORE.put(key, JSON.stringify(savedPhoto));
-        return jsonResponse({ success: true, photo: savedPhoto, message: "Today Highlight photo saved to the shared Drive folder." });
+        const savedPhoto = { id: uploaded.id, storage: "R2", url: imageUrl, date: String(date), uploaded_by: session.email, updated_at: new Date().toISOString() };
+        try {
+          await env.OAUTH_TOKEN_STORE.put(key, JSON.stringify(savedPhoto));
+        } catch (saveError) {
+          await deleteTripMediaFromR2(env, trip.id, uploaded.id).catch(() => undefined);
+          throw saveError;
+        }
+        return jsonResponse({ success: true, photo: savedPhoto, message: "Today Highlight photo saved to private trip storage." });
       } catch (error) {
         return jsonResponse({ success: false, error: error instanceof Error ? error.message : "Could not save the Today Highlight photo." }, 500);
       }
@@ -2607,10 +2735,15 @@ export default {
         }
         // Four photos at the 10 MiB per-photo limit are supported.
         if (encodedTotal > 56_000_000) return jsonResponse({ success: false, error: "Total photo size must be 40 MB or smaller per memory." }, 400);
-        const photoFiles: Array<{ id: string; url: string }> = [];
-        for (const photo of photos) photoFiles.push(await uploadSharedMemoryPhoto(tokenData.access_token, photo, 10 * 1024 * 1024));
-        // Store both Drive file IDs and URLs so photos can be located from the sheet later.
-        const photoIdsValue = photoFiles.length ? JSON.stringify(photoFiles) : "";
+        const photoFiles: Array<{ id: string; url: string; objectKey: string }> = [];
+        try {
+          for (const photo of photos) photoFiles.push(await uploadTripMediaToR2(env, session, trip, photo, 10 * 1024 * 1024));
+        } catch (uploadError) {
+          await Promise.all(photoFiles.map((photo) => deleteTripMediaFromR2(env, trip.id, photo.id).catch(() => undefined)));
+          throw uploadError;
+        }
+        // Store R2 media IDs and authenticated Worker URLs. Legacy Drive IDs remain readable.
+        const photoIdsValue = photoFiles.length ? JSON.stringify(photoFiles.map(({ id, url }) => ({ id, url }))) : "";
         const createdAt = new Date().toISOString();
         const appendUrl =
           `${sheetUrl}:append?valueInputOption=RAW&insertDataOption=INSERT_ROWS`;
@@ -2636,8 +2769,9 @@ export default {
         });
 
         if (!appendResponse.ok) {
+          await Promise.all(photoFiles.map((photo) => deleteTripMediaFromR2(env, trip.id, photo.id).catch(() => undefined)));
           return jsonResponse(
-            { success: false, error: "Could not save the memory to Google Sheets." },
+            { success: false, error: "Could not save the memory to Google Sheets. Uploaded photos were rolled back; please retry." },
             502,
           );
         }
