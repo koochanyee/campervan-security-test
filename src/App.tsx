@@ -14,7 +14,7 @@ type ViewName =
 
 type ApiResponse = {
   success?: boolean;
-  user?: { email?: string; googleId?: string };
+  user?: { email?: string; googleId?: string; displayName?: string; photoUrl?: string };
   data?: ItineraryRow[];
   count?: number;
   error?: string;
