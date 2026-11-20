@@ -21,11 +21,15 @@ interface GoogleTokenInfo {
   email_verified?: string;
   exp?: string;
   iss?: string;
+  name?: string;
+  picture?: string;
 }
 
 interface SessionPayload {
   email: string;
   googleId: string;
+  displayName?: string;
+  photoUrl?: string;
   exp: number;
 }
 
@@ -688,6 +692,8 @@ export default {
           {
             email,
             googleId: token.sub,
+            displayName: typeof token.name === "string" ? token.name.trim().slice(0, 80) : "",
+            photoUrl: typeof token.picture === "string" && /^https:\/\//i.test(token.picture) ? token.picture.slice(0, 2048) : "",
             exp: Math.floor(Date.now() / 1000) + 8 * 60 * 60,
           },
           env.SESSION_SECRET,
@@ -698,6 +704,8 @@ export default {
           user: {
             googleId: token.sub,
             email,
+            displayName: typeof token.name === "string" ? token.name.trim().slice(0, 80) : "",
+            photoUrl: typeof token.picture === "string" && /^https:\/\//i.test(token.picture) ? token.picture.slice(0, 2048) : "",
           },
           message: "Google identity verified. Trip access granted.",
         });
@@ -738,6 +746,8 @@ export default {
         user: {
           email: session.email,
           googleId: session.googleId,
+          displayName: session.displayName || "",
+          photoUrl: session.photoUrl || "",
         },
       });
     }
@@ -757,11 +767,21 @@ export default {
         const now = new Date().toISOString();
         const email = session.email.trim().toLowerCase();
         const defaultName = email.split("@")[0].replace(/[._-]+/g, " ").trim().slice(0, 80);
+        const googleDisplayName = (session.displayName || "").trim().slice(0, 80) || defaultName;
+        const googlePhotoUrl = (session.photoUrl || "").trim().slice(0, 2048);
+        const safeGooglePhotoUrl = /^https:\/\//i.test(googlePhotoUrl) ? googlePhotoUrl : "";
         await env.APP_DB.prepare(`
-          INSERT INTO users (google_sub, email, display_name, created_at, updated_at)
-          VALUES (?, ?, ?, ?, ?)
-          ON CONFLICT(google_sub) DO UPDATE SET email = excluded.email, updated_at = excluded.updated_at
-        `).bind(session.googleId, email, defaultName, now, now).run();
+          INSERT INTO users (google_sub, email, display_name, photo_url, created_at, updated_at)
+          VALUES (?, ?, ?, ?, ?, ?)
+          ON CONFLICT(google_sub) DO UPDATE SET
+            email = excluded.email,
+            display_name = CASE
+              WHEN users.display_name IS NULL OR users.display_name = '' OR users.display_name = ?
+              THEN excluded.display_name ELSE users.display_name END,
+            photo_url = CASE
+              WHEN excluded.photo_url <> '' THEN excluded.photo_url ELSE users.photo_url END,
+            updated_at = excluded.updated_at
+        `).bind(session.googleId, email, googleDisplayName, safeGooglePhotoUrl, now, now, defaultName).run();
 
         if (request.method === "POST") {
           let body: { displayName?: unknown; preferredChatName?: unknown; photoUrl?: unknown; contactPhone?: unknown; notificationPreferences?: unknown };
